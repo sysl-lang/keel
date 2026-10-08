@@ -1,0 +1,16 @@
+module keel.boot
+
+// What the image has to do for itself before any sysl code may read module storage.
+
+// Symbols the linker script defines. Each is an address and nothing more, so each is declared as a
+// byte whose address is the only thing ever taken.
+extern __bss_start: u8
+extern __bss_end: u8
+
+// Zero `.bss`, which the image does not carry.
+zero_bss()
+    var p: *u8 = &__bss_start
+    val end: *u8 = &__bss_end
+    while usize(p) < usize(end)
+        *p = 0
+        p = ptr_cast(usize(p) + 1)

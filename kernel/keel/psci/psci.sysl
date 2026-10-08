@@ -1,0 +1,21 @@
+module keel.psci
+
+// The Power State Coordination Interface, which QEMU's `virt` machine answers itself. Its conduit is
+// `hvc` when the guest runs at EL1 with no EL2 beneath it — the case under HVF and under TCG's default
+// — and a call is a function number in x0.
+
+private const SYSTEM_OFF: u64 = 0x8400_0008
+
+// Ask the machine to power off. QEMU exits when it is answered; should it ever return, the processor
+// waits for an interrupt that is never coming.
+system_off() -> never
+    val id = SYSTEM_OFF
+    asm
+        [aarch64]
+            "hvc #0"
+            in id : "x0"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    loop
+        asm
+            [aarch64] "wfi"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"

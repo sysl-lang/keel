@@ -1,0 +1,6 @@
+// keel — a research kernel for aarch64, QEMU `virt`.
+
+package {
+  name    = "keel"
+  version = "0.0.1"
+}
