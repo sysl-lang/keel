@@ -1149,6 +1149,166 @@ On a target whose `entry` is `_start` the platform starts at `_start`, and packa
 and `keel_user_finish(code) -> never` is the sysl half. Clean form: allow it when the manifest's
 `entry` is not `main`.
 
+## Milestone 7: virtio-blk
+
+Findings 36-38 are against the same prerelease `1a7aee7358`. Found while writing `keel.virtio`, a
+modern virtio-mmio block driver (a split virtqueue in two frames, eight requests in flight, completion
+by an SPI that wakes the sleeping thread), and while making a kernel bounds failure fatal (keel now
+exports `sysl_bounds_fail`). Ranked: 36 is what every DMA driver needs and is where a wrong answer is a
+device writing to the wrong memory; 37 is silent and hangs the machine; 38 answers milestone 4's
+question about `async` in drivers. None was fixed here.
+
+## 36. A slice does not say where its storage is, so a driver cannot hand a caller's buffer to a device
+
+Milestone 7, `read_sector(n, buf: []u8)`. A device reads and writes memory by *physical* address, in
+runs that must be physically contiguous. The natural driver puts the caller's buffer straight into the
+data descriptor:
+
+    sh.desc[d + 1].addr = u64(mm.to_phys(mm.VirtAddr(u64(usize(as_mut_ptr(buf))))))
+
+It compiles for every buffer, and it is right for only some of them. keel's memory has three kinds of
+kernel address: the linear map (frames, heap blocks, module storage), where physical = virtual minus
+`KERNEL_BASE`; the thread-stack window at `KERNEL_BASE + 0x40_0000_0000` (the stack-guard test faults
+at `far=0xffff00400000bff8`), mapped page by page from whatever frames were free, so subtracting gives
+an address past the end of RAM; and a heap block of 2 KiB or more, which is a run of frames — contiguous
+— but a 512-byte block in a slab is contiguous only because a slab is one frame. The boot test's own
+callers pass `b[..]` of a local `[512]u8`, which is on a thread stack: the device would have been
+handed physical address `0x40_0000_xxxx`, which is not memory at all, and on real hardware would have
+written there.
+
+Nothing in the type of `buf` can say which kind it is, and nothing in sysl lets a function ask for
+"memory a device can reach": no qualifier on a slice or pointer for its provenance, no way to state
+"physically contiguous for `n` bytes", and no physical-address operation that could refuse where it does
+not know. The DMA region itself has the same problem one level down: `mm.alloc_frames(2)` answers a
+`Frame`, and turning it into a `*Shared` is `ptr_cast(usize(u64(mm.to_virt(pa))))` — nothing ties the
+struct's size to the frame count but an `@assert(sizeof(Shared) == 0x2000)` written by hand, and
+`phys(usize(&sh.headers[s]))` is correct only because `sh` came from the linear map, which no type
+records.
+
+Linux has the same split (`dma_map_single` refuses a vmalloc or stack address at run time, with
+`CONFIG_DMA_API_DEBUG`); Rust's embedded HALs mark DMA buffers with a `'static` + `StableDeref` bound so
+the buffer cannot move or die while the device holds it.
+
+Workaround (used): the caller's bytes never reach the device. Each request slot owns a 512-byte bounce
+buffer inside the queue's own frames, and `read_sector`/`write_sector` copy through it — one extra copy
+per sector, and the physical address is only ever taken of memory the driver allocated from the frame
+allocator.
+
+Clean form: a pointer or slice qualifier for memory a device may reach (`*dma T`, `[]dma u8`), which
+only an allocator of such memory produces and which carries, or can answer, its physical address;
+an ordinary `[]u8` refusing to convert to it without a named, checked operation. Short of that, a
+standard way for a kernel to state its own address-space regions so a physical-address function can
+refuse an address outside the linear map.
+
+## 37. Nothing marks a function that may sleep, so an interrupt handler that blocks compiles and hangs
+
+Milestone 7, the disk's interrupt. `virtio.interrupt()` runs in IRQ context (from `keel_trap`, slot 5,
+on the interrupted thread's stack). It must take completions and wake threads, and must never sleep:
+sleeping there switches away from an exception frame, with the GIC still waiting for its EOI. Nothing
+says so. With one line added to `irq.dispatch`:
+
+    else if id == virtio.irq()
+        virtio.interrupt()
+        var probe: [512]u8 = [0; 512]
+        val _ = virtio.read_sector(1, probe[..])      // blocks on a WaitQueue
+
+the kernel builds with no diagnostic — `keel.trap`'s `@no_alloc` is checked through every call and is
+satisfied, since a blocking read allocates nothing — and the boot test prints `keel: disk read ok` and
+then nothing: `FAIL: QEMU did not exit within 8s`.
+
+`@no_alloc` is the right shape (an attribute checked through every call) for the wrong property.
+Linux's answer is `might_sleep()`, a run-time check; Zephyr asserts `!k_is_in_isr()` in every blocking
+call. Both are conventions a reviewer has to know about.
+
+Workaround (used): care, and a comment on `interrupt()` saying it runs in IRQ context.
+
+Clean form: a function attribute in the `@no_alloc` family — `@no_block` on a module or function,
+checked through every call, with the blocking primitives (`WaitQueue.sleep`, `Mutex.lock`, `block_on`)
+marked as blocking at their declaration (`@blocks`), so an IRQ path that reaches one is refused naming
+the chain.
+
+## 38. `async` would not have improved this driver: the waker may not be called from the interrupt, and the reference's answer is the mechanism keel already has
+
+Milestone 7, the question milestone 4 left open: driver completions as tasks inside a kernel thread.
+Not built; what writing the driver showed, checked against `reference/async.md`:
+
+- **The completion arrives in an interrupt, and a waker may not be called there.** The reference is
+  explicit: a waker is a `&Fn() -> unit` belonging to the executor's domain, and the advice in its own
+  refusal is *"let the other domain — an interrupt, another thread — signal the executor, and have the
+  executor call the waker"*. Signalling the executor from the interrupt is exactly what
+  `virtio.interrupt()` already does for a thread: set `done` under the IrqLock and `wake_one` the
+  sleeper. A task-based driver keeps that handoff and adds a layer above it: the executor (a kernel
+  thread) wakes, steps the task, the task reads the status.
+- **The rule is not enforced where a kernel would break it.** The `&sync` capture check stops at module
+  storage (finding 22), so a waker parked in a module `var` and called from an exported interrupt
+  handler builds for `aarch64-freestanding` with no diagnostic:
+
+      var on_complete: Option[&Fn() -> unit] = None
+      arm(wake: &Fn() -> unit)
+          on_complete = Some(wake)
+      @export("disk_irq")
+      disk_irq()
+          on_complete match
+              Some(wake) -> wake()
+              None -> ()
+      async read_sector(n: u64) -> u64
+          await park(arm)
+          n * 2
+
+  (`sysl build-c --target aarch64-freestanding`: `wrote asyncprobe.a`.) That is the shape a kernel would
+  write first, and it touches non-atomic counts from interrupt context.
+- **Each `park` allocates** (its waker, and every task frame, through `sysl_task_alloc`), which the
+  interrupt path could not do under `@no_alloc` even if it were allowed to call the waker.
+- **What the blocking design costs is small.** Per request: a `done` flag, a `WaitQueue`, and a
+  three-line loop (`while !done: waiters.sleep(&lock)`). The API is callable from any thread on any
+  core, which is what a filesystem above it wants.
+
+Where async *would* help is one kernel thread with many requests outstanding (readahead, a filesystem
+that issues a run of sector reads and waits for all of them) — today that needs a thread per request or
+a hand-written completion counter. For that, sysl would need an interrupt-safe waker: a waker that is a
+`&sync` value (or a plain index into an executor's table, no count at all) whose `wake()` is
+`@no_alloc` and may be called from another domain, so an interrupt handler can call it directly; and an
+executor contract whose idle step can block the kernel thread (`WaitQueue.sleep`) rather than spin.
+
+Workaround (used): none needed — the driver is kernel threads and wait queues, as decided.
+
+Clean form: an interrupt-safe waker kind in the executor contract, as above; and finding 22's check
+extended to module storage, so the probe above is refused.
+
+## What worked in milestone 7
+
+- **`volatile` struct fields for a ring the device writes.** `Desc`, `Avail`, `Used` and `UsedElem` are
+  plain structs with `volatile` fields; `sh.used.ring[i].id` through a `*Shared` is a single 32-bit load
+  each time, and `[SLOTS][SECTOR_SIZE]u8` nests. `@assert(offsetof(...))` pins the virtio-mmio
+  register block and the queue layout against the specification, as it did the GIC's.
+- **The barrier built-ins are exactly the vocabulary virtio needs**: `dmb(ishst)` before publishing the
+  available index, `dmb(oshst)` between it and the notify store to Device memory (Linux's `writel`
+  barrier), `dmb(ishld)` between reading the used index and its elements, `dsb(st)` before
+  `QueueReady`. No asm block in the driver. (finding 28's items 1 and 2 are answered by them.)
+- **Module storage with no initializer is zero, and `@main` stays empty**: `private var disk: Disk` (an
+  `IrqLock`, a `WaitQueue`, pointers, counters) and `private var slots: [8]Slot` fill no `main`
+  (finding 31 checked with `emit-llvm`).
+- **`sysl_bounds_fail` is an `@export` away.** keel's version (in `keel.trap`, `@no_alloc`) prints the
+  form, values, length and `file:line:column` — `keel: bounds check failed: index a=121 b=0 length=3
+  at keel/selftest/bounds.sysl:15:15` — and powers off. The location string is NUL-terminated, read
+  through a `*u8`.
+- **Wire structs at their natural order.** virtio's fields are little-endian, which is aarch64's order,
+  so the structs are plain integers; a struct field cannot state a byte order (`sysl.encoding`'s
+  `get_u32_le` works on byte slices, not on a volatile field), which would matter only on a big-endian
+  target, of which sysl has none.
+- **Unsigned arithmetic wraps**, so the free-running 16-bit ring indices are `i + 1` on a `u16`.
+- Padding the queue's struct to place each ring on its own boundary took hand-counted `pad` arrays
+  (finding 30: a field cannot ask for alignment).
+- Controls: not waiting for the used ring (`run` returns after the notify) fails at once — `disk read
+  failed: device error`, `disk smp wrong: good 64 bad 336`. Not acknowledging the interrupt either hangs
+  the run (an interrupt storm on the boot core) or, when the other cores finish first, shows as 719
+  interrupts for 400 requests; the test now fails on more interrupts than requests. **Removing all three
+  ring barriers does not fail** (5/5 HVF, 3/3 TCG): QEMU's device model reads the rings in its own
+  thread after a trapping MMIO notify, which serialises the guest's stores, so no test here can show a
+  missing virtio barrier; they are right by the specification. Without keel's `sysl_bounds_fail`, the
+  compiler's `brk #1` now halts through the trap handler (`not keel's breakpoint, halted`), and the
+  ordered check fails on the missing `bounds check failed` line.
+
 ## What worked in milestone 6
 
 - **A user program is ordinary sysl.** `print`, `s"..."` interpolation, `val`/`var`, `loop`, a
