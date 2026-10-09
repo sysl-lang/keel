@@ -1,0 +1,56 @@
+// udpecho <port> <seconds>: answer every UDP datagram sent to <port> with the same bytes, until one says
+// "bye" (answered too) or <seconds> pass with nothing arriving. Exits 0 after a "bye", 1 otherwise.
+//
+// The socket calls are keel.user's, not the standard library's: `sysl.posix.net` is TCP over C shims
+// and has no seam a target without a C library could answer (FINDINGS.md 54).
+
+import abi.keel.abi.{ETIMEDOUT, Errno}
+import rt.keel.user
+import sysl.text.parse_int
+
+main(args: []string)
+    user.exit(serve(args))
+
+private serve(args: []string) -> int
+    if args.len != 3
+        print("usage: udpecho <port> <seconds>")
+        return 2
+    val port = parse_int(args[1]) match
+        Ok(n) if n > 0 && n < 65536 -> u16(n)
+        _ ->
+            print("udpecho: not a port:", args[1])
+            return 2
+    val seconds = parse_int(args[2]) match
+        Ok(n) if n > 0 -> u64(n)
+        _ ->
+            print("udpecho: not a number of seconds:", args[2])
+            return 2
+
+    val sd = user.socket() match
+        Ok(s) -> s
+        Err(e) -> return failed("socket", e)
+    user.bind(sd, port) match
+        Ok(_) -> ()
+        Err(e) -> return failed("bind", e)
+    print("udpecho: listening on port", port)
+
+    var served = 0
+    var buf: [1472]u8 = [0; 1472]
+    loop
+        val (n, from) = user.recvfrom(sd, buf[..], seconds * 1000) match
+            Ok(got) -> got
+            Err(ETIMEDOUT) ->
+                print("udpecho: nothing for", seconds, "seconds; served", served)
+                return 1
+            Err(e) -> return failed("recvfrom", e)
+        val data = buf[0..<usize(n)]
+        user.sendto(sd, data, from) match
+            Ok(_) -> served += 1
+            Err(e) -> return failed("sendto", e)
+        if n == 3 && data[0] == u8('b') && data[1] == u8('y') && data[2] == u8('e')
+            print("udpecho: bye after", served, "datagrams")
+            return 0
+
+private failed(what: string, e: Errno) -> int
+    print("udpecho:", what, "failed, errno", i64(e))
+    1

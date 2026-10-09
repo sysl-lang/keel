@@ -3,7 +3,7 @@ module keel.proc
 import abi.keel.abi.{EFAULT, ENOSYS, Errno, STDERR, STDIN, STDOUT, SYS_ACCESS, SYS_BRK, SYS_CHDIR, SYS_CLOSE,
     SYS_EXIT, SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR,
     SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN, SYS_STAT, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINK, SYS_WAIT,
-    SYS_WRITE}
+    SYS_WRITE, SYS_SOCKET, SYS_BIND, SYS_RECVFROM, SYS_SENDTO, SYS_SOCKCLOSE}
 import keel.console
 import keel.fs
 import keel.mm
@@ -46,6 +46,11 @@ private[proc] system_call(regs: *u64)
         SYS_SPAWN -> sys_spawn(p, regs)
         SYS_WAIT -> sys_wait(p, regs)
         SYS_GETPPID -> sys_getppid(p, regs)
+        SYS_SOCKET -> sys_socket(p)
+        SYS_BIND -> sys_bind(p, regs)
+        SYS_RECVFROM -> sys_recvfrom(p, regs)
+        SYS_SENDTO -> sys_sendto(p, regs)
+        SYS_SOCKCLOSE -> sys_sockclose(p, regs)
         else Err(ENOSYS)
     regs[0] = r match
         Ok(v) -> u64(v)

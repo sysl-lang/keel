@@ -1,0 +1,59 @@
+module keel.selftest
+
+// What milestone 11 is for: the virtio network card the boot test attaches to QEMU's user-mode network
+// (slirp), with host UDP port KEEL_UDP_PORT forwarded to keel's port 7. keel pings the gateway (slirp
+// answers ICMP echo for 10.0.2.2; a ping from the host cannot reach the guest through slirp), then
+// serves UDP echo on port 7 while the script's client, on the host, sends datagrams to the forwarded
+// port and checks each comes back. The client ends by sending "bye", which is what this waits for.
+
+import keel.net
+import keel.proc
+
+private const PING_TIMEOUT_MS: u64 = 3000
+private const ECHO_TIMEOUT_MS: u64 = 10000
+
+// Bring the network up and run the kernel's half of the test. Answers whether the network is up, for
+// the user-mode half that follows.
+network() -> bool
+    val mac = net.up() match
+        Some(m) -> m
+        None ->
+            print("keel: no virtio-net card")
+            return false
+    print("keel: virtio-net found, mac", net.mac_text(mac))
+
+    net.ping(net.gateway(), PING_TIMEOUT_MS) match
+        Some(_) -> print("keel: ping gateway ok")
+        None -> print("keel: ping gateway failed")
+
+    val (bye, echoed) = net.echo_wait(ECHO_TIMEOUT_MS)
+    if bye
+        print("keel: udp echo served", echoed)
+    else
+        print("keel: udp echo saw no bye; echoed", echoed)
+
+    // The same service from EL0: /bin/udpecho on USER_ECHO_PORT through the socket calls, which the
+    // client reaches through the second forwarded port.
+    proc.start_with("/bin/udpecho", ["udpecho", USER_ECHO_PORT, USER_ECHO_SECONDS]) match
+        Ok(p) ->
+            proc.wait(p)
+            if proc.exited(p)
+                print("keel: udpecho exited", proc.exit_code(p))
+            else
+                print("keel: udpecho", proc.why(p))
+        Err(_) -> print("keel: udpecho did not load")
+    true
+
+private const USER_ECHO_PORT: string = "8007"
+private const USER_ECHO_SECONDS: string = "10"
+
+// After the user-mode half: stop the stack's thread, and report what it saw.
+network_down()
+    val s = net.stats()
+    net.down()
+    if net.sockets_open() == 0
+        print("keel: network down, sockets closed")
+    else
+        print("keel: network down,", net.sockets_open(), "sockets left open")
+    if s.bad_ip_checksums != 0 || s.bad_udp_checksums != 0
+        print("keel: bad checksums received: ip", s.bad_ip_checksums, "udp", s.bad_udp_checksums)

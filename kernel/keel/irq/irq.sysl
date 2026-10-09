@@ -5,6 +5,7 @@ module keel.irq
 
 import keel.console
 import keel.gic
+import keel.net
 import keel.sched
 import keel.timer
 import keel.virtio
@@ -24,11 +25,14 @@ dispatch()
     if id == timer.IRQ
         timer.rearm()
         ticks.add(1, Ordering.Relaxed)
+        net.net_tick()
         sched.tick()
     else if id == gic.RESCHEDULE
         sched.reschedule_requested()
     else if id == virtio.irq()
         virtio.interrupt()
+    else if id == net.nic_irq()
+        net.nic_interrupt()
     else if id == console.irq()
         console.interrupt()
     else

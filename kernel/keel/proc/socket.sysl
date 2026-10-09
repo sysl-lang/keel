@@ -1,0 +1,75 @@
+module keel.proc
+
+// The datagram socket calls (user/abi has the numbers), over keel.net's socket table. A socket is not a
+// file descriptor: it is numbered by its place in keel.net's table and belongs to the process that
+// opened it, which is all a first slice needs, and a process's sockets are closed when it ends.
+//
+// A datagram crosses the user boundary through a kernel buffer on this thread's stack, as the console's
+// bytes do: keel.net copies under its lock, and the copy to or from user memory is made outside it.
+
+import abi.keel.abi.{EADDRINUSE, EBADF, EDESTADDRREQ, EFAULT, EHOSTUNREACH, EMSGSIZE, ENETDOWN, ENFILE, Errno,
+    ETIMEDOUT, SockAddr}
+import keel.mm
+import keel.net
+import keel.net.{Ip, NetError}
+import keel.sched.Process
+
+private errno(e: NetError) -> Errno = e match
+    NoNet -> ENETDOWN
+    NoSocket -> EBADF
+    TableFull -> ENFILE
+    PortInUse -> EADDRINUSE
+    NotBound -> EDESTADDRREQ
+    TooLong -> EMSGSIZE
+    TimedOut -> ETIMEDOUT
+    NoRoute -> EHOSTUNREACH
+
+// socket() -> a socket number
+private[proc] sys_socket(p: *Process) -> Result[i64, Errno] = net.socket_open(p.pid) match
+    Ok(sd) -> Ok(i64(sd))
+    Err(e) -> Err(errno(e))
+
+// bind(sd, port) -> 0
+private[proc] sys_bind(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[1] > 0xffff then return Err(Errno.EINVAL)
+    net.socket_bind(usize(regs[0]), p.pid, u16(regs[1])) match
+        Ok(_) -> Ok(0)
+        Err(e) -> Err(errno(e))
+
+// recvfrom(sd, buf, len, *SockAddr, timeout_ms) -> bytes: the oldest datagram, cut to `len`, and who
+// sent it; waits up to `timeout_ms` (0: for ever).
+private[proc] sys_recvfrom(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val buf = regs[1]
+    val len = if regs[2] < u64(net.MAX_PAYLOAD) then usize(regs[2]) else net.MAX_PAYLOAD
+    val from = regs[3]
+    if !mm.user_range(&p.space, buf, u64(len), true) then return Err(EFAULT)
+    if from != 0 && !mm.user_range(&p.space, from, u64(sizeof(SockAddr)), true) then return Err(EFAULT)
+    var bytes: [net.MAX_PAYLOAD]u8 = [0; net.MAX_PAYLOAD]
+    val (n, ip, port) = net.socket_recv(usize(regs[0]), p.pid, bytes[0..<len], regs[4]) match
+        Ok(got) -> got
+        Err(e) -> return Err(errno(e))
+    if !mm.copy_to_user(&p.space, buf, bytes[0..<n]) then return Err(EFAULT)
+    if from != 0
+        var who = SockAddr(u32(ip), port, 0)
+        val raw: *u8 = ptr_cast(&who)
+        if !mm.copy_to_user(&p.space, from, raw[0..<sizeof(SockAddr)]) then return Err(EFAULT)
+    Ok(i64(n))
+
+// sendto(sd, buf, len, *SockAddr) -> bytes
+private[proc] sys_sendto(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[2] > u64(net.MAX_PAYLOAD) then return Err(EMSGSIZE)
+    val len = usize(regs[2])
+    var bytes: [net.MAX_PAYLOAD]u8 = [0; net.MAX_PAYLOAD]
+    if !mm.copy_from_user(&p.space, regs[1], bytes[0..<len]) then return Err(EFAULT)
+    var to = SockAddr(0, 0, 0)
+    var raw: *u8 = ptr_cast(&to)
+    if !mm.copy_from_user(&p.space, regs[3], raw[0..<sizeof(SockAddr)]) then return Err(EFAULT)
+    net.socket_send(usize(regs[0]), p.pid, Ip(to.ip), to.port, bytes[0..<len]) match
+        Ok(n) -> Ok(i64(n))
+        Err(e) -> Err(errno(e))
+
+// sockclose(sd) -> 0
+private[proc] sys_sockclose(p: *Process, regs: *u64) -> Result[i64, Errno] =
+    net.socket_close(usize(regs[0]), p.pid) match
+        Ok(_) -> Ok(0)
+        Err(e) -> Err(errno(e))

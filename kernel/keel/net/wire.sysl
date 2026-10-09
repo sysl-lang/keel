@@ -1,0 +1,149 @@
+module keel.net
+
+// What a packet looks like on the wire: Ethernet II, ARP, IPv4, ICMP and UDP headers, every multi-byte
+// field big-endian.
+//
+// A header is a struct viewed over the frame's bytes (`at`), which is the raw tier (FINDINGS.md 39). A
+// big-endian field cannot be declared as an integer: sysl lays an integer field out in the machine's
+// order and has no byte order for a field or a struct, and its library deliberately has no byte swap
+// (FINDINGS.md 51). So a 16- or 32-bit field is `Be16`/`Be32`, its bytes in wire order, read with `get`
+// and written with `be16`/`be32`. Every field is bytes, so every header has alignment 1 and may sit at
+// any offset in a frame — the IPv4 header starts 14 bytes in.
+
+import sysl.slices.as_mut_ptr
+
+struct Be16
+    hi: u8
+    lo: u8
+
+    get(self) -> u16 = u16(self.hi) << 8 | u16(self.lo)
+
+be16(v: u16) -> Be16 = Be16(u8(v >> 8), u8(v & 0xff))
+
+struct Be32
+    b: [4]u8
+
+    get(self) -> u32 = u32(self.b[0]) << 24 | u32(self.b[1]) << 16 | u32(self.b[2]) << 8 | u32(self.b[3])
+
+be32(v: u32) -> Be32 = Be32([u8(v >> 24), u8((v >> 16) & 0xff), u8((v >> 8) & 0xff), u8(v & 0xff)])
+
+// An IPv4 address, as the number its four bytes spell (10.0.2.15 is 0x0a00_020f). A `new` type has no
+// zero and no constant (FINDINGS.md 52), so storage the kernel zero-fills holds an address as its `u32`,
+// and the well-known addresses are functions.
+type Ip = new u32
+
+ip(a: u8, b: u8, c: u8, d: u8) -> Ip = Ip(u32(a) << 24 | u32(b) << 16 | u32(c) << 8 | u32(d))
+
+struct Mac
+    b: [6]u8
+
+broadcast() -> Mac = Mac([0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
+
+same_mac(a: Mac, b: Mac) -> bool
+    for i in 0..<6
+        if a.b[i] != b.b[i] then return false
+    true
+
+struct EthHeader
+    dst: Mac
+    src: Mac
+    kind: Be16                                  // the EtherType
+
+const ETH_HEADER: usize = 14
+const ETH_MIN: usize = 60                       // a shorter frame is padded with zeros
+const ETH_MAX: usize = 1514
+const ETHERTYPE_IPV4: u16 = 0x0800
+const ETHERTYPE_ARP: u16 = 0x0806
+
+// An ARP packet for IPv4 over Ethernet (RFC 826).
+struct ArpPacket
+    htype: Be16                                 // 1, Ethernet
+    ptype: Be16                                 // 0x0800, IPv4
+    hlen: u8                                    // 6
+    plen: u8                                    // 4
+    op: Be16
+    sha: Mac                                    // sender's hardware address
+    spa: Be32                                   // sender's protocol address
+    tha: Mac
+    tpa: Be32
+
+const ARP_PACKET: usize = 28
+const ARP_REQUEST: u16 = 1
+const ARP_REPLY: u16 = 2
+
+// An IPv4 header without options (RFC 791); a received one may carry options, which `ihl` steps over.
+struct Ipv4Header
+    ver_ihl: u8                                 // version 4 in the high nibble, header words in the low
+    tos: u8
+    total: Be16                                 // header and payload, in bytes
+    id: Be16
+    frag: Be16                                  // flags (bit 13 is "more fragments") and the offset
+    ttl: u8
+    proto: u8
+    checksum: Be16
+    src: Be32
+    dst: Be32
+
+const IPV4_HEADER: usize = 20
+const PROTO_ICMP: u8 = 1
+const PROTO_UDP: u8 = 17
+const FRAG_MORE: u16 = 0x2000
+const FRAG_OFFSET: u16 = 0x1fff
+
+struct IcmpEcho
+    kind: u8                                    // 8 a request, 0 a reply
+    code: u8
+    checksum: Be16
+    id: Be16
+    seq: Be16
+
+const ICMP_ECHO_HEADER: usize = 8
+const ICMP_ECHO_REQUEST: u8 = 8
+const ICMP_ECHO_REPLY: u8 = 0
+
+struct UdpHeader
+    src_port: Be16
+    dst_port: Be16
+    len: Be16                                   // header and payload
+    checksum: Be16                              // 0: the sender computed none
+
+const UDP_HEADER: usize = 8
+
+@assert(sizeof(EthHeader) == ETH_HEADER, "an Ethernet header is 14 bytes")
+@assert(sizeof(ArpPacket) == ARP_PACKET, "an ARP packet is 28 bytes")
+@assert(sizeof(Ipv4Header) == IPV4_HEADER, "an IPv4 header is 20 bytes")
+@assert(sizeof(IcmpEcho) == ICMP_ECHO_HEADER, "an ICMP echo header is 8 bytes")
+@assert(sizeof(UdpHeader) == UDP_HEADER, "a UDP header is 8 bytes")
+@assert(alignof(Ipv4Header) == 1, "a header may sit at any offset in a frame")
+
+// The header of type T at `offset` in `bytes`, which must hold all of it. Raw: nothing checks that T is
+// only bytes (FINDINGS.md 39), which is what makes any bit pattern a valid header here.
+at[T](bytes: []u8, offset: usize) -> *T
+    if offset + sizeof(T) > bytes.len then panic("keel.net: a header past the end of its frame")
+    ptr_cast(usize(as_mut_ptr(bytes)) + offset)
+
+// The Internet checksum (RFC 1071): the ones' complement of the ones' complement sum of the bytes taken
+// as big-endian 16-bit words, an odd last byte padded with zero. `start` is a sum to continue from (a
+// pseudo-header's). A block that holds its own correct checksum sums to 0.
+checksum(bytes: []const u8, start: u32) -> u16 = u16(~fold(sum16(bytes, start)) & 0xffff)
+
+sum16(bytes: []const u8, start: u32) -> u32
+    var sum = start
+    var i: usize = 0
+    while i + 1 < bytes.len
+        sum += u32(bytes[i]) << 8 | u32(bytes[i + 1])
+        i += 2
+    if i < bytes.len then sum += u32(bytes[i]) << 8
+    fold(sum)
+
+private fold(s: u32) -> u32
+    var sum = s
+    while sum > 0xffff
+        sum = (sum & 0xffff) + (sum >> 16)
+    sum
+
+// The UDP pseudo-header's sum (RFC 768): the two addresses, the protocol and the UDP length.
+pseudo_sum(src: Ip, dst: Ip, proto: u8, len: usize) -> u32
+    val s = u32(src)
+    val d = u32(dst)
+    fold((s >> 16) + (s & 0xffff) + (d >> 16) + (d & 0xffff) + u32(proto) + u32(len))

@@ -31,36 +31,6 @@ const SECTOR_SIZE: usize = 512
 private const QUEUE_SIZE: usize = 32            // descriptors; a power of two, at most QueueNumMax
 private const SLOTS: usize = 8                  // requests in flight: three descriptors each
 
-// A descriptor (§ 2.7.5): a buffer's physical address and length, and the next in its chain.
-struct Desc
-    addr: volatile u64
-    len: volatile u32
-    flags: volatile u16
-    next: volatile u16
-
-@assert(sizeof(Desc) == 16, "a virtq descriptor is 16 bytes")
-
-private const DESC_NEXT: u16 = 1                // `next` continues the chain
-private const DESC_WRITE: u16 = 2               // the device writes this buffer (else reads it)
-
-// The available ring (§ 2.7.6): what the driver offers. `idx` counts offers for ever, wrapping at 2^16.
-struct Avail
-    flags: volatile u16
-    idx: volatile u16
-    ring: [QUEUE_SIZE]volatile u16
-    used_event: volatile u16
-
-struct UsedElem
-    id: volatile u32                            // the head of the chain that completed
-    len: volatile u32                           // bytes the device wrote into it
-
-// The used ring (§ 2.7.8): what the device has finished.
-struct Used
-    flags: volatile u16
-    idx: volatile u16
-    ring: [QUEUE_SIZE]UsedElem
-    avail_event: volatile u16
-
 // A block request's header (§ 5.2.6), which the device reads.
 struct ReqHeader
     kind: u32
@@ -76,9 +46,9 @@ private const STATUS_UNSET: u8 = 0xff           // written before submitting; th
 // the available ring 2 and the used ring 4; each starts on its own boundary here.
 struct Shared
     desc: [QUEUE_SIZE]Desc                      // 0x000
-    avail: Avail                                // 0x200
+    avail: Avail[QUEUE_SIZE]                    // 0x200
     pad0: [442]u8
-    used: Used                                  // 0x400
+    used: Used[QUEUE_SIZE]                      // 0x400
     pad1: [760]u8
     headers: [SLOTS]ReqHeader                   // 0x800
     status: [SLOTS]volatile u8                  // 0x880
@@ -139,22 +109,8 @@ init() -> Option[u64]
         print("keel: virtio-blk is legacy (version", r.version, "); QEMU needs force-legacy=false")
         return None
 
-    r.status = 0
-    r.status = ACKNOWLEDGE
-    r.status = ACKNOWLEDGE | DRIVER
-
-    r.device_features_sel = 1
-    if (r.device_features & F_VERSION_1_BANK1) == 0 then return fail(r, "the device is not virtio 1")
-    r.driver_features_sel = 0
-    r.driver_features = 0                       // no block features: no flush, no read-only, ...
-    r.driver_features_sel = 1
-    r.driver_features = F_VERSION_1_BANK1
-    r.status = ACKNOWLEDGE | DRIVER | FEATURES_OK
-    if (r.status & FEATURES_OK) == 0 then return fail(r, "the device refused the features")
-
-    r.queue_sel = 0
-    if r.queue_ready != 0 then return fail(r, "queue 0 is already live")
-    if usize(r.queue_num_max) < QUEUE_SIZE then return fail(r, "queue 0 is too small")
+    // No block features: no flush, no read-only, ...
+    if negotiate(r, 0).is_none() then return fail(r, "the device is not virtio 1, or refused it")
 
     val frame = mm.alloc_frames(SHARED_FRAMES) match
         Some(f) -> f
@@ -179,20 +135,8 @@ init() -> Option[u64]
         sh.desc[d + 2].len = 1
         sh.desc[d + 2].flags = DESC_WRITE
 
-    r.queue_num = u32(QUEUE_SIZE)
-    val desc_pa = phys(usize(&sh.desc[0]))
-    val avail_pa = phys(usize(&sh.avail))
-    val used_pa = phys(usize(&sh.used))
-    r.queue_desc_low = u32(desc_pa & 0xffff_ffff)
-    r.queue_desc_high = u32(desc_pa >> 32)
-    r.queue_driver_low = u32(avail_pa & 0xffff_ffff)
-    r.queue_driver_high = u32(avail_pa >> 32)
-    r.queue_device_low = u32(used_pa & 0xffff_ffff)
-    r.queue_device_high = u32(used_pa >> 32)
-    // The table and the rings are in Normal memory and the device may read them as soon as the queue
-    // is ready: complete those stores first.
-    dsb(st)
-    r.queue_ready = 1
+    if !set_queue(r, 0, QUEUE_SIZE, phys(usize(&sh.desc[0])), phys(usize(&sh.avail)), phys(usize(&sh.used)))
+        return fail(r, "queue 0 is live already or too small")
 
     val flags = disk.lock.lock()
     disk.regs = r
@@ -203,11 +147,11 @@ init() -> Option[u64]
     disk.lock.unlock(flags)
 
     gic.enable_spi(t.irq, cpu.core_id())
-    r.status = ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK
+    driver_ok(r)
     Some(disk.capacity)
 
 private fail(r: *Regs, why: string) -> Option[u64]
-    r.status = r.status | FAILED
+    mark_failed(r)
     print("keel: virtio-blk:", why)
     None
 
@@ -294,9 +238,6 @@ private run(s: usize, kind: u32, sector: u64) -> u8
     while !slots[s].done
         slots[s].waiters.sleep(&disk.lock)
     sh.status[s]
-
-// The ring indices are free-running 16-bit counters, as sysl's `u16` arithmetic is.
-private next_index(i: u16) -> u16 = i + 1
 
 // The disk's interrupt, from keel.irq.dispatch (IRQ context, so under keel.trap's `@no_alloc`):
 // acknowledge it, then take every completion the used ring holds. Acknowledging first means a

@@ -117,6 +117,10 @@ kmain(dtb_pa: u64) -> never
     selftest.user()
     selftest.files()
 
+    // Milestone 11: the network, from the kernel and then from a user program.
+    if selftest.network()
+        selftest.network_down()
+
     // Milestone 10: init and the shell, on the console, until the shell exits.
     selftest.session()
 

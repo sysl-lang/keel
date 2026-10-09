@@ -3,6 +3,7 @@ module keel.proc
 import keel.cpu
 import keel.fs
 import keel.mm
+import keel.net
 import keel.sched
 import keel.sched.{Context, OpenFile, Process}
 import sysl.sync.{Atomic, Ordering}
@@ -126,6 +127,7 @@ private run(p: *Process, entry: u64, sp: u64)
 
     // Whatever the process left open is closed for it, however it ended; then its parent may reap it.
     fs.close_all(p)
+    net.close_sockets_of(p.pid)
     ended(p)
 
 // Wait for a process the kernel started to end, then give its address space back.

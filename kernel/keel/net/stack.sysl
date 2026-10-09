@@ -1,0 +1,538 @@
+module keel.net
+
+// A minimal IPv4 stack over the virtio network card: Ethernet, ARP, IPv4 (no fragments, no options sent),
+// ICMP echo in both directions, and UDP — a kernel echo service on port 7 and a small table of
+// datagram sockets for user programs.
+//
+//   up() / down()          bring the card and the stack's thread up; stop and join the thread
+//   ping(ip, ms)           an ICMP echo to `ip`, answered within `ms` or not
+//   echo_wait(ms)          wait for the port-7 echo service to see the word "bye"
+//   socket_* functions     what keel.proc's socket system calls are made of
+//
+// The address is QEMU's user-mode network's (slirp): keel is 10.0.2.15/24, the gateway 10.0.2.2.
+//
+// One IrqLock, `lock`, guards everything here and in nic.sysl: the card's rings, the ARP table, the
+// sockets and the counters. The card's interrupt takes it to acknowledge and wake `events`. The stack's
+// thread (`netd`) sleeps on `events` until a frame is in the receive ring, then handles each frame
+// where the device put it, holding the lock throughout: replies (ARP, ICMP, the echo service) are sent
+// from there, and a datagram for a socket is copied into the socket's queue. Nothing that holds the
+// lock sleeps except through `events.sleep`, which gives it up.
+//
+// A thread that waits for the network with a deadline (`ping`, `resolve`, a socket's receive) sleeps on
+// `events` too; the timer's interrupt wakes `events` every tick while anyone is waiting with a deadline
+// (`net_tick`), and the sleeper looks at the clock. That is a 10 ms timeout made of the two mechanisms
+// keel already has; keel has no timed sleep.
+
+import keel.sched.{IrqLock, Thread, WaitQueue, join, spawn}
+import keel.timer
+import sysl.sync.{Atomic, Ordering}
+
+// Both zero until `up`: the lock free, the queue empty.
+private[net] var lock: IrqLock
+private[net] var events: WaitQueue
+
+// How many threads are asleep on `events` with a deadline; the timer wakes `events` only while this is
+// not zero. An atomic, as the timer reads it on every core without the lock.
+private var timed_waiters: Atomic[u64] = Atomic(0)
+
+our_ip() -> Ip = ip(10, 0, 2, 15)
+gateway() -> Ip = ip(10, 0, 2, 2)
+private const NETMASK: u32 = 0xffff_ff00
+const ECHO_PORT: u16 = 7
+
+// Off only to show the receiving side checks: with it on, every IPv4 header keel sends carries a
+// checksum one too high, and slirp drops each of them (scripts/boot-test.sh's control).
+private const SPOIL_IP_CHECKSUM: bool = false
+
+private const ARP_ENTRIES: usize = 8
+private const SOCKETS: usize = 4
+private const SOCKET_QUEUE: usize = 4
+const MAX_PAYLOAD: usize = ETH_MAX - ETH_HEADER - IPV4_HEADER - UDP_HEADER    // 1472
+
+private struct ArpEntry
+    valid: bool
+    ip: u32
+    mac: Mac
+
+private struct Datagram
+    from: u32
+    from_port: u16
+    len: usize
+    bytes: [MAX_PAYLOAD]u8
+
+private struct Socket
+    open: bool
+    owner: u64                                  // the pid that opened it
+    port: u16                                   // 0 until bound
+    head: usize                                 // the oldest queued datagram
+    count: usize
+    queue: [SOCKET_QUEUE]Datagram
+
+// What the stack has seen and done since `up`.
+struct NetStats
+    frames: u64
+    arp_replies_sent: u64
+    ip_packets: u64
+    bad_ip_checksums: u64
+    fragments_dropped: u64
+    echo_requests: u64
+    echo_replies: u64
+    udp_datagrams: u64
+    bad_udp_checksums: u64
+    no_socket: u64
+    socket_overflows: u64
+    echoed: u64
+
+private struct Stack
+    running: bool
+    stopping: bool
+    mac: Mac
+    next_id: u16                                // the IPv4 identification of the next packet sent
+    arp: [ARP_ENTRIES]ArpEntry
+    arp_next: usize                             // the entry the next new address replaces
+    ping_seq: u16                               // the sequence number `ping` waits for
+    ping_answered: bool
+    bye_seen: bool
+    stats: NetStats
+
+private var stack: Stack
+private var sockets: [SOCKETS]Socket
+private var netd_thread: Option[&sync Thread] = None
+
+// Bring the card up and start the stack's thread. Answers the card's address, or None if there is no
+// card. Run once.
+up() -> Option[Mac]
+    val mac = init_nic()?
+    val flags = lock.lock()
+    stack.mac = mac
+    stack.running = true
+    lock.unlock(flags)
+    netd_thread = Some(spawn(netd))
+    Some(mac)
+
+// Stop the stack's thread and wait for it to end. The card stays up, and frames that arrive are left
+// in its ring.
+down()
+    val flags = lock.lock()
+    stack.stopping = true
+    events.wake_all()
+    lock.unlock(flags)
+    netd_thread match
+        Some(t) -> join(t)
+        None -> ()
+    netd_thread = None
+
+stats() -> NetStats
+    val flags = lock.lock()
+    val s = stack.stats
+    lock.unlock(flags)
+    s
+
+// The timer's interrupt, on every core, every tick: wake whoever is waiting with a deadline.
+net_tick()
+    if timed_waiters.load(Ordering.Relaxed) == 0 then return
+    val flags = lock.lock()
+    events.wake_all()
+    lock.unlock(flags)
+
+// Milliseconds since the counter started.
+now_ms() -> u64 = timer.now_ms()
+
+// Sleep on `events` until woken, unless `deadline` (in `now_ms` terms) has passed; answers false then.
+// Holding `lock`, which the sleep gives up.
+private[net] wait_until(deadline: u64) -> bool
+    if now_ms() >= deadline then return false
+    timed_waiters.add(1, Ordering.Relaxed)
+    events.sleep(&lock)
+    timed_waiters.sub(1, Ordering.Relaxed)
+    true
+
+// The stack's thread: handle every received frame, then sleep until the card's interrupt says there
+// are more.
+private netd()
+    val flags = lock.lock()
+    loop
+        if stack.stopping then break
+        rx_take() match
+            Some((frame, id)) ->
+                receive(frame)
+                rx_done(id)
+            None -> events.sleep(&lock)
+    stack.running = false
+    lock.unlock(flags)
+
+// One Ethernet frame. Holding `lock`.
+private receive(frame: []u8)
+    stack.stats.frames += 1
+    if frame.len < ETH_HEADER then return
+    val eth: *EthHeader = at(frame, 0)
+    if !same_mac(eth.dst, stack.mac) && !same_mac(eth.dst, broadcast()) then return
+    val kind = eth.kind.get()
+    if kind == ETHERTYPE_ARP
+        receive_arp(frame)
+    else if kind == ETHERTYPE_IPV4
+        receive_ipv4(frame)
+
+// ARP: learn the sender, and answer a request for our address.
+private receive_arp(frame: []u8)
+    if frame.len < ETH_HEADER + ARP_PACKET then return
+    val a: *ArpPacket = at(frame, ETH_HEADER)
+    if a.htype.get() != 1 || a.ptype.get() != ETHERTYPE_IPV4 || a.hlen != 6 || a.plen != 4 then return
+    val sender = Ip(a.spa.get())
+    learn(sender, a.sha)
+    if a.op.get() == ARP_REQUEST && Ip(a.tpa.get()) == our_ip()
+        send_arp(ARP_REPLY, a.sha, sender)
+        stack.stats.arp_replies_sent += 1
+    // Someone waiting in `resolve` may now have its answer.
+    events.wake_all()
+
+private send_arp(op: u16, to: Mac, target: Ip)
+    var out: [ETH_HEADER + ARP_PACKET]u8 = [0; ETH_HEADER + ARP_PACKET]
+    val eth: *EthHeader = at(out[..], 0)
+    eth.dst = if op == ARP_REQUEST then broadcast() else to
+    eth.src = stack.mac
+    eth.kind = be16(ETHERTYPE_ARP)
+    val a: *ArpPacket = at(out[..], ETH_HEADER)
+    a.htype = be16(1)
+    a.ptype = be16(ETHERTYPE_IPV4)
+    a.hlen = 6
+    a.plen = 4
+    a.op = be16(op)
+    a.sha = stack.mac
+    a.spa = be32(u32(our_ip()))
+    a.tha = if op == ARP_REQUEST then Mac([0; 6]) else to
+    a.tpa = be32(u32(target))
+    val _ = transmit(out[..])
+
+private learn(ip: Ip, mac: Mac)
+    for i in 0..<ARP_ENTRIES
+        if stack.arp[i].valid && stack.arp[i].ip == u32(ip)
+            stack.arp[i].mac = mac
+            return
+    stack.arp[stack.arp_next] = ArpEntry(true, u32(ip), mac)
+    stack.arp_next = (stack.arp_next + 1) % ARP_ENTRIES
+
+private lookup(ip: Ip) -> Option[Mac]
+    for i in 0..<ARP_ENTRIES
+        if stack.arp[i].valid && stack.arp[i].ip == u32(ip) then return Some(stack.arp[i].mac)
+    None
+
+// The hardware address to send a packet for `dst` to: its own on our subnet, the gateway's otherwise.
+// Asks by ARP, once a second, until `deadline`. Holding `lock`; may sleep.
+private[net] resolve(dst: Ip, deadline: u64) -> Option[Mac]
+    val hop = if (u32(dst) & NETMASK) == (u32(our_ip()) & NETMASK) then dst else gateway()
+    var asked_at: u64 = 0
+    loop
+        lookup(hop) match
+            Some(m) -> return Some(m)
+            None -> ()
+        val now = now_ms()
+        if asked_at == 0 || now - asked_at >= 1000
+            send_arp(ARP_REQUEST, broadcast(), hop)
+            asked_at = now
+        if !wait_until(deadline) then return None
+
+// An IPv4 packet: the header checked, then handed on by protocol. Holding `lock`.
+private receive_ipv4(frame: []u8)
+    if frame.len < ETH_HEADER + IPV4_HEADER then return
+    val h: *Ipv4Header = at(frame, ETH_HEADER)
+    val header_len = usize(h.ver_ihl & 0xf) * 4
+    val total = usize(h.total.get())
+    if (h.ver_ihl >> 4) != 4 || header_len < IPV4_HEADER || total < header_len then return
+    if ETH_HEADER + total > frame.len then return
+    stack.stats.ip_packets += 1
+    if checksum(frame[ETH_HEADER..<ETH_HEADER + header_len], 0) != 0
+        stack.stats.bad_ip_checksums += 1
+        return
+    if (h.frag.get() & (FRAG_MORE | FRAG_OFFSET)) != 0
+        stack.stats.fragments_dropped += 1
+        return
+    if Ip(h.dst.get()) != our_ip() then return
+    val eth: *EthHeader = at(frame, 0)
+    val from = Ip(h.src.get())
+    val payload = frame[ETH_HEADER + header_len..<ETH_HEADER + total]
+    if h.proto == PROTO_ICMP
+        receive_icmp(eth.src, from, payload)
+    else if h.proto == PROTO_UDP
+        receive_udp(eth.src, from, payload)
+
+// The offset of an IPv4 packet's payload in a frame keel builds (no options).
+private const PAYLOAD_AT: usize = ETH_HEADER + IPV4_HEADER
+
+// Put the Ethernet and IPv4 headers in front of the `len` bytes of payload already at `PAYLOAD_AT` in
+// `out`, and send the frame. Holding `lock`.
+private send_ipv4(out: []u8, to: Mac, dst: Ip, proto: u8, len: usize) -> bool
+    val eth: *EthHeader = at(out, 0)
+    eth.dst = to
+    eth.src = stack.mac
+    eth.kind = be16(ETHERTYPE_IPV4)
+    val h: *Ipv4Header = at(out, ETH_HEADER)
+    h.ver_ihl = 0x45
+    h.tos = 0
+    h.total = be16(u16(IPV4_HEADER + len))
+    h.id = be16(stack.next_id)
+    stack.next_id += 1
+    h.frag = be16(0)
+    h.ttl = 64
+    h.proto = proto
+    h.checksum = be16(0)
+    h.src = be32(u32(our_ip()))
+    h.dst = be32(u32(dst))
+    val sum = checksum(out[ETH_HEADER..<PAYLOAD_AT], 0)
+    h.checksum = be16(if SPOIL_IP_CHECKSUM then sum + 1 else sum)
+    transmit(out[0..<PAYLOAD_AT + len])
+
+// ICMP: answer an echo request; note an echo reply `ping` is waiting for. Holding `lock`.
+private receive_icmp(mac: Mac, from: Ip, payload: []u8)
+    if payload.len < ICMP_ECHO_HEADER || checksum(payload, 0) != 0 then return
+    val e: *IcmpEcho = at(payload, 0)
+    if e.kind == ICMP_ECHO_REQUEST && e.code == 0
+        stack.stats.echo_requests += 1
+        if payload.len > MAX_PAYLOAD + UDP_HEADER then return
+        var out: [ETH_MAX]u8 = [0; ETH_MAX]
+        for i in 0..<payload.len
+            out[PAYLOAD_AT + i] = payload[i]
+        val r: *IcmpEcho = at(out[..], PAYLOAD_AT)
+        r.kind = ICMP_ECHO_REPLY
+        r.checksum = be16(0)
+        r.checksum = be16(checksum(out[PAYLOAD_AT..<PAYLOAD_AT + payload.len], 0))
+        val _ = send_ipv4(out[..], mac, from, PROTO_ICMP, payload.len)
+    else if e.kind == ICMP_ECHO_REPLY
+        stack.stats.echo_replies += 1
+        if e.id.get() == PING_ID && e.seq.get() == stack.ping_seq
+            stack.ping_answered = true
+            events.wake_all()
+
+private const PING_ID: u16 = 0x6b6c             // "kl"
+private const PING_DATA: usize = 32
+
+// Send an ICMP echo request to `dst` and wait up to `timeout` ms for its reply. Answers the round trip in
+// milliseconds, or None. From a kernel thread; not from the stack's own.
+ping(dst: Ip, timeout: u64) -> Option[u64]
+    val start = now_ms()
+    val deadline = start + timeout
+    val flags = lock.lock()
+    val answer = ping_locked(dst, start, deadline)
+    lock.unlock(flags)
+    answer
+
+private ping_locked(dst: Ip, start: u64, deadline: u64) -> Option[u64]
+    if !stack.running then return None
+    val mac = resolve(dst, deadline)?
+    stack.ping_seq += 1
+    stack.ping_answered = false
+    var out: [ETH_MAX]u8 = [0; ETH_MAX]
+    val e: *IcmpEcho = at(out[..], PAYLOAD_AT)
+    e.kind = ICMP_ECHO_REQUEST
+    e.code = 0
+    e.id = be16(PING_ID)
+    e.seq = be16(stack.ping_seq)
+    for i in 0..<PING_DATA
+        out[PAYLOAD_AT + ICMP_ECHO_HEADER + i] = u8(0x61 + i % 26)
+    val len = ICMP_ECHO_HEADER + PING_DATA
+    e.checksum = be16(checksum(out[PAYLOAD_AT..<PAYLOAD_AT + len], 0))
+    if !send_ipv4(out[..], mac, dst, PROTO_ICMP, len) then return None
+    while !stack.ping_answered
+        if !wait_until(deadline) then return None
+    Some(now_ms() - start)
+
+// UDP: check the checksum if the sender gave one, then the echo service or a bound socket. Holding
+// `lock`.
+private receive_udp(mac: Mac, from: Ip, payload: []u8)
+    if payload.len < UDP_HEADER then return
+    val u: *UdpHeader = at(payload, 0)
+    val len = usize(u.len.get())
+    if len < UDP_HEADER || len > payload.len then return
+    stack.stats.udp_datagrams += 1
+    if u.checksum.get() != 0 && checksum(payload[0..<len], pseudo_sum(from, our_ip(), PROTO_UDP, len)) != 0
+        stack.stats.bad_udp_checksums += 1
+        return
+    val port = u.dst_port.get()
+    val from_port = u.src_port.get()
+    val data = payload[UDP_HEADER..<len]
+    if port == ECHO_PORT
+        val _ = send_udp(mac, from, ECHO_PORT, from_port, data)
+        stack.stats.echoed += 1
+        if is_bye(data)
+            stack.bye_seen = true
+            events.wake_all()
+        return
+    for s in 0..<SOCKETS
+        if sockets[s].open && sockets[s].port == port
+            deliver(s, from, from_port, data)
+            return
+    stack.stats.no_socket += 1
+
+private is_bye(data: []const u8) -> bool = data.len == 3 && data[0] == u8('b') && data[1] == u8('y') && data[2] == u8('e')
+
+// A UDP datagram of `data` from our port `src_port` to `dst`:`dst_port`, through `mac`. Holding `lock`.
+private send_udp(mac: Mac, dst: Ip, src_port: u16, dst_port: u16, data: []const u8) -> bool
+    if data.len > MAX_PAYLOAD then return false
+    var out: [ETH_MAX]u8 = [0; ETH_MAX]
+    val len = UDP_HEADER + data.len
+    val u: *UdpHeader = at(out[..], PAYLOAD_AT)
+    u.src_port = be16(src_port)
+    u.dst_port = be16(dst_port)
+    u.len = be16(u16(len))
+    u.checksum = be16(0)
+    for i in 0..<data.len
+        out[PAYLOAD_AT + UDP_HEADER + i] = data[i]
+    val sum = checksum(out[PAYLOAD_AT..<PAYLOAD_AT + len], pseudo_sum(our_ip(), dst, PROTO_UDP, len))
+    // A computed 0 is sent as all ones: 0 means "no checksum" (RFC 768).
+    u.checksum = be16(if sum == 0 then 0xffff else sum)
+    send_ipv4(out[..], mac, dst, PROTO_UDP, len)
+
+// Wait up to `timeout` ms for the echo service to have echoed "bye". Answers whether it did, and how many
+// datagrams it echoed.
+echo_wait(timeout: u64) -> (bool, u64)
+    val deadline = now_ms() + timeout
+    val flags = lock.lock()
+    while !stack.bye_seen
+        if !wait_until(deadline) then break
+    val answer = (stack.bye_seen, stack.stats.echoed)
+    lock.unlock(flags)
+    answer
+
+// -- Sockets -----------------------------------------------------------------------------------------
+//
+// A datagram socket belongs to the process that opened it (`owner`, its pid) and is numbered by its
+// place in the table. Bound to a port, it queues up to SOCKET_QUEUE datagrams for that port; one more is
+// dropped and counted. keel.proc's system calls are these, plus the copying to and from the program.
+
+enum NetError
+    NoNet                                       // no card, or the stack is down
+    NoSocket                                    // not a socket, or not the caller's
+    TableFull
+    PortInUse
+    NotBound
+    TooLong
+    TimedOut
+    NoRoute                                     // ARP found no address for the next hop
+
+socket_open(owner: u64) -> Result[usize, NetError]
+    val flags = lock.lock()
+    var answer: Result[usize, NetError] = Err(TableFull)
+    if !stack.running
+        answer = Err(NoNet)
+    else
+        for s in 0..<SOCKETS
+            if !sockets[s].open
+                sockets[s].open = true
+                sockets[s].owner = owner
+                sockets[s].port = 0
+                sockets[s].head = 0
+                sockets[s].count = 0
+                answer = Ok(s)
+                break
+    lock.unlock(flags)
+    answer
+
+// Whether `sd` is a socket `owner` opened. Holding `lock`.
+private mine(sd: usize, owner: u64) -> bool = sd < SOCKETS && sockets[sd].open && sockets[sd].owner == owner
+
+socket_bind(sd: usize, owner: u64, port: u16) -> Result[unit, NetError]
+    val flags = lock.lock()
+    val answer = bind_locked(sd, owner, port)
+    lock.unlock(flags)
+    answer
+
+private bind_locked(sd: usize, owner: u64, port: u16) -> Result[unit, NetError]
+    if !mine(sd, owner) then return Err(NoSocket)
+    if port == 0 || port == ECHO_PORT then return Err(PortInUse)
+    for s in 0..<SOCKETS
+        if sockets[s].open && sockets[s].port == port then return Err(PortInUse)
+    sockets[sd].port = port
+    Ok(())
+
+private deliver(s: usize, from: Ip, from_port: u16, data: []const u8)
+    if sockets[s].count == SOCKET_QUEUE
+        stack.stats.socket_overflows += 1
+        return
+    val slot = (sockets[s].head + sockets[s].count) % SOCKET_QUEUE
+    sockets[s].queue[slot].from = u32(from)
+    sockets[s].queue[slot].from_port = from_port
+    sockets[s].queue[slot].len = data.len
+    for i in 0..<data.len
+        sockets[s].queue[slot].bytes[i] = data[i]
+    sockets[s].count += 1
+    events.wake_all()
+
+// The oldest datagram queued on `sd`, copied into `into` (cut to fit), with its length and sender;
+// waits up to `timeout` ms for one, or for ever if `timeout` is 0.
+socket_recv(sd: usize, owner: u64, into: []u8, timeout: u64) -> Result[(usize, Ip, u16), NetError]
+    val deadline = if timeout == 0 then 0xffff_ffff_ffff_ffff else now_ms() + timeout
+    val flags = lock.lock()
+    val answer = recv_locked(sd, owner, into, deadline)
+    lock.unlock(flags)
+    answer
+
+private recv_locked(sd: usize, owner: u64, into: []u8, deadline: u64) -> Result[(usize, Ip, u16), NetError]
+    loop
+        if !mine(sd, owner) then return Err(NoSocket)
+        if sockets[sd].port == 0 then return Err(NotBound)
+        if sockets[sd].count > 0 then break
+        if !stack.running then return Err(NoNet)
+        if !wait_until(deadline) then return Err(TimedOut)
+    val d = &sockets[sd].queue[sockets[sd].head]
+    val n = if d.len < into.len then d.len else into.len
+    for i in 0..<n
+        into[i] = d.bytes[i]
+    val answer = (n, Ip(d.from), d.from_port)
+    sockets[sd].head = (sockets[sd].head + 1) % SOCKET_QUEUE
+    sockets[sd].count -= 1
+    Ok(answer)
+
+// Send `data` from `sd`'s port to `to`:`port`, resolving the next hop first (up to a second).
+socket_send(sd: usize, owner: u64, to: Ip, port: u16, data: []const u8) -> Result[usize, NetError]
+    if data.len > MAX_PAYLOAD then return Err(TooLong)
+    val flags = lock.lock()
+    val answer = send_locked(sd, owner, to, port, data)
+    lock.unlock(flags)
+    answer
+
+private send_locked(sd: usize, owner: u64, to: Ip, port: u16, data: []const u8) -> Result[usize, NetError]
+    if !mine(sd, owner) then return Err(NoSocket)
+    if sockets[sd].port == 0 then return Err(NotBound)
+    if !stack.running then return Err(NoNet)
+    val mac = resolve(to, now_ms() + 1000) match
+        Some(m) -> m
+        None -> return Err(NoRoute)
+    if !send_udp(mac, to, sockets[sd].port, port, data) then return Err(NoNet)
+    Ok(data.len)
+
+socket_close(sd: usize, owner: u64) -> Result[unit, NetError]
+    val flags = lock.lock()
+    val ok = mine(sd, owner)
+    if ok then sockets[sd].open = false
+    lock.unlock(flags)
+    if ok then Ok(()) else Err(NoSocket)
+
+// Close every socket `owner` still has; a process's end calls this.
+close_sockets_of(owner: u64)
+    val flags = lock.lock()
+    for s in 0..<SOCKETS
+        if sockets[s].open && sockets[s].owner == owner then sockets[s].open = false
+    lock.unlock(flags)
+
+// How many sockets are open.
+sockets_open() -> usize
+    val flags = lock.lock()
+    var n: usize = 0
+    for s in 0..<SOCKETS
+        if sockets[s].open then n += 1
+    lock.unlock(flags)
+    n
+
+// "a.b.c.d"
+ip_text(a: Ip) -> string
+    val v = u32(a)
+    s"${v >> 24}.${(v >> 16) & 0xff}.${(v >> 8) & 0xff}.${v & 0xff}"
+
+mac_text(m: Mac) -> string
+    var t = ""
+    for i in 0..<6
+        val b = m.b[i]
+        t = t + hex_digit(b >> 4) + hex_digit(b & 0xf) + (if i < 5 then ":" else "")
+    t
+
+private hex_digit(n: u8) -> string = "0123456789abcdef"[usize(n)..<usize(n) + 1]

@@ -34,6 +34,9 @@ start_this_core()
     set_countdown(period)
     set_control(1)
 
+// Milliseconds since the system counter started; the same on every core.
+now_ms() -> u64 = read_sysreg("cntvct_el0") * 1000 / frequency()
+
 // Begin the next period. The interrupt handler calls this, or the timer's condition stays met and the
 // interrupt stays raised.
 rearm() = set_countdown(period)

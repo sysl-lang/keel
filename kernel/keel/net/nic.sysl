@@ -1,0 +1,239 @@
+module keel.net
+
+// A virtio network card (virtio 1.2 § 5.1) over keel.virtio's transport: queue 0 receives, queue 1
+// transmits, and one interrupt (the transport's SPI) says either has moved.
+//
+// Everything the device reaches is in one run of `SHARED_FRAMES` contiguous frames (`Shared`): the two
+// queues' rings, then QSIZE receive buffers and QSIZE transmit buffers of 2 KiB each. Every buffer is a
+// single descriptor, descriptor i of a queue owning buffer i of that queue, so a used element's `id`
+// names its buffer. A frame in either direction is preceded by the 12-byte `virtio_net_hdr` (with
+// VIRTIO_F_VERSION_1 its `num_buffers` field is always there); keel asks for no offloads, so a header
+// it sends is all zeros and one it receives is ignored.
+//
+// Receive: every receive buffer is offered to the device at `init`. The interrupt only acknowledges and
+// wakes the stack's thread (stack.sysl), which takes what the used ring holds, handles each frame where
+// it lies and offers the buffer again. Transmit: `transmit` copies a frame into a free transmit buffer
+// and offers it; buffers the device has finished with are taken back from the used ring at the next
+// `transmit`, so transmit completions need no interrupt work. Nothing here sleeps: a frame finding no
+// free buffer is dropped and counted, as a full queue drops on any card.
+//
+// The caller's frame is copied rather than handed to the device, for the reason the disk's bounce
+// buffers exist: a `[]u8` does not say where its storage is (FINDINGS.md 36). `lock` (stack.sysl) guards
+// all of it.
+
+import keel.cpu
+import keel.gic
+import keel.mm
+import keel.virtio
+import keel.virtio.{Avail, Desc, Regs, Used}
+
+const QSIZE: usize = 16
+const BUF_SIZE: usize = 2048
+const NET_HDR: usize = 12
+
+private const RX_QUEUE: u32 = 0
+private const TX_QUEUE: u32 = 1
+private const F_MAC: u32 = 1 << 5               // VIRTIO_NET_F_MAC: the configuration holds the address
+
+// One virtqueue's structures, in one frame: the descriptor table wants 16-byte alignment, the available
+// ring 2 and the used ring 4.
+struct Ring
+    desc: [QSIZE]Desc                           // 0x000
+    avail: Avail[QSIZE]                         // 0x100
+    pad0: [218]u8
+    used: Used[QSIZE]                           // 0x200
+    pad1: [3448]u8
+
+@assert(offsetof(Ring, avail) == 0x100, "the available ring is at 0x100")
+@assert(offsetof(Ring, used) == 0x200, "the used ring is at 0x200")
+@assert(sizeof(Ring) == 0x1000, "a ring is one frame")
+
+struct Shared
+    rx: Ring                                    // 0x0000
+    tx: Ring                                    // 0x1000
+    rx_buf: [QSIZE][BUF_SIZE]u8                 // 0x2000
+    tx_buf: [QSIZE][BUF_SIZE]u8                 // 0xa000
+
+@assert(offsetof(Shared, rx_buf) == 0x2000, "the receive buffers start at 0x2000")
+@assert(offsetof(Shared, tx_buf) == 0xa000, "the transmit buffers start at 0xa000")
+@assert(sizeof(Shared) == 0x12000, "the card's memory is 18 frames")
+
+private const SHARED_FRAMES: u64 = 18
+
+private struct Nic
+    ready: bool
+    regs: *Regs
+    irq: u32
+    mac: Mac
+    shared: *Shared
+    rx_last_used: u16                           // the used index up to which frames are taken
+    rx_next_avail: u16                          // the available index this driver writes next
+    tx_last_used: u16
+    tx_next_avail: u16
+    tx_busy: [QSIZE]bool
+    interrupts: u64
+    received: u64
+    sent: u64
+    dropped_tx: u64
+
+// Zero until `init`: `ready` false.
+private var nic: Nic
+
+private phys(p: usize) -> u64 = u64(mm.to_phys(mm.VirtAddr(u64(p))))
+
+// Find the card, negotiate, give it both queues and every receive buffer, and route its interrupt to
+// this core. Answers the card's MAC address, or None if there is no usable card. Run once, from a kernel
+// thread, before the stack's thread starts.
+init_nic() -> Option[Mac]
+    val t = virtio.find(virtio.DEVICE_NET) match
+        Some(t) -> t
+        None -> return None
+    val r = t.regs
+    if r.version != 2
+        print("keel: virtio-net is legacy (version", r.version, "); QEMU needs force-legacy=false")
+        return None
+    val agreed = virtio.negotiate(r, F_MAC) match
+        Some(f) -> f
+        None -> return fail(r, "the device is not virtio 1, or refused it")
+    if (agreed & F_MAC) == 0 then return fail(r, "the device has no MAC address")
+
+    val frame = mm.alloc_frames(SHARED_FRAMES) match
+        Some(f) -> f
+        None -> return fail(r, "no frames for the queues")
+    val sh: *Shared = ptr_cast(usize(u64(mm.to_virt(mm.frame_addr(frame)))))
+    val words: *u64 = ptr_cast(sh)
+    for i in 0..<usize(SHARED_FRAMES * 512)
+        words[i] = 0
+
+    for i in 0..<QSIZE
+        sh.rx.desc[i].addr = phys(usize(&sh.rx_buf[i][0]))
+        sh.rx.desc[i].len = u32(BUF_SIZE)
+        sh.rx.desc[i].flags = virtio.DESC_WRITE
+        sh.rx.avail.ring[i] = u16(i)
+        sh.tx.desc[i].addr = phys(usize(&sh.tx_buf[i][0]))
+    sh.rx.avail.idx = u16(QSIZE)
+
+    if !virtio.set_queue(r, RX_QUEUE, QSIZE, phys(usize(&sh.rx.desc[0])), phys(usize(&sh.rx.avail)),
+            phys(usize(&sh.rx.used)))
+        return fail(r, "the receive queue is live already or too small")
+    if !virtio.set_queue(r, TX_QUEUE, QSIZE, phys(usize(&sh.tx.desc[0])), phys(usize(&sh.tx.avail)),
+            phys(usize(&sh.tx.used)))
+        return fail(r, "the transmit queue is live already or too small")
+
+    // virtio_net_config.mac: the first six bytes of the configuration, read a word at a time.
+    val w0 = r.config[0]
+    val w1 = r.config[1]
+    val mac = Mac([u8(w0 & 0xff), u8((w0 >> 8) & 0xff), u8((w0 >> 16) & 0xff), u8(w0 >> 24),
+        u8(w1 & 0xff), u8((w1 >> 8) & 0xff)])
+
+    val flags = lock.lock()
+    nic.regs = r
+    nic.irq = t.irq
+    nic.mac = mac
+    nic.shared = sh
+    nic.rx_next_avail = u16(QSIZE)
+    nic.ready = true
+    lock.unlock(flags)
+
+    gic.enable_spi(t.irq, cpu.core_id())
+    virtio.driver_ok(r)
+    dmb(oshst)
+    r.queue_notify = RX_QUEUE
+    Some(mac)
+
+private fail(r: *Regs, why: string) -> Option[Mac]
+    virtio.mark_failed(r)
+    print("keel: virtio-net:", why)
+    None
+
+// The interrupt this card raises; `gic.SPURIOUS` before `init_nic`.
+nic_irq() -> u32 = if nic.ready then nic.irq else gic.SPURIOUS
+
+// The card's interrupt, from keel.irq.dispatch (IRQ context: it may not sleep, and under keel.trap's
+// `@no_alloc`). Acknowledge first, so a frame arriving after the stack's thread has read the ring raises
+// the interrupt again rather than being missed; then wake the thread.
+nic_interrupt()
+    val flags = lock.lock()
+    nic.interrupts += 1
+    nic.regs.interrupt_ack = nic.regs.interrupt_status
+    events.wake_all()
+    lock.unlock(flags)
+
+// Whether a received frame is waiting in the used ring. Holding `lock`.
+private[net] rx_pending() -> bool = nic.ready && nic.shared.rx.used.idx != nic.rx_last_used
+
+// The next received frame, without the virtio header, as a view of its receive buffer, and the buffer's
+// number for `rx_done`; None when the ring is empty. Holding `lock`.
+private[net] rx_take() -> Option[([]u8, usize)]
+    if !rx_pending() then return None
+    // The device writes an element, then the index: read them in that order.
+    dmb(ishld)
+    val e = nic.shared.rx.used.ring[usize(nic.rx_last_used) % QSIZE]
+    val id = usize(e.id)
+    val len = usize(e.len)
+    nic.rx_last_used = virtio.next_index(nic.rx_last_used)
+    nic.received += 1
+    if id >= QSIZE || len < NET_HDR || len > BUF_SIZE then return Some((nic.shared.rx_buf[0][0..<0], id % QSIZE))
+    Some((nic.shared.rx_buf[id][NET_HDR..<len], id))
+
+// Offer receive buffer `id` to the device again. Holding `lock`.
+private[net] rx_done(id: usize)
+    val sh = nic.shared
+    sh.rx.avail.ring[usize(nic.rx_next_avail) % QSIZE] = u16(id)
+    dmb(ishst)
+    nic.rx_next_avail = virtio.next_index(nic.rx_next_avail)
+    sh.rx.avail.idx = nic.rx_next_avail
+    dmb(oshst)
+    nic.regs.queue_notify = RX_QUEUE
+
+// Send one Ethernet frame (header included, no virtio header), padded to the minimum length. False if
+// the card is not there, the frame is too long, or every transmit buffer is still the device's. Holding
+// `lock`.
+private[net] transmit(frame: []const u8) -> bool
+    if !nic.ready || frame.len > ETH_MAX then return false
+    val sh = nic.shared
+    // Take back every buffer the device has finished with.
+    while sh.tx.used.idx != nic.tx_last_used
+        dmb(ishld)
+        val id = usize(sh.tx.used.ring[usize(nic.tx_last_used) % QSIZE].id)
+        if id < QSIZE then nic.tx_busy[id] = false
+        nic.tx_last_used = virtio.next_index(nic.tx_last_used)
+    var slot = QSIZE
+    for i in 0..<QSIZE
+        if !nic.tx_busy[i]
+            slot = i
+            break
+    if slot == QSIZE
+        nic.dropped_tx += 1
+        return false
+
+    val len = if frame.len < ETH_MIN then ETH_MIN else frame.len
+    for i in 0..<NET_HDR
+        sh.tx_buf[slot][i] = 0
+    for i in 0..<len
+        sh.tx_buf[slot][NET_HDR + i] = if i < frame.len then frame[i] else 0
+    sh.tx.desc[slot].len = u32(NET_HDR + len)
+    sh.tx.desc[slot].flags = 0
+    nic.tx_busy[slot] = true
+
+    sh.tx.avail.ring[usize(nic.tx_next_avail) % QSIZE] = u16(slot)
+    // The device may read the ring entry, the descriptor and the buffer once it sees the new index.
+    dmb(ishst)
+    nic.tx_next_avail = virtio.next_index(nic.tx_next_avail)
+    sh.tx.avail.idx = nic.tx_next_avail
+    // And the index before the notification, a store to Device memory.
+    dmb(oshst)
+    nic.regs.queue_notify = TX_QUEUE
+    nic.sent += 1
+    true
+
+// This card's address; meaningful once `init_nic` answered it.
+private[net] our_mac() -> Mac = nic.mac
+
+// What the card has done: interrupts, frames received, frames sent, frames dropped for want of a
+// transmit buffer.
+nic_stats() -> (u64, u64, u64, u64)
+    val flags = lock.lock()
+    val answer = (nic.interrupts, nic.received, nic.sent, nic.dropped_tx)
+    lock.unlock(flags)
+    answer

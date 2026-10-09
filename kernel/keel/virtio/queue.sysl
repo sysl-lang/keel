@@ -1,0 +1,90 @@
+module keel.virtio
+
+// What every virtio driver over this transport shares: the split virtqueue's three structures, and the
+// steps of bringing a device up (§ 3.1.1) and of handing it a queue (§ 4.2.3.2). The block driver
+// (blk.sysl) and the network driver (keel.net) each lay the structures out in frames of their own and
+// call these.
+//
+// A queue's size is a value parameter of its rings: the disk's queue has 32 entries, each of the
+// network card's two has 16.
+
+// A descriptor (§ 2.7.5): a buffer's physical address and length, and the next in its chain.
+struct Desc
+    addr: volatile u64
+    len: volatile u32
+    flags: volatile u16
+    next: volatile u16
+
+@assert(sizeof(Desc) == 16, "a virtq descriptor is 16 bytes")
+
+const DESC_NEXT: u16 = 1                        // `next` continues the chain
+const DESC_WRITE: u16 = 2                       // the device writes this buffer (else reads it)
+
+// The available ring (§ 2.7.6): what the driver offers. `idx` counts offers for ever, wrapping at 2^16.
+struct Avail[const N: usize]
+    flags: volatile u16
+    idx: volatile u16
+    ring: [N]volatile u16
+    used_event: volatile u16
+
+struct UsedElem
+    id: volatile u32                            // the head of the chain that completed
+    len: volatile u32                           // bytes the device wrote into it
+
+// The used ring (§ 2.7.8): what the device has finished.
+struct Used[const N: usize]
+    flags: volatile u16
+    idx: volatile u16
+    ring: [N]UsedElem
+    avail_event: volatile u16
+
+// Reset the device and negotiate: the device must offer VIRTIO_F_VERSION_1, and the driver accepts it
+// and the device-specific bits `wanted` (bank 0) that the device also offers. Answers the bank-0 bits
+// agreed, or None if the device is not modern or refused them. The device is left at FEATURES_OK; the
+// caller sets up its queues, then calls `driver_ok`.
+negotiate(r: *Regs, wanted: u32) -> Option[u32]
+    r.status = 0
+    r.status = ACKNOWLEDGE
+    r.status = ACKNOWLEDGE | DRIVER
+
+    r.device_features_sel = 1
+    if (r.device_features & F_VERSION_1_BANK1) == 0 then return None
+    r.device_features_sel = 0
+    val agreed = r.device_features & wanted
+    r.driver_features_sel = 0
+    r.driver_features = agreed
+    r.driver_features_sel = 1
+    r.driver_features = F_VERSION_1_BANK1
+    r.status = ACKNOWLEDGE | DRIVER | FEATURES_OK
+    if (r.status & FEATURES_OK) == 0 then return None
+    Some(agreed)
+
+// Hand the device queue `index` of `size` entries at these physical addresses, and make it live. False
+// if the queue is already live or the device's queues are smaller than `size`.
+set_queue(r: *Regs, index: u32, size: usize, desc: u64, avail: u64, used: u64) -> bool
+    r.queue_sel = index
+    if r.queue_ready != 0 then return false
+    if usize(r.queue_num_max) < size then return false
+    r.queue_num = u32(size)
+    r.queue_desc_low = u32(desc & 0xffff_ffff)
+    r.queue_desc_high = u32(desc >> 32)
+    r.queue_driver_low = u32(avail & 0xffff_ffff)
+    r.queue_driver_high = u32(avail >> 32)
+    r.queue_device_low = u32(used & 0xffff_ffff)
+    r.queue_device_high = u32(used >> 32)
+    // The table and the rings are in Normal memory and the device may read them as soon as the queue
+    // is ready: complete those stores first.
+    dsb(st)
+    r.queue_ready = 1
+    true
+
+// The driver is ready: the device may use its queues and raise interrupts.
+driver_ok(r: *Regs)
+    r.status = ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK
+
+// Give up on a device: tell it so.
+mark_failed(r: *Regs)
+    r.status = r.status | FAILED
+
+// The ring indices are free-running 16-bit counters, as sysl's `u16` arithmetic is.
+next_index(i: u16) -> u16 = i + 1

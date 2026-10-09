@@ -78,6 +78,13 @@ after_user_line=(
     "inside a directory"    # cat /dir/inner.txt
     "keel: cat ok"
     "user: sysl.fs ok"      # fscheck: cwd, truncate, access, errors, unsupported calls, through sysl.fs
+    "keel: virtio-net found, mac 52:54:00:12:34:56"   # QEMU's default address, from the card's configuration
+    "keel: ping gateway ok" # ARP found slirp's gateway, and it answered an ICMP echo
+    "keel: udp echo served "   # port 7 in the kernel echoed the host client's datagrams until its "bye"
+    "udpecho: listening on port 8007"   # a sysl program at EL0 bound a socket...
+    "udpecho: bye after "   # ...and echoed the second client's datagrams through recvfrom/sendto
+    "keel: udpecho exited 0"
+    "keel: network down, sockets closed"   # the stack's thread joined; the program's socket closed at its exit
 )
 
 # Milestone 10: then init starts the shell, and the script is at the console. Each boot's session is
@@ -166,7 +173,7 @@ not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: sh ende
     "keel: processes left unreaped" "keel: processes still running before init")
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
-    init sh mkdir rm rmdir mv false ppid orphan)
+    init sh mkdir rm rmdir mv false ppid orphan udpecho)
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
 frames_min=65000
@@ -217,6 +224,14 @@ fi
 drive=(-drive file=$disk,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0
        -global virtio-mmio.force-legacy=false)
 
+# The network: QEMU's user-mode stack (slirp), keel at 10.0.2.15, with two host UDP ports forwarded —
+# $udp_port to keel's port 7 (the kernel's echo service) and the next one to 8007 (/bin/udpecho). A
+# client on the host (udp-echo-client.pl) talks to each while keel runs.
+udp_port=${KEEL_UDP_PORT:-15007}
+user_udp_port=$((udp_port + 1))
+nic=(-netdev user,id=n0,hostfwd=udp:127.0.0.1:$udp_port-:7,hostfwd=udp:127.0.0.1:$user_udp_port-:8007
+     -device virtio-net-device,netdev=n0)
+
 # One boot on the disk as it stands, passing only if every line of `before_user_line`, then $2, then
 # `after_user_line`, then the array named $4, then `shutdown` is printed in order and QEMU powers off
 # by itself. The array named $3 is typed at the console, a line each. $1 names the boot in the log.
@@ -226,8 +241,13 @@ boot() {
     local expected=($before_user_line "$user_line" $after_user_line "${(@P)4}" $shutdown)
 
     print -rl -- "${(@P)3}" > $input
-    qemu-system-aarch64 -M virt,gic-version=3 $machine -smp ${KEEL_SMP:-4} -m 256M -nographic $drive -kernel $elf > $log 2>&1 < $input &
+    qemu-system-aarch64 -M virt,gic-version=3 $machine -smp ${KEEL_SMP:-4} -m 256M -nographic $drive $nic -kernel $elf > $log 2>&1 < $input &
     local qpid=$!
+    local udp_log=$out/udp$name.log
+    perl $root/scripts/udp-echo-client.pl $udp_port $limit kernel > $udp_log.kernel 2>&1 &
+    local kclient=$!
+    perl $root/scripts/udp-echo-client.pl $user_udp_port $limit user > $udp_log.user 2>&1 &
+    local uclient=$!
 
     waited=0
     while kill -0 $qpid 2> /dev/null && (( waited < limit * 10 )); do
@@ -242,10 +262,15 @@ boot() {
     fi
     local qemu_exit=0
     wait $qpid 2> /dev/null || qemu_exit=$?
+    # A client still running once keel is gone never got its echo; it is stopped by PID.
+    kill $kclient $uclient 2> /dev/null || true
+    wait $kclient 2> /dev/null || true
+    wait $uclient 2> /dev/null || true
 
     print -r -- "--- QEMU output, boot $name ($accel${opt:+, $opt}) ---"
     cat $log
     print -r -- "---"
+    cat $udp_log.kernel $udp_log.user
 
     if [[ $exited == no ]]; then
         print -r -- "FAIL: boot $name: QEMU did not exit within ${limit}s; the kernel did not power off"
@@ -282,6 +307,13 @@ boot() {
         print -r -- "FAIL: boot $name: QEMU exited with status $qemu_exit"
         return 1
     fi
+    local client
+    for client in kernel user; do
+        if [[ $(<$udp_log.$client) != *"host: udp echo ok ($client)"* ]]; then
+            print -r -- "FAIL: boot $name: the host's UDP client for the $client echo got no echo"
+            return 1
+        fi
+    done
 }
 
 # The image is well-formed after a boot: mkfs's check reads every directory, inode and bitmap bit.

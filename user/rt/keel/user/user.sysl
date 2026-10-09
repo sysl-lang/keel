@@ -10,7 +10,8 @@ module keel.user
 
 import abi.keel.abi.{ANY_CHILD, Errno, ExitStatus, NO_FD, STDOUT, SYS_BRK, SYS_CLOSE, SYS_EXIT, SYS_FSTAT,
     SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN,
-    SYS_STAT, SYS_SYNC, SYS_UNLINK, SYS_WAIT, SYS_WRITE, Stat}
+    SYS_STAT, SYS_SYNC, SYS_UNLINK, SYS_WAIT, SYS_WRITE, Stat, SYS_SOCKET, SYS_BIND, SYS_RECVFROM, SYS_SENDTO,
+    SYS_SOCKCLOSE, SockAddr}
 import sysl.buf.{Buf, buf}
 import sysl.slices.{as_mut_ptr, as_ptr}
 
@@ -183,6 +184,29 @@ wait(pid: i64 = ANY_CHILD) -> Result[(u64, ExitStatus), Errno]
     Ok((child, s))
 
 getppid() -> u64 = u64(call(SYS_GETPPID, 0, 0, 0, 0))
+
+// --- UDP sockets -----------------------------------------------------------------------------------
+//
+// keel.abi's socket calls, as they are: a socket is a number, an address a `SockAddr`. The standard
+// library has no datagram socket and no hook to supply one through (FINDINGS.md 54), so a program on
+// keel calls these directly.
+
+socket() -> Result[u64, Errno] = answer(call(SYS_SOCKET, 0, 0, 0, 0))
+
+bind(sd: u64, port: u16) -> Result[unit, Errno] = done(call(SYS_BIND, sd, u64(port), 0, 0))
+
+// The oldest datagram for `sd`, cut to fit `into`: its length and its sender. Waits up to `timeout_ms`
+// (0: for ever), then ETIMEDOUT.
+recvfrom(sd: u64, into: []u8, timeout_ms: u64) -> Result[(u64, SockAddr), Errno]
+    var from = SockAddr(0, 0, 0)
+    val n = answer(call5(SYS_RECVFROM, sd, u64(usize(as_mut_ptr(into))), u64(into.len), u64(usize(&from)),
+        timeout_ms))?
+    Ok((n, from))
+
+sendto(sd: u64, bytes: []const u8, to: SockAddr) -> Result[u64, Errno] =
+    answer(call(SYS_SENDTO, sd, addr(bytes), len(bytes), u64(usize(&to))))
+
+sockclose(sd: u64) -> Result[unit, Errno] = done(call(SYS_SOCKCLOSE, sd, 0, 0, 0))
 
 // A system call of up to four arguments, its answer exactly as the kernel gave it: the result, or a
 // negative error number. For a caller that turns the number into something of its own (keel.fsys

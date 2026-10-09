@@ -32,6 +32,22 @@ const SYS_ACCESS: u64 = 21      // access(path, path_len, how) -> 0 if the path 
 const SYS_SPAWN: u64 = 22       // spawn(path, path_len, args, args_len, out_fd) -> the child's pid
 const SYS_WAIT: u64 = 23        // wait(pid, *ExitStatus) -> the pid of the child that ended
 const SYS_GETPPID: u64 = 24     // getppid() -> the parent's pid; 0 for a process the kernel started
+const SYS_SOCKET: u64 = 25      // socket() -> a UDP socket's number
+const SYS_BIND: u64 = 26        // bind(sd, port) -> 0
+const SYS_RECVFROM: u64 = 27    // recvfrom(sd, buf, len, *SockAddr, timeout_ms) -> bytes of the datagram
+const SYS_SENDTO: u64 = 28      // sendto(sd, buf, len, *SockAddr) -> bytes sent
+const SYS_SOCKCLOSE: u64 = 29   // sockclose(sd) -> 0
+
+// A socket is a UDP endpoint on keel's one interface (10.0.2.15). Its number is not a file descriptor:
+// sockets have a table of their own, and a process's are closed when it ends. `recvfrom` waits for a
+// datagram up to `timeout_ms` (0: for ever) and answers ETIMEDOUT after; its `*SockAddr` (or 0) is
+// filled with the sender. Port 7 is the kernel's own echo service and cannot be bound.
+struct SockAddr
+    ip: u32                     // 10.0.2.2 is 0x0a00_0202
+    port: u16
+    reserved: u16
+
+@assert(sizeof(SockAddr) == 8, "a SockAddr is 8 bytes")
 
 // `spawn` starts the executable at `path` as a child of the caller, with the caller's current
 // directory and its standard descriptors. `args` is the child's argv, each argument followed by a NUL
@@ -125,6 +141,7 @@ enum Errno: i64
     ENOTDIR = 20
     EISDIR = 21
     EINVAL = 22
+    ENFILE = 23                 // socket: every socket in the system is open
     EMFILE = 24                 // every descriptor is in use
     EFBIG = 27                  // past the largest file the filesystem holds
     ENOSPC = 28                 // no free block or inode
@@ -132,3 +149,9 @@ enum Errno: i64
     ENAMETOOLONG = 36
     ENOSYS = 38                 // no such system call
     ENOTEMPTY = 39
+    EDESTADDRREQ = 89           // the socket is not bound to a port
+    EMSGSIZE = 90               // more than one datagram holds (1472 bytes)
+    EADDRINUSE = 98             // bind: the port is taken
+    ENETDOWN = 100              // no network card, or the stack is down
+    ETIMEDOUT = 110             // recvfrom: nothing arrived in time
+    EHOSTUNREACH = 113          // sendto: ARP found no address for the next hop

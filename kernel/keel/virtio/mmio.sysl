@@ -63,6 +63,7 @@ struct Regs
 @assert(offsetof(Regs, config) == 0x100, "the configuration space is at 0x100")
 
 const MAGIC: u32 = 0x7472_6976                  // "virt", little-endian
+const DEVICE_NET: u32 = 1
 const DEVICE_BLOCK: u32 = 2
 
 // Device status bits (§ 2.1).
