@@ -27,6 +27,18 @@ struct Process
     ppid: u64                   // the parent's pid; 0 for a process the kernel started and waits for
     ended: bool                 // it has ended and is waiting to be reaped (keel.proc's table lock)
     me: Option[&sync Process]   // the box keeping itself alive while it is in keel.proc's table
+    uid: u32                    // who it runs as: 0 is root; a child starts with its parent's
+    gid: u32                    // its one group; there are no supplementary groups
+
+// Who a process runs as, for keel.fs's permission checks.
+struct Cred
+    uid: u32
+    gid: u32
+
+// The kernel's own processes, and every check it makes for itself, run as root.
+root_cred() -> Cred = Cred(0, 0)
+
+cred_of(p: *Process) -> Cred = Cred(p.uid, p.gid)
 
 // Room for the current directory's path; keel.fs's longest path argument is the same.
 const CWD_ROOM: usize = 256

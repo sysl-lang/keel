@@ -1,41 +1,43 @@
 // init: pid 1, the first process and the one every orphan is handed to.
 //
-// It starts /bin/sh and waits. Whatever else ends meanwhile is a process whose parent ended before
-// it, given to init by the kernel, and init reaps it. When the shell exits by itself — `exit`, or the
-// end of its input — the session is over: init waits for anything still running and exits with the
-// shell's code, and the kernel shuts down. A shell that was ended by a fault is started again, since
-// a console with no shell on it is a machine nobody can use.
+// It runs /bin/login on the console and waits, and runs it again each time it exits — after a user's
+// shell has exited, or a fault ended it — the way getty does. Whatever else ends meanwhile is a process
+// whose parent ended before it, given to init by the kernel, and init reaps it. When login says the
+// console's input has ended at its prompt (passwd.CONSOLE_CLOSED), the machine's session is over:
+// init waits for anything still running and exits 0, and the kernel shuts down.
 
 import abi.keel.abi.ExitStatus
+import passwd.keel.passwd
 import rt.keel.user
 
 var orphans = 0
-var code: i64 = 0
+var sessions = 0
 
 loop
-    val sh = user.spawn("/bin/sh", ["sh"]) match
+    val login = user.spawn("/bin/login", ["login"]) match
         Ok(pid) -> pid
         Err(e) ->
-            print("init: cannot start /bin/sh, errno", i64(e))
+            print(s"init: cannot start /bin/login: ${user.describe(e)}")
             exit(1)
     var status = ExitStatus(0, 0)
     loop
         user.wait() match
             Ok((pid, s)) ->
-                if pid == sh
+                if pid == login
                     status = s
                     break
                 orphans += 1
             Err(_) -> break
-    if status.fault == 0
-        code = status.code
-        break
-    print("init: sh ended by a fault, starting it again")
+    if status.fault != 0
+        print("init: login ended by a fault, starting it again")
+        continue
+    if status.code == i64(passwd.CONSOLE_CLOSED) then break
+    sessions += 1
 
-// The session is over; nothing is left behind.
+// The console has closed; nothing is left behind.
 loop
     user.wait() match
         Ok(_) -> orphans += 1
         Err(_) -> break
-print(s"init: the shell exited $code; orphans reaped: $orphans")
-exit(int(code))
+print(s"init: the console closed after $sessions sessions; orphans reaped: $orphans")
+exit(0)

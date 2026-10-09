@@ -1,0 +1,31 @@
+module keel.fs
+
+// Permissions: whether a process may read, write or search an inode, by Unix's rules. Root (uid 0)
+// passes every check. Anyone else gets exactly one class of the mode's nine bits: the owner's three if
+// it owns the inode, else the group's if its gid is the inode's, else everyone else's — so an owner
+// whose own bits refuse it is refused even where the group's or other's bits would let it in.
+//
+// Which bits each call needs is the caller's business (calls.sysl): `r`/`w` on a file for `open`, `x` on
+// a file to run it, `w` and `x` on a directory to add or remove an entry, and `x` on every directory a
+// path walks through (`resolve`).
+
+import abi.keel.abi.{EACCES, Errno}
+import keel.sched.Cred
+import ondisk.keel.ondisk.Inode
+
+// Off only to show what the checks are for: with it off, every process may do anything root may.
+private const CHECK_PERMISSIONS: bool = true
+
+private[fs] const MAY_READ: u16 = 4
+private[fs] const MAY_WRITE: u16 = 2
+private[fs] const MAY_EXEC: u16 = 1
+
+// Whether `who` may do all of `want` (MAY_* bits) to inode `i`.
+private[fs] permits(i: *Inode, who: Cred, want: u16) -> bool
+    if !CHECK_PERMISSIONS || who.uid == 0 then return true
+    val shift: u16 = if who.uid == u32(i.uid) then 6 elif who.gid == u32(i.gid) then 3 else 0
+    ((i.mode >> shift) & want) == want
+
+// The same as a `Result`: EACCES when refused.
+private[fs] allowed(i: *Inode, who: Cred, want: u16) -> Result[unit, Errno] =
+    if permits(i, who, want) then Ok(()) else Err(EACCES)

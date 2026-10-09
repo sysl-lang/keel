@@ -1,17 +1,26 @@
 // mkfs — keel's filesystem, built, checked and read from on the host. The format is keel.ondisk, the module
 // the kernel mounts it with; kernel/keel/fs/FORMAT.md describes it.
 //
-//   mkfs build <image> <blocks> [<dir>]   a fresh filesystem of <blocks> 4 KiB blocks, holding a copy
-//                                         of <dir>'s files and directories
+//   mkfs build <image> <blocks> [<dir> [<owners>]]
+//                                         a fresh filesystem of <blocks> 4 KiB blocks, holding a copy
+//                                         of <dir>'s files and directories (its /etc/passwd and
+//                                         /etc/group among them), each owned by root, a directory
+//                                         0o755 and a file 0o755 if the host's copy is executable by
+//                                         anyone, else 0o644 — except for the paths <owners> names
 //   mkfs check <image>                    fsck: "host: fsck ok …", or every problem found and exit 1
 //   mkfs get <image> <path> <host file>   copy a file out of the image
+//   mkfs passwd <name> <password>         the hash field of /etc/passwd for that account (keel.passwd)
+//
+// An <owners> file has a line per path to set apart: `<path in the image> <uid> <gid> <octal mode>`,
+// for example `/home/alice 1000 1000 755` or `/bin/su 0 0 4755`.
 
 import ondisk.keel.ondisk
 import ondisk.keel.ondisk.{BLOCK_SIZE, DIRENT_SIZE, Dirent, Inode, KIND_DIR, KIND_FILE, KIND_FREE, NAME_MAX,
-    NDIRECT, ROOT_INO, Super}
+    NDIRECT, PERMISSION_BITS, ROOT_INO, S_IFMT, Super}
+import passwd.keel.passwd
 import sysl.buf.{Buf, buf}
 import sysl.fs
-import sysl.text.split
+import sysl.text.{parse_long, parse_long_base, split}
 
 // Room for this many inodes in a fresh filesystem: four blocks of them.
 private const INODES: u32 = 256
@@ -28,10 +37,14 @@ main(args: []string)
     val n = args.len
     if n >= 4 && args[1] == "build"
         val blocks = parse_count(args[3])
-        exit(build(args[2], blocks, if n >= 5 then Some(args[4]) else None))
+        exit(build(args[2], blocks, if n >= 5 then Some(args[4]) else None, if n >= 6 then Some(args[5]) else None))
     if n == 3 && args[1] == "check" then exit(check(args[2]))
     if n == 5 && args[1] == "get" then exit(get(args[2], args[3], args[4]))
-    print("usage: mkfs build <image> <blocks> [<dir>] | mkfs check <image> | mkfs get <image> <path> <host file>")
+    if n == 4 && args[1] == "passwd"
+        print(passwd.hashed(args[2], args[3]))
+        exit(0)
+    print("usage: mkfs build <image> <blocks> [<dir> [<owners>]] | mkfs check <image> | " +
+        "mkfs get <image> <path> <host file> | mkfs passwd <name> <password>")
     exit(2)
 
 private parse_count(s: string) -> u32
@@ -85,7 +98,7 @@ private opened(path: string) -> Image
 
 // --- build ---------------------------------------------------------------------------------------
 
-private build(path: string, blocks: u32, from: Option[string]) -> int
+private build(path: string, blocks: u32, from: Option[string], owners: Option[string]) -> int
     var bytes: Buf[u8] = buf()
     for _ in 0..<usize(blocks) * BLOCK_SIZE
         bytes.push(0)
@@ -103,6 +116,9 @@ private build(path: string, blocks: u32, from: Option[string]) -> int
     inode(&img, root).links = 2
     from match
         Some(dir) -> fill(&img, root, dir)
+        None -> ()
+    owners match
+        Some(file) -> set_owners(&img, file)
         None -> ()
 
     fs.write_bytes(path, img.bytes) match
@@ -129,8 +145,45 @@ private new_inode(img: *Image, kind: u16) -> u32
     img.next_ino += 1
     val i = inode(img, ino)
     i.kind = kind
-    i.mode = if kind == KIND_DIR then 0o755 else 0o644
+    i.mode = ondisk.type_bits(kind) | (if kind == KIND_DIR then 0o755 else 0o644)
     i.links = 1
+    i.uid = 0
+    i.gid = 0
+    ino
+
+// Apply an owners file: each line `<path> <uid> <gid> <octal mode>`.
+private set_owners(img: *Image, file: string)
+    val text = fs.read_text(file) match
+        Ok(t) -> t
+        Err(_) -> fail(s"mkfs: cannot read $file")
+    for line in split(text, "\n")
+        if line.bytes.len == 0 then continue
+        val f = split(line, " ")
+        if f.len != 4 then fail(s"mkfs: $file: '$line' is not '<path> <uid> <gid> <mode>'")
+        val ino = find_path(img, f[0])
+        if ino == 0 then fail(s"mkfs: $file: ${f[0]} is not in the image")
+        val uid = number(parse_long(f[1]), line)
+        val gid = number(parse_long(f[2]), line)
+        val mode = number(parse_long_base(f[3], 8), line)
+        if uid > 0xffff || gid > 0xffff || (mode | long(PERMISSION_BITS)) != long(PERMISSION_BITS)
+            fail(s"mkfs: $file: '$line' is out of range")
+        val i = inode(img, ino)
+        i.uid = u16(uid)
+        i.gid = u16(gid)
+        i.mode = (i.mode & S_IFMT) | u16(mode)
+
+private number[E](r: Result[long, E], line: string) -> long = r match
+    Ok(n) -> if n >= 0 then n else fail(s"mkfs: '$line' has a negative number")
+    Err(_) -> fail(s"mkfs: '$line' has something that is not a number")
+
+// The inode an absolute path names, or 0.
+private find_path(img: *Image, file: string) -> u32
+    var ino = ROOT_INO
+    for part in split(file, "/")
+        if part.bytes.len == 0 then continue
+        if inode(img, ino).kind != KIND_DIR then return 0
+        ino = lookup(img, ino, part.bytes)
+        if ino == 0 then return 0
     ino
 
 // The block holding byte `n * BLOCK_SIZE` of the file, given one if it has none.
@@ -172,6 +225,7 @@ private fill(img: *Image, dir: u32, from: string)
                 Ok(b) -> b
                 Err(_) -> fail(s"mkfs: cannot read $host")
             val ino = new_inode(img, KIND_FILE)
+            if executable(host) then inode(img, ino).mode = ondisk.type_bits(KIND_FILE) | 0o755
             var off: usize = 0
             while off < bytes.len
                 val n = if bytes.len - off < BLOCK_SIZE then bytes.len - off else BLOCK_SIZE
@@ -181,6 +235,11 @@ private fill(img: *Image, dir: u32, from: string)
                 off += n
             inode(img, ino).size = u64(bytes.len)
             add_entry(img, dir, name, ino, KIND_FILE)
+
+// Whether anyone may run the host's copy of a file — which is what decides 0o755 over 0o644 for keel's.
+private executable(host: string) -> bool = fs.metadata(host) match
+    Ok(m) -> (m.permissions() & 0o111) != 0
+    Err(_) -> false
 
 // --- check ---------------------------------------------------------------------------------------
 //
@@ -222,6 +281,10 @@ private check(path: string) -> int
             k.problems.push(s"inode $ino has kind ${i.kind}")
             continue
         if i.kind == KIND_FILE then k.files += 1 else k.dirs += 1
+        if (i.mode & S_IFMT) != ondisk.type_bits(i.kind)
+            k.problems.push(f"inode $ino has mode ${i.mode}%o, whose type is not its kind ${i.kind}")
+        if (i.mode | S_IFMT | PERMISSION_BITS) != (S_IFMT | PERMISSION_BITS)
+            k.problems.push(f"inode $ino has mode ${i.mode}%o, with bits keel does not define")
         val refs = k.refs[usize(ino)]
         if refs == 0 then k.problems.push(s"inode $ino is in use and no directory names it")
         if u32(i.links) != refs then k.problems.push(s"inode $ino has link count ${i.links}, named $refs times")
@@ -312,12 +375,8 @@ private claim(img: *Image, k: *Fsck, ino: u32, b: u32)
 
 private get(path: string, file: string, host: string) -> int
     var img = opened(path)
-    var ino = ROOT_INO
-    for part in split(file, "/")
-        if part.bytes.len == 0 then continue
-        if inode(&img, ino).kind != KIND_DIR then fail(s"mkfs: $file: not found")
-        ino = lookup(&img, ino, part.bytes)
-        if ino == 0 then fail(s"mkfs: $file: not found")
+    val ino = find_path(&img, file)
+    if ino == 0 then fail(s"mkfs: $file: not found")
     val i = inode(&img, ino)
     if i.kind != KIND_FILE then fail(s"mkfs: $file is not a file")
     var out: Buf[u8] = buf()

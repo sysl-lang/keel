@@ -1,0 +1,11 @@
+// id: this process's user and group, as `uid=<n>(<name>) gid=<n>(<name>)`, the names from /etc/passwd
+// and /etc/group (a number with no line there is printed alone).
+
+import passwd.keel.passwd
+import rt.keel.user
+
+val uid = user.getuid()
+val gid = user.getgid()
+val uname = passwd.user_name(passwd.read_users(), uid)
+val gname = passwd.group_name(passwd.read_groups(), gid)
+print(s"uid=$uid($uname) gid=$gid($gname)")

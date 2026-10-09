@@ -1,0 +1,25 @@
+// `login`: asks who is at the console, checks the password against /etc/passwd, and runs that user's
+// shell as them.
+
+package {
+  name    = "login"
+  version = "0.0.1"
+}
+
+dependencies {
+  rt { workspace = true }
+  fsys { workspace = true }
+  passwd { workspace = true }
+}
+
+// keel does not save the FP/SIMD registers yet, and leaves the unit trapping at EL0 too.
+codegen {
+  general_regs_only = true
+}
+
+targets {
+  aarch64-freestanding {
+    linker_script = "../user.ld"
+    entry         = "_start"
+  }
+}

@@ -1,0 +1,63 @@
+// login: who is at the console. It asks for a name and a password, checks them against /etc/passwd
+// (keel.passwd has the hash), and then becomes that user — its group, then its uid, which only root
+// may change, so login has to be started by root (init) — goes to the user's home directory and runs
+// the user's shell as a child, waiting for it. When the shell exits, so does login, and init starts
+// another, the way getty does.
+//
+// A wrong name or password says `login incorrect` and asks again. The end of the input at the name
+// prompt (Ctrl-D on an empty line) exits with passwd.CONSOLE_CLOSED, which tells init the console is
+// gone. The password is echoed: keel's console has one line discipline and no way to turn echo off.
+
+import abi.keel.abi.Errno
+import passwd.keel.passwd
+import passwd.keel.passwd.User
+import rt.keel.user
+import sysl.fs
+import sysl.io.{lines, stdin}
+
+session(u: User) -> never
+    user.setgid(u.gid) match
+        Ok(_) -> ()
+        Err(e) -> refuse(e)
+    user.setuid(u.uid) match
+        Ok(_) -> ()
+        Err(e) -> refuse(e)
+    fs.set_current_dir(u.home) match
+        Ok(_) -> ()
+        Err(e) ->
+            print(s"login: ${u.home}: $e; starting in /")
+            val _ = fs.set_current_dir("/")
+    val shell = user.spawn(u.shell, ["sh"]) match
+        Ok(pid) -> pid
+        Err(e) ->
+            print(s"login: cannot start ${u.shell}: ${user.describe(e)}")
+            exit(1)
+    loop
+        user.wait() match
+            Ok((pid, _)) -> if pid == shell then exit(0)
+            Err(_) -> exit(0)
+
+refuse(e: Errno) -> never
+    print(s"login: cannot change user: ${user.describe(e)}")
+    exit(1)
+
+var input = stdin()
+var reader = lines(&input)
+loop
+    prints("login: ")
+    val name = reader.getline() match
+        Some(n) -> n
+        None ->
+            print("")
+            exit(passwd.CONSOLE_CLOSED)
+    if name == "" then continue
+    prints("password: ")
+    val password = reader.getline() match
+        Some(p) -> p
+        None ->
+            print("")
+            exit(passwd.CONSOLE_CLOSED)
+    passwd.user_named(passwd.read_users(), name) match
+        Some(u) -> if passwd.opens(u, password) then session(u)
+        None -> ()
+    print("login incorrect")

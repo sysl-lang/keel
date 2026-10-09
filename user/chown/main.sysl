@@ -1,0 +1,49 @@
+// chown <user>[:<group>] <path>...: give each path to a user, and a group if one is named (otherwise
+// its group stays), each by name (/etc/passwd, /etc/group) or by number. Root only. Exits 1 if any path
+// was refused, 2 for a name nobody has.
+//
+// `sysl.fs` can read an owner (`Meta.owner`, `Meta.group`) but has no call that changes one (FINDINGS.md
+// 63), so the change is keel's own system call, through the runtime.
+
+import passwd.keel.passwd
+import rt.keel.user
+import sysl.fs
+import sysl.text.split
+
+main(args: []string)
+    if args.len < 3
+        print("usage: chown <user>[:<group>] <path>...")
+        exit(2)
+    val parts = split(args[1], ":")
+    val uid = passwd.id_of(parts[0]) match
+        Some(n) -> n
+        None -> passwd.user_named(passwd.read_users(), parts[0]) match
+            Some(u) -> u.uid
+            None -> unknown("user", parts[0])
+    var group: Option[u32] = None
+    if parts.len > 1
+        group = Some(passwd.id_of(parts[1]) match
+            Some(n) -> n
+            None -> passwd.group_named(passwd.read_groups(), parts[1]) match
+                Some(g) -> g.gid
+                None -> unknown("group", parts[1]))
+    var failed = false
+    for path in args[2..]
+        val gid = group match
+            Some(g) -> g
+            None -> fs.metadata(path) match
+                Ok(m) -> m.group
+                Err(e) ->
+                    print(s"chown: $path: $e")
+                    failed = true
+                    continue
+        user.chown(path, uid, gid) match
+            Ok(_) -> ()
+            Err(e) ->
+                print(s"chown: $path: ${user.describe(e)}")
+                failed = true
+    if failed then exit(1)
+
+unknown(what: string, name: string) -> never
+    print(s"chown: no $what '$name'")
+    exit(2)

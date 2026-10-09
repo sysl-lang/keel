@@ -8,10 +8,10 @@ module keel.user
 // for a `main(args: []string)`, turns the pair into the slice and calls it — and ends the process with
 // whatever `main` answered.
 
-import abi.keel.abi.{ANY_CHILD, Errno, ExitStatus, NO_FD, STDOUT, SYS_BRK, SYS_CLOSE, SYS_EXIT, SYS_FSTAT,
+import abi.keel.abi.{ANY_CHILD, EACCES, EINVAL, ENOENT, EPERM, Errno, ExitStatus, NO_FD, STDOUT, SYS_BRK, SYS_CLOSE, SYS_EXIT, SYS_FSTAT,
     SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN,
     SYS_STAT, SYS_SYNC, SYS_UNLINK, SYS_WAIT, SYS_WRITE, Stat, SYS_SOCKET, SYS_BIND, SYS_RECVFROM, SYS_SENDTO,
-    SYS_SOCKCLOSE, SockAddr}
+    SYS_SOCKCLOSE, SockAddr, SYS_GETUID, SYS_GETGID, SYS_SETUID, SYS_SETGID, SYS_CHOWN}
 import sysl.buf.{Buf, buf}
 import sysl.slices.{as_mut_ptr, as_ptr}
 
@@ -125,12 +125,12 @@ close(fd: u64) -> Result[unit, Errno] = done(call(SYS_CLOSE, fd, 0, 0, 0))
 lseek(fd: u64, offset: i64, whence: u64) -> Result[u64, Errno] = answer(call(SYS_LSEEK, fd, u64(offset), whence, 0))
 
 fstat(fd: u64) -> Result[Stat, Errno]
-    var s = Stat(0, 0, 0, 0, 0)
+    var s = Stat(0, 0, 0, 0, 0, 0, 0)
     done(call(SYS_FSTAT, fd, u64(usize(&s)), 0, 0))?
     Ok(s)
 
 stat(path: string) -> Result[Stat, Errno]
-    var s = Stat(0, 0, 0, 0, 0)
+    var s = Stat(0, 0, 0, 0, 0, 0, 0)
     done(call(SYS_STAT, addr(path.bytes), len(path.bytes), u64(usize(&s)), 0))?
     Ok(s)
 
@@ -185,6 +185,32 @@ wait(pid: i64 = ANY_CHILD) -> Result[(u64, ExitStatus), Errno]
     Ok((child, s))
 
 getppid() -> u64 = u64(call(SYS_GETPPID, 0, 0, 0, 0))
+
+// --- Users -----------------------------------------------------------------------------------------
+//
+// keel.abi's user calls. The standard library has no notion of a process's user, and `sysl.fs` can
+// read a file's owner but not change it (FINDINGS.md 63), so a program on keel calls these directly.
+
+getuid() -> u32 = u32(call(SYS_GETUID, 0, 0, 0, 0))
+
+getgid() -> u32 = u32(call(SYS_GETGID, 0, 0, 0, 0))
+
+// Become `uid`; EPERM unless this process is root.
+setuid(uid: u32) -> Result[unit, Errno] = done(call(SYS_SETUID, u64(uid), 0, 0, 0))
+
+setgid(gid: u32) -> Result[unit, Errno] = done(call(SYS_SETGID, u64(gid), 0, 0, 0))
+
+// An error number in words, for the messages a program prints about these calls.
+describe(e: Errno) -> string = e match
+    EPERM -> "operation not permitted"
+    EACCES -> "permission denied"
+    ENOENT -> "no such file or directory"
+    EINVAL -> "invalid argument"
+    else s"error ${i64(e)}"
+
+// The owner and group of what `path` names; root only.
+chown(path: string, uid: u32, gid: u32) -> Result[unit, Errno] =
+    done(call(SYS_CHOWN, addr(path.bytes), len(path.bytes), u64(uid), u64(gid)))
 
 // --- UDP sockets -----------------------------------------------------------------------------------
 //

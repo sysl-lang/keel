@@ -1,0 +1,27 @@
+// chmod <octal mode> <path>...: set each path's permission bits to exactly the mode, with the standard
+// library's `sysl.fs.set_permissions` (keel.fsys answers it with keel's chmod call). Only the owner or
+// root may. Exits 1 if any path was refused, 2 for a mode that is not octal.
+
+import rt.keel.user
+import sysl.fs
+import sysl.text.parse_long_base
+
+main(args: []string)
+    if args.len < 3
+        print("usage: chmod <octal mode> <path>...")
+        exit(2)
+    val mode = parse_long_base(args[1], 8) match
+        Ok(m) -> if m >= 0 && m <= 0o7777 then u32(m) else bad_mode(args[1])
+        Err(_) -> bad_mode(args[1])
+    var failed = false
+    for path in args[2..]
+        fs.set_permissions(path, mode) match
+            Ok(_) -> ()
+            Err(e) ->
+                print(s"chmod: $path: $e")
+                failed = true
+    if failed then exit(1)
+
+bad_mode(text: string) -> never
+    print(s"chmod: '$text' is not an octal mode")
+    exit(2)

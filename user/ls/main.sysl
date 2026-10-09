@@ -1,10 +1,15 @@
 // ls [-l] [<dir>]: the names in a directory (the current one by default), sorted, one to a line. With
-// `-l`, each name follows its kind (`d` for a directory, `-` for a file) and its size in bytes, read
-// with `sysl.fs.metadata`. keel keeps no times, so there are none to show. Exits 1 if the directory
-// could not be listed or an entry could not be read.
+// `-l`, each name follows its mode as ten characters (`drwxr-xr-x`, an `s` where the owner's `x` is for
+// a set-user-ID file), its owner's name from /etc/passwd and its size in bytes, read with
+// `sysl.fs.metadata`. keel keeps no times, so there are none to show. Exits 1 if the directory could
+// not be listed or an entry could not be read.
 
+import passwd.keel.passwd
+import passwd.keel.passwd.User
 import rt.keel.user
+import sysl.buf.{Buf, buf}
 import sysl.fs
+import sysl.fs.Meta
 import sysl.path.join
 import sysl.slices.sort
 
@@ -16,17 +21,38 @@ main(args: []string)
         Ok(names) ->
             var all = names.view()
             sort(all)
+            val users: Buf[User] = if long then passwd.read_users() else buf()
             for name in all
-                if long then detail(dir, name) else print(name)
+                if long then detail(dir, name, users) else print(name)
         Err(e) ->
             print(s"ls: $dir: $e")
             exit(1)
 
-detail(dir: string, name: string)
+detail(dir: string, name: string, users: Buf[User])
     fs.metadata(join(dir, name)) match
         Ok(m) ->
-            val kind = if m.is_dir() then "d" else "-"
-            print(f"$kind ${m.size}%8d $name")
+            val owner = passwd.user_name(users, m.owner)
+            print(f"${mode_string(m)} ${padded(owner, 6)} ${m.size}%8d $name")
         Err(e) ->
             print(s"ls: $name: $e")
             exit(1)
+
+// `drwxr-xr-x`: the kind, then rwx for the owner, the group and everyone else.
+mode_string(m: Meta) -> string
+    val p = m.permissions()
+    val kind = if m.is_dir() then "d" else "-"
+    val owner_x = if (p & 0o4000) != 0 then "s" else bit(p, 0o100, "x")
+    kind + bit(p, 0o400, "r") + bit(p, 0o200, "w") + owner_x + bit(p, 0o040, "r") + bit(p, 0o020, "w") +
+        bit(p, 0o010, "x") + bit(p, 0o004, "r") + bit(p, 0o002, "w") + bit(p, 0o001, "x")
+
+bit(p: u32, mask: u32, letter: string) -> string = if (p & mask) != 0 then letter else "-"
+
+// `text` and spaces after it, to `width` bytes. `f"${text}%-6s"` says the same, and is refused on a
+// freestanding target as needing C's snprintf (FINDINGS.md 64).
+padded(text: string, width: usize) -> string
+    var out = text
+    var n = text.bytes.len
+    while n < width
+        out = out + " "
+        n += 1
+    out

@@ -1,0 +1,6 @@
+// whoami: the name /etc/passwd gives this process's uid, or the number if it gives none.
+
+import passwd.keel.passwd
+import rt.keel.user
+
+print(passwd.user_name(passwd.read_users(), user.getuid()))

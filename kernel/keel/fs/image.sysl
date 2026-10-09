@@ -4,7 +4,8 @@ module keel.fs
 // reads an executable this way before it lays the segments out in a new address space.
 
 import abi.keel.abi.{EFBIG, EISDIR, ENAMETOOLONG, ENOENT, Errno}
-import ondisk.keel.ondisk.KIND_DIR
+import keel.sched.Cred
+import ondisk.keel.ondisk.{KIND_DIR, S_ISUID}
 import sysl.buf.{Buf, buf_with_capacity}
 
 // The largest file `read_file` reads: an executable is a few hundred KiB at most, and the copy is one
@@ -15,17 +16,25 @@ private const MAX_FILE: u64 = 4 * 1024 * 1024
 private const MAX_PATH: usize = 256
 private const CHUNK: usize = 512
 
+// An executable read for a new process: its bytes, and who the process runs as.
+struct Executable
+    bytes: Buf[u8]
+    run_as: Cred
+
 // The whole of the file at `path` — absolute, or taken from the directory `cwd` names (an absolute,
-// normalized path, as `Process.cwd` holds) — in a buffer on the kernel heap.
-read_file(cwd: []const u8, path: []const u8) -> Result[Buf[u8], Errno]
+// normalized path, as `Process.cwd` holds) — in a buffer on the kernel heap, if `who` may run it
+// (EACCES). The process runs as `who`, or, for a set-user-ID file, as its owner with `who`'s group.
+read_executable(cwd: []const u8, path: []const u8, who: Cred) -> Result[Executable, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
     val full = joined(cwd, path, room[..])?
     val st = lock()
     defer unlock()
-    val ino = resolve(st, full)?
+    val ino = resolve(st, full, who)?
     var i = read_inode(st, ino)?
     if i.kind == KIND_DIR then return Err(EISDIR)
+    allowed(&i, who, MAY_EXEC)?
     if i.size > MAX_FILE then return Err(EFBIG)
+    val run_as = if (i.mode & S_ISUID) != 0 then Cred(u32(i.uid), who.gid) else who
     var out: Buf[u8] = buf_with_capacity(usize(i.size), 0)
     var chunk: [CHUNK]u8 = [0; CHUNK]
     var at: u64 = 0
@@ -34,7 +43,7 @@ read_file(cwd: []const u8, path: []const u8) -> Result[Buf[u8], Errno]
         if n == 0 then break
         out.extend(chunk[0..<n])
         at += u64(n)
-    Ok(out)
+    Ok(Executable(out, run_as))
 
 // `path` as an absolute path in `room`: as it is if it begins with `/`, else `cwd`, a `/`, and it.
 private[fs] joined(cwd: []const u8, path: []const u8, room: []u8) -> Result[[]const u8, Errno]

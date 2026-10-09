@@ -5,7 +5,7 @@ import keel.fs
 import keel.mm
 import keel.net
 import keel.sched
-import keel.sched.{Context, OpenFile, Process}
+import keel.sched.{Context, Cred, OpenFile, Process}
 import sysl.sync.{Atomic, Ordering}
 
 // User processes: made from an ELF image, run by a kernel thread of their own, ended by `exit`, by a
@@ -25,11 +25,12 @@ private var next_pid: Atomic[u64] = Atomic(1)
 start(path: string) -> Result[&sync Process, LoadError] = start_with(path, [])
 
 // Start the program at `path` with `args` — its argv, the program's name first by convention.
+// The kernel's processes run as root.
 start_with(path: string, args: []const string) -> Result[&sync Process, LoadError]
-    val image = fs.read_file("/".bytes, path.bytes) match
+    val image = fs.read_executable("/".bytes, path.bytes, sched.root_cred()) match
         Ok(b) -> b
         Err(e) -> return Err(Unreadable(e))
-    start_image(image.view(), args, null, None)
+    start_image(image.bytes.view(), args, null, None, image.run_as)
 
 // Number processes from 1 again: init is pid 1. Only while there are none, which it answers.
 restart_pids() -> bool
@@ -39,10 +40,10 @@ restart_pids() -> bool
 
 // Load `image`, an executable already in kernel memory, and start it running with `args`. A `parent`
 // (null: the kernel) passes on its current directory, and `out`, when there is one, stands as the
-// child's standard output. The process is in the table before its thread can run.
+// child's standard output. It runs as `run_as`. The process is in the table before its thread can run.
 private[proc] start_image(image: []const u8, args: []const string, parent: *Process,
-        out: Option[OpenFile]) -> Result[&sync Process, LoadError]
-    val started = start_loaded(image, args, parent, out)
+        out: Option[OpenFile], run_as: Cred) -> Result[&sync Process, LoadError]
+    val started = start_loaded(image, args, parent, out, run_as)
     if started.is_err()
         // The descriptor handed over for the child is not the child's after all.
         out match
@@ -51,7 +52,7 @@ private[proc] start_image(image: []const u8, args: []const string, parent: *Proc
     started
 
 private start_loaded(image: []const u8, args: []const string, parent: *Process,
-        out: Option[OpenFile]) -> Result[&sync Process, LoadError]
+        out: Option[OpenFile], run_as: Cred) -> Result[&sync Process, LoadError]
     var l = load(image)?
     val sp = lay_out_args(&l.space, args) match
         Some(sp) -> sp
@@ -59,7 +60,7 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process,
             mm.free_space(&l.space)
             return Err(TooManyArgs)
     val p: &sync Process = Process(next_pid.add(1), l.space, l.heap_base, l.heap_base, Context([0; 12], 0, 0),
-        Atomic(0), 0, 0, None, 0, sched.no_files(), sched.root_dir(), 1, 0, false, None)
+        Atomic(0), 0, 0, None, 0, sched.no_files(), sched.root_dir(), 1, 0, false, None, run_as.uid, run_as.gid)
     val raw: *Process = &*p
     if parent != null
         raw.ppid = parent.pid

@@ -15,7 +15,7 @@ const BLOCK_SIZE: usize = 4096
 const SECTORS_PER_BLOCK: u64 = 8
 
 const MAGIC: u32 = 0x6c65_656b                 // the bytes "keel", read as a little-endian u32
-const VERSION: u32 = 1
+const VERSION: u32 = 2                          // 2: inodes carry an owner, a group and a POSIX mode
 
 // Block 0 is the boot block: the filesystem never uses it (the virtio test writes sectors 1 and 2).
 const SUPER_BLOCK: u32 = 1
@@ -56,22 +56,39 @@ struct Super
 
 @assert(sizeof(Super) == 48, "the superblock is 48 bytes")
 
+// `Inode.mode` is POSIX's `st_mode`: the type in the top four bits, which always agrees with `kind`,
+// and below it the set-user-ID bit and the nine `rwx` bits for the owner, the group and everyone else.
+const S_IFMT: u16 = 0o170000
+const S_IFDIR: u16 = 0o040000
+const S_IFREG: u16 = 0o100000
+const S_ISUID: u16 = 0o4000                     // an executable runs as its owner
+const PERMISSION_BITS: u16 = 0o4777             // what `chmod` may set: set-user-ID and rwx x 3
+
+// The type bits for a kind.
+type_bits(kind: u16) -> u16 = if kind == KIND_DIR then S_IFDIR else S_IFREG
+
+// The superuser: its uid passes every permission check.
+const ROOT_UID: u16 = 0
+
 // One file or directory: 64 bytes, 64 to a block. Block numbers are absolute; 0 means none (block 0 is
 // the boot block, which nothing owns).
 struct Inode
     kind: u16                   // KIND_FREE, KIND_FILE, KIND_DIR
-    mode: u16                   // permission bits, kept and reported, not enforced
+    mode: u16                   // type bits | S_ISUID | rwx for owner, group, other
     links: u16                  // directory entries naming it: 1 for a file, 2 + subdirectories for a directory
-    reserved: u16
+    uid: u16                    // the owner
     size: u64                   // bytes
     direct: [NDIRECT]u32        // the first ten blocks
     indirect: u32               // a block of 1024 more block numbers
-    reserved2: u32
+    gid: u16                    // the group
+    reserved: u16
 
 @assert(sizeof(Inode) == 64, "an inode is 64 bytes")
+@assert(offsetof(Inode, uid) == 6, "Inode.uid is at 6")
 @assert(offsetof(Inode, size) == 8, "Inode.size is at 8")
 @assert(offsetof(Inode, direct) == 16, "Inode.direct is at 16")
 @assert(offsetof(Inode, indirect) == 56, "Inode.indirect is at 56")
+@assert(offsetof(Inode, gid) == 60, "Inode.gid is at 60")
 
 // One directory entry: 32 bytes, 128 to a block. A directory is a file of these; `.` and `..` are its
 // first two. A name is up to 24 bytes, not terminated.

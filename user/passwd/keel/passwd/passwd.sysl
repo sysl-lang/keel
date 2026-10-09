@@ -1,0 +1,118 @@
+module keel.passwd
+
+// keel's user database: /etc/passwd and /etc/group, in Unix's layout, and the password hash.
+//
+//   /etc/passwd   name:hash:uid:gid:home:shell     one user a line
+//   /etc/group    name:x:gid:members               one group a line; members comma-separated
+//
+// The hash is PBKDF2-HMAC-SHA-256 over the password, salted with `keel:` and the user's name, 1,000
+// iterations, 16 bytes written as 32 hex digits — the password itself is never on the disk. The salt is
+// the name rather than random bytes so that the host's mkfs and the boot test can write a known
+// account; the iteration count is low because TCG emulates every round. An empty hash field is an
+// account no password opens.
+
+import sysl.buf.{Buf, buf}
+import sysl.crypto.{pbkdf2_hmac256, verify}
+import sysl.encoding.hex_string
+import sysl.fs
+import sysl.text.{parse_long, split}
+
+struct User
+    name: string
+    hash: string
+    uid: u32
+    gid: u32
+    home: string
+    shell: string
+
+struct Group
+    name: string
+    gid: u32
+    members: []string
+
+private const ITERATIONS: u32 = 1000
+private const KEY_BYTES: usize = 16
+
+// What `login` exits with when the console's input ends at its prompt: init, which runs `login` again
+// after every session, takes it as the end of the machine's session and stops.
+const CONSOLE_CLOSED: int = 100
+
+// /etc/passwd and /etc/group as they are now; empty when the file cannot be read.
+read_users() -> Buf[User] = fs.read_text("/etc/passwd") match
+    Ok(t) -> users(t)
+    Err(_) -> buf()
+
+read_groups() -> Buf[Group] = fs.read_text("/etc/group") match
+    Ok(t) -> groups(t)
+    Err(_) -> buf()
+
+// The hash field for `name` with `password`.
+hashed(name: string, password: string) -> string
+    var key: [KEY_BYTES]u8 = [0; KEY_BYTES]
+    pbkdf2_hmac256(password.bytes, s"keel:$name".bytes, ITERATIONS, key[..]) match
+        Ok(_) -> hex_string(key[..])
+        Err(_) -> ""
+
+// Whether `password` is `u`'s, compared in constant time.
+opens(u: User, password: string) -> bool
+    if u.hash.bytes.len == 0 then return false
+    verify(hashed(u.name, password).bytes, u.hash.bytes)
+
+// Every well-formed line of a passwd file; a malformed one is skipped.
+users(text: string) -> Buf[User]
+    var out: Buf[User] = buf()
+    for line in split(text, "\n")
+        val f = split(line, ":")
+        if f.len != 6 then continue
+        val uid = id_of(f[2])
+        val gid = id_of(f[3])
+        if uid.is_none() || gid.is_none() then continue
+        out.push(User(f[0], f[1], uid.unwrap(), gid.unwrap(), f[4], f[5]))
+    out
+
+// Every well-formed line of a group file.
+groups(text: string) -> Buf[Group]
+    var out: Buf[Group] = buf()
+    for line in split(text, "\n")
+        val f = split(line, ":")
+        if f.len != 4 then continue
+        id_of(f[2]) match
+            Some(gid) -> out.push(Group(f[0], gid, if f[3] == "" then [] else split(f[3], ",")))
+            None -> ()
+    out
+
+user_named(all: Buf[User], name: string) -> Option[User]
+    for u in all
+        if u.name == name then return Some(u)
+    None
+
+user_with(all: Buf[User], uid: u32) -> Option[User]
+    for u in all
+        if u.uid == uid then return Some(u)
+    None
+
+group_with(all: Buf[Group], gid: u32) -> Option[Group]
+    for g in all
+        if g.gid == gid then return Some(g)
+    None
+
+group_named(all: Buf[Group], name: string) -> Option[Group]
+    for g in all
+        if g.name == name then return Some(g)
+    None
+
+// A user's name, or its number when /etc/passwd has no line for it, as `ls -l` and `id` print it.
+user_name(all: Buf[User], uid: u32) -> string = user_with(all, uid) match
+    Some(u) -> u.name
+    None -> s"$uid"
+
+group_name(all: Buf[Group], gid: u32) -> string = group_with(all, gid) match
+    Some(g) -> g.name
+    None -> s"$gid"
+
+// An id field: decimal, 0 to 65535 (an inode records 16 bits).
+id_of(text: string) -> Option[u32]
+    if text.bytes.len == 0 then return None
+    parse_long(text) match
+        Ok(n) -> if n >= 0 && n <= 0xffff then Some(u32(n)) else None
+        Err(_) -> None

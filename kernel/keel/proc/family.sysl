@@ -20,6 +20,7 @@ import abi.keel.abi.{ANY_CHILD, ARGS_ROOM, E2BIG, EAGAIN, ECHILD, EFAULT, EINVAL
     ENOMEM, Errno, ExitStatus, INIT_PID, NO_FD}
 import keel.fs
 import keel.mm
+import keel.sched
 import keel.sched.{IrqLock, OpenFile, Process, WaitQueue}
 import sysl.buf.{Buf, buf, buf_with_capacity}
 import sysl.text.from_utf8
@@ -90,9 +91,11 @@ private[proc] sys_spawn(p: *Process, regs: *u64) -> Result[i64, Errno]
     if args_len > 0 && !mm.copy_from_user(&p.space, regs[2], packed.view()) then return Err(EFAULT)
     val args = unpacked(packed.view())?
 
-    val image = fs.read_file(p.cwd[0..<p.cwd_len], path[0..<usize(path_len)])?
+    // The file must be executable by the caller; the child runs as the caller, or as the file's owner
+    // when it is set-user-ID.
+    val image = fs.read_executable(p.cwd[0..<p.cwd_len], path[0..<usize(path_len)], sched.cred_of(p))?
     val out = if regs[4] == NO_FD then None else Some(fs.inherit(p, regs[4])?)
-    start_image(image.view(), args.view(), p, out) match
+    start_image(image.bytes.view(), args.view(), p, out, image.run_as) match
         Ok(child) -> Ok(i64(child.pid))
         Err(e) -> Err(errno_of(e))
 

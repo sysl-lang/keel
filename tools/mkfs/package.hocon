@@ -8,4 +8,5 @@ package {
 
 dependencies {
   ondisk { workspace = true }
+  passwd { workspace = true }
 }

@@ -14,13 +14,13 @@ module keel.fs
 // an operation that fails half way through can leave a block or an inode allocated and unnamed, which
 // mkfs's check reports.
 
-import abi.keel.abi.{EBADF, EBUSY, EEXIST, EFAULT, EINVAL, EISDIR, EMFILE, ENAMETOOLONG, ENOENT, ENOTDIR,
+import abi.keel.abi.{EBADF, EBUSY, EEXIST, EFAULT, EINVAL, EISDIR, EMFILE, ENAMETOOLONG, ENOENT, ENOTDIR, EPERM,
     ENOTEMPTY, ERANGE, Errno, FIRST_FILE_FD, MAX_FDS, O_ACCMODE, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY,
     SEEK_CUR, SEEK_END, SEEK_SET, Stat}
 import keel.mm
-import keel.sched.{OPEN_FILES, OpenFile, Process}
+import keel.sched.{Cred, OPEN_FILES, OpenFile, Process, cred_of}
 import ondisk.keel.ondisk
-import ondisk.keel.ondisk.{DIRENT_SIZE, Dirent, Inode, KIND_DIR, KIND_FILE, ROOT_INO}
+import ondisk.keel.ondisk.{DIRENT_SIZE, Dirent, Inode, KIND_DIR, KIND_FILE, PERMISSION_BITS, ROOT_INO, S_IFMT}
 
 private const MAX_PATH: usize = 256
 private const CHUNK: usize = 512
@@ -37,18 +37,21 @@ sys_open(p: *Process, regs: *u64) -> Result[i64, Errno]
         fd += 1
     if fd == MAX_FDS then return Err(EMFILE)
 
+    val who = cred_of(p)
     val st = lock()
     defer unlock()
-    val ino = resolve(st, path) match
+    val ino = resolve(st, path, who) match
         Ok(ino) ->
             if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 then return Err(EEXIST)
             ino
         Err(ENOENT) ->
             if (flags & O_CREAT) == 0 then return Err(ENOENT)
-            create(st, path, KIND_FILE)?
+            create(st, path, KIND_FILE, who)?
         Err(e) -> return Err(e)
     var i = read_inode(st, ino)?
     if i.kind == KIND_DIR && access != O_RDONLY then return Err(EISDIR)
+    val want = if access == O_RDONLY then MAY_READ elif access == O_WRONLY then MAY_WRITE else MAY_READ | MAY_WRITE
+    allowed(&i, who, want)?
     if (flags & O_TRUNC) != 0 && access != O_RDONLY && i.kind == KIND_FILE && i.size != 0
         truncate(st, &i)?
         write_inode(st, ino, i)?
@@ -178,7 +181,7 @@ sys_stat(p: *Process, regs: *u64) -> Result[i64, Errno]
     val path = path_in(p, regs[0], regs[1], room[..])?
     val st = lock()
     defer unlock()
-    val ino = resolve(st, path)?
+    val ino = resolve(st, path, cred_of(p))?
     val s = stat_of(ino, read_inode(st, ino)?)
     stat_out(p, regs[2], s)
 
@@ -188,7 +191,7 @@ sys_mkdir(p: *Process, regs: *u64) -> Result[i64, Errno]
     val path = path_in(p, regs[0], regs[1], room[..])?
     val st = lock()
     defer unlock()
-    val _ = create(st, path, KIND_DIR)?
+    val _ = create(st, path, KIND_DIR, cred_of(p))?
     Ok(0)
 
 // getdents(fd, buf, len) -> bytes: as many whole entries as fit, from where the last call stopped.
@@ -218,11 +221,13 @@ sys_getdents(p: *Process, regs: *u64) -> Result[i64, Errno]
 sys_unlink(p: *Process, regs: *u64) -> Result[i64, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
     val path = path_in(p, regs[0], regs[1], room[..])?
+    val who = cred_of(p)
     val st = lock()
     defer unlock()
-    val (dir_ino, name) = parent_of(st, path)?
+    val (dir_ino, name) = parent_of(st, path, who)?
     var dir = read_inode(st, dir_ino)?
     val f = named(st, &dir, name)?
+    allowed(&dir, who, MAY_WRITE | MAY_EXEC)?
     if f.kind == KIND_DIR then return Err(EISDIR)
     if st.opens[usize(f.ino)] != 0 then return Err(EBUSY)
     clear_slot(st, &dir, f.slot)?
@@ -233,11 +238,13 @@ sys_unlink(p: *Process, regs: *u64) -> Result[i64, Errno]
 sys_rmdir(p: *Process, regs: *u64) -> Result[i64, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
     val path = path_in(p, regs[0], regs[1], room[..])?
+    val who = cred_of(p)
     val st = lock()
     defer unlock()
-    val (dir_ino, name) = parent_of(st, path)?
+    val (dir_ino, name) = parent_of(st, path, who)?
     var dir = read_inode(st, dir_ino)?
     val f = named(st, &dir, name)?
+    allowed(&dir, who, MAY_WRITE | MAY_EXEC)?
     if f.kind != KIND_DIR then return Err(ENOTDIR)
     if st.opens[usize(f.ino)] != 0 then return Err(EBUSY)
     var victim = read_inode(st, f.ino)?
@@ -255,15 +262,18 @@ sys_rename(p: *Process, regs: *u64) -> Result[i64, Errno]
     var to_room: [MAX_PATH]u8 = [0; MAX_PATH]
     val from = path_in(p, regs[0], regs[1], from_room[..])?
     val to = path_in(p, regs[2], regs[3], to_room[..])?
+    val who = cred_of(p)
     val st = lock()
     defer unlock()
-    val (src_ino, src_name) = parent_of(st, from)?
-    val (dst_ino, dst_name) = parent_of(st, to)?
+    val (src_ino, src_name) = parent_of(st, from, who)?
+    val (dst_ino, dst_name) = parent_of(st, to, who)?
     if dots(dst_name) then return Err(EINVAL)
     var src_dir = read_inode(st, src_ino)?
     val src = named(st, &src_dir, src_name)?
     var dst_dir = if dst_ino == src_ino then src_dir else read_inode(st, dst_ino)?
     if dst_dir.kind != KIND_DIR then return Err(ENOTDIR)
+    allowed(&src_dir, who, MAY_WRITE | MAY_EXEC)?
+    allowed(&dst_dir, who, MAY_WRITE | MAY_EXEC)?
     val existing = find(st, &dst_dir, dst_name)?
     existing match
         Some(e) ->
@@ -310,16 +320,18 @@ sys_sync() -> Result[i64, Errno]
 
 // --- Shared by the calls above --------------------------------------------------------------------
 
-// Make a file or a directory at `path`, which must not exist; its parent must.
-private create(st: *State, path: []const u8, kind: u16) -> Result[u32, Errno]
-    val (dir_ino, name) = parent_of(st, path)?
+// Make a file or a directory at `path`, which must not exist, owned by `who`; its parent must exist and
+// let `who` write and search it.
+private create(st: *State, path: []const u8, kind: u16, who: Cred) -> Result[u32, Errno]
+    val (dir_ino, name) = parent_of(st, path, who)?
     if dots(name) then return Err(EEXIST)
     var dir = read_inode(st, dir_ino)?
     if dir.kind != KIND_DIR then return Err(ENOTDIR)
     find(st, &dir, name)? match
         Some(_) -> return Err(EEXIST)
         None -> ()
-    val ino = new_inode(st, kind)?
+    allowed(&dir, who, MAY_WRITE | MAY_EXEC)?
+    val ino = new_inode(st, kind, who)?
     if kind == KIND_DIR
         var d = read_inode(st, ino)?
         add_entry(st, &d, ".".bytes, ino, KIND_DIR)?
@@ -372,10 +384,13 @@ sys_getcwd(p: *Process, regs: *u64) -> Result[i64, Errno]
 sys_chdir(p: *Process, regs: *u64) -> Result[i64, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
     val path = path_in(p, regs[0], regs[1], room[..])?
+    val who = cred_of(p)
     val st = lock()
     defer unlock()
-    val ino = resolve(st, path)?
-    if read_inode(st, ino)?.kind != KIND_DIR then return Err(ENOTDIR)
+    val ino = resolve(st, path, who)?
+    var d = read_inode(st, ino)?
+    if d.kind != KIND_DIR then return Err(ENOTDIR)
+    allowed(&d, who, MAY_EXEC)?
     var clean: [MAX_PATH]u8 = [0; MAX_PATH]
     val n = normalized(path, clean[..])
     for j in 0..<n
@@ -387,9 +402,12 @@ sys_chdir(p: *Process, regs: *u64) -> Result[i64, Errno]
 sys_truncate(p: *Process, regs: *u64) -> Result[i64, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
     val path = path_in(p, regs[0], regs[1], room[..])?
+    val who = cred_of(p)
     val st = lock()
     defer unlock()
-    val ino = resolve(st, path)?
+    val ino = resolve(st, path, who)?
+    var i = read_inode(st, ino)?
+    if i.kind == KIND_FILE then allowed(&i, who, MAY_WRITE)?
     resized(st, ino, regs[2])
 
 // ftruncate(fd, length) -> 0, on a descriptor open for writing.
@@ -400,14 +418,51 @@ sys_ftruncate(p: *Process, regs: *u64) -> Result[i64, Errno]
     defer unlock()
     resized(st, f.ino, regs[1])
 
-// access(path, path_len, how) -> 0 when the path names something. keel keeps permission bits but
-// enforces none, so whether the program may read or write it is always yes.
+// access(path, path_len, how) -> 0 when the path names something and the caller may do what `how`
+// asks (its low three bits: r 4, w 2, x 1; 0 asks only whether it is there).
 sys_access(p: *Process, regs: *u64) -> Result[i64, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
     val path = path_in(p, regs[0], regs[1], room[..])?
+    if regs[2] > 7 then return Err(EINVAL)
+    val who = cred_of(p)
     val st = lock()
     defer unlock()
-    val _ = resolve(st, path)?
+    val ino = resolve(st, path, who)?
+    var i = read_inode(st, ino)?
+    allowed(&i, who, u16(regs[2]))?
+    Ok(0)
+
+// chmod(path, path_len, mode) -> 0: the set-user-ID and rwx bits of `mode` (others are EINVAL), by
+// the owner or root (EPERM).
+sys_chmod(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var room: [MAX_PATH]u8 = [0; MAX_PATH]
+    val path = path_in(p, regs[0], regs[1], room[..])?
+    val mode = regs[2]
+    if (mode | u64(PERMISSION_BITS)) != u64(PERMISSION_BITS) then return Err(EINVAL)
+    val who = cred_of(p)
+    val st = lock()
+    defer unlock()
+    val ino = resolve(st, path, who)?
+    var i = read_inode(st, ino)?
+    if who.uid != 0 && who.uid != u32(i.uid) then return Err(EPERM)
+    i.mode = (i.mode & S_IFMT) | u16(mode)
+    write_inode(st, ino, i)?
+    Ok(0)
+
+// chown(path, path_len, uid, gid) -> 0: root only (EPERM). Both ids fit 16 bits on the disk (EINVAL).
+sys_chown(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var room: [MAX_PATH]u8 = [0; MAX_PATH]
+    val path = path_in(p, regs[0], regs[1], room[..])?
+    if regs[2] > 0xffff || regs[3] > 0xffff then return Err(EINVAL)
+    val who = cred_of(p)
+    if who.uid != 0 then return Err(EPERM)
+    val st = lock()
+    defer unlock()
+    val ino = resolve(st, path, who)?
+    var i = read_inode(st, ino)?
+    i.uid = u16(regs[2])
+    i.gid = u16(regs[3])
+    write_inode(st, ino, i)?
     Ok(0)
 
 private resized(st: *State, ino: u32, length: u64) -> Result[i64, Errno]
@@ -454,7 +509,8 @@ private file_of(p: *Process, fd: u64) -> Result[*OpenFile, Errno]
     if f.ino == 0 then return Err(EBADF)
     Ok(f)
 
-private stat_of(ino: u32, i: Inode) -> Stat = Stat(ino, u32(i.kind), u32(i.mode), u32(i.links), i.size)
+private stat_of(ino: u32, i: Inode) -> Stat =
+    Stat(ino, u32(i.kind), u32(i.mode), u32(i.links), i.size, u32(i.uid), u32(i.gid))
 
 private stat_out(p: *Process, va: u64, s: Stat) -> Result[i64, Errno]
     if !mm.copy_to_user(&p.space, va, bytes_of(&s)) then return Err(EFAULT)

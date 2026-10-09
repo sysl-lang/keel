@@ -6,6 +6,7 @@ module keel.fs
 // no current directory yet), `.` and `..` found as the entries they are.
 
 import abi.keel.abi.{EINVAL, EIO, ENAMETOOLONG, ENOENT, ENOTDIR, Errno}
+import keel.sched.Cred
 import ondisk.keel.ondisk
 import ondisk.keel.ondisk.{BLOCK_SIZE, DIRENT_SIZE, Dirent, Inode, KIND_DIR, NAME_MAX, ROOT_INO}
 
@@ -82,8 +83,9 @@ private[fs] is_empty(st: *State, dir: *Inode) -> Result[bool, Errno]
         if name != ".".bytes && name != "..".bytes then return Ok(false)
     Ok(true)
 
-// The inode a path names.
-private[fs] resolve(st: *State, path: []const u8) -> Result[u32, Errno]
+// The inode a path names, as `who` finds it: every directory the walk passes through must let `who`
+// search it (EACCES).
+private[fs] resolve(st: *State, path: []const u8, who: Cred) -> Result[u32, Errno]
     var ino = ROOT_INO
     var at: usize = 0
     while at < path.len
@@ -92,6 +94,7 @@ private[fs] resolve(st: *State, path: []const u8) -> Result[u32, Errno]
         if start == end then continue
         if end - start > NAME_MAX then return Err(ENAMETOOLONG)
         var dir = read_inode(st, ino)?
+        if dir.kind == KIND_DIR then allowed(&dir, who, MAY_EXEC)?
         ino = find(st, &dir, path[start..<end])? match
             Some(f) -> f.ino
             None -> return Err(ENOENT)
@@ -99,7 +102,7 @@ private[fs] resolve(st: *State, path: []const u8) -> Result[u32, Errno]
 
 // The directory holding a path's last component, and that component: `/a/b/c` is `/a/b`'s inode and
 // `c`. A path with no last component (`/`, or nothing) is EINVAL.
-private[fs] parent_of(st: *State, path: []const u8) -> Result[(u32, []const u8), Errno]
+private[fs] parent_of(st: *State, path: []const u8, who: Cred) -> Result[(u32, []const u8), Errno]
     var end = path.len
     while end > 0 && path[end - 1] == u8('/')
         end -= 1
@@ -108,7 +111,7 @@ private[fs] parent_of(st: *State, path: []const u8) -> Result[(u32, []const u8),
         start -= 1
     if start == end then return Err(EINVAL)
     if end - start > NAME_MAX then return Err(ENAMETOOLONG)
-    val dir = resolve(st, path[0..<start])?
+    val dir = resolve(st, path[0..<start], who)?
     Ok((dir, path[start..<end]))
 
 // The component of `path` starting at `at`: where it starts and ends. At a `/` it is the empty one

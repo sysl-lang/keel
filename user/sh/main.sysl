@@ -7,6 +7,8 @@
 //   pwd         the current directory
 //   exit [n]    end the shell with code n (0 by default); the end of the input does the same
 //
+// The prompt is `# ` when the shell runs as root and `$ ` otherwise.
+//
 // A command that fails says so on the line after its output: `sh: <name>: exit status <n>`, or the
 // signal a fault ended it with (status 128 + the signal), or that it is not there (status 127).
 
@@ -134,13 +136,16 @@ parse_code(text: string) -> i64
         n = n * 10 + i64(b - u8('0'))
     n
 
+// The prompt says who the shell runs as: `# ` for root, `$ ` for anyone else.
+val prompt = if user.getuid() == 0 then "# " else "$ "
+
 var input = stdin()
-prints("$ ")
+prints(prompt)
 for line in lines(&input)
     words(line) match
         Some(w) ->
             if w.len() > 0 && !builtin(w) then val _ = run(w)
         None -> print("sh: a quote is not closed")
-    prints("$ ")
+    prints(prompt)
 print("")
 exit(0)

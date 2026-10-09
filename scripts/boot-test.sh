@@ -74,7 +74,7 @@ after_user_line=(
     "keel: cp big ok"       # ...and the 200 KiB /m9/big.bin, through the indirect block (checked on the host too)
     "cp: /missing.txt: no such file or directory"   # cp of a missing file says sysl.fs's error...
     "keel: cp missing ok"   # ...and exits 1 (cmp of it exits 2)
-    $'\nbin\ndir\nhello.txt\nm9\nout.txt\n'   # ls /, sorted, one name to a line
+    $'\nbin\ndir\netc\nhello.txt\nhome\nm9\nout.txt\n'   # ls /, sorted, one name to a line
     "keel: ls ok"
     "inside a directory"    # cat /dir/inner.txt
     "keel: cat ok"
@@ -92,7 +92,15 @@ after_user_line=(
 # piped into QEMU's serial input and its transcript checked, in order, between the lines above and the
 # shutdown below. The console echoes a line as the shell reads it, so the transcript is the prompt,
 # the command and its output, one after another.
+#
+# Milestone 12: init runs login, not the shell, and runs it again after every session; the end of the
+# input at its prompt (Ctrl-D, the last line of each session) ends init. Boot 1 logs in as root for
+# milestone 10's steps, then as alice: a wrong password, `id`, a root-only file refused, `login` refused
+# to a user who is not root, `su` with a wrong and then the right password, the file read as root,
+# then chmod and chown back as alice. The prompt is `# ` for root and `$ ` for anyone else.
 session1=(
+    'root'
+    'keelroot'
     'echo hello'
     'pwd'
     'mkdir /t'
@@ -122,43 +130,96 @@ session1=(
     'orphan'
     'false'
     'nosuch'
+    'whoami'
     'exit'
+    'alice'
+    'nope'
+    'alice'
+    'wonderland'
+    'id'
+    'pwd'
+    'cat /etc/secret'
+    'login'
+    'root'
+    'keelroot'
+    'su'
+    'nope'
+    'su'
+    'keelroot'
+    'id'
+    'cat /etc/secret'
+    'exit'
+    'echo note > note'
+    'chmod 600 note'
+    'ls -l'
+    'chown root note'
+    'su'
+    'keelroot'
+    'chown root:root /home/alice/note'
+    'exit'
+    'ls -l'
+    'cat note'
+    'whoami'
+    'exit'
+    $'\x04'
 )
 transcript1=(
-    $'$ echo hello\nhello\n'                    # a program from /bin with its argv
-    $'$ pwd\n/\n'                               # the built-in pwd, from the root
-    $'$ mkdir /t\n$ cd /t\n$ pwd\n/t\n'         # mkdir, and cd — the shell's own directory
-    $'$ echo data > f\n$ ls\nf\n'               # > made f in /t, and ls in the child's inherited cwd
-    $'$ cat f\ndata\n'                          # ...holding what echo wrote to its redirected stdout
-    $'$ cp f g\n$ rm f\n$ ls\ng\n'              # cp, rm: only g is left
-    $'$ mv g h\n$ ls\nh\n'                      # mv
-    $'$ mv h /m9/kept\n$ cd ..\n$ rmdir t\n$ ls -l /\nd '   # / is as the files program expects it next boot
-    $'\nd       96 dir\n-       19 hello.txt\nd      192 m9\n'   # ls -l: kind and size, from sysl.fs.metadata
-    $'$ mkdir /t\n$ mkdir /t/a\n$ echo one > /t/a/x\n$ cp -r /t /u\n$ ls -l /u/a\n-        4 x\n'   # copy_dir_all
-    $'$ rm -r /t\n$ rm -r /u\n$ ls /\nbin\ndir\nhello.txt\nm9\nout.txt\n$ ppid\npid '   # remove_dir_all: both trees gone
-    $' ppid 2\n'                                # ppid's parent is the shell, pid 2 (init is 1)
-    $'$ orphan\n$ false\nsh: false: exit status 1\n'   # a failing command's status is said
-    $'$ nosuch\nsh: nosuch: not found\n'        # ...and a missing one's
-    $'$ exit\n'
-    "init: the shell exited 0; orphans reaped: 1"   # orphan's child was handed to init and reaped
+    $'login: root\npassword: keelroot\n'        # init ran login; root's password opens root's account
+    $'# echo hello\nhello\n'                    # a program from /bin with its argv, in root's shell
+    $'# pwd\n/\n'                               # the built-in pwd, from root's home, the root
+    $'# mkdir /t\n# cd /t\n# pwd\n/t\n'         # mkdir, and cd — the shell's own directory
+    $'# echo data > f\n# ls\nf\n'               # > made f in /t, and ls in the child's inherited cwd
+    $'# cat f\ndata\n'                          # ...holding what echo wrote to its redirected stdout
+    $'# cp f g\n# rm f\n# ls\ng\n'              # cp, rm: only g is left
+    $'# mv g h\n# ls\nh\n'                      # mv
+    $'# mv h /m9/kept\n# cd ..\n# rmdir t\n# ls -l /\ndrwxr-xr-x root   '   # / is as the files program expects it next boot
+    $'\ndrwxr-xr-x root         96 dir\ndrwxr-xr-x root        160 etc\n-rw-r--r-- root         19 hello.txt\n'
+    $'drwxr-xr-x root         96 home\ndrwxr-xr-x root        192 m9\n'   # ls -l: mode, owner and size, from sysl.fs.metadata
+    $'# mkdir /t\n# mkdir /t/a\n# echo one > /t/a/x\n# cp -r /t /u\n# ls -l /u/a\n-rw-r--r-- root          4 x\n'   # copy_dir_all
+    $'# rm -r /t\n# rm -r /u\n# ls /\nbin\ndir\netc\nhello.txt\nhome\nm9\nout.txt\n# ppid\npid '   # remove_dir_all: both trees gone
+    $' ppid 3\n'                                # ppid's parent is the shell, pid 3 (init is 1, login 2)
+    $'# orphan\n# false\nsh: false: exit status 1\n'   # a failing command's status is said
+    $'# nosuch\nsh: nosuch: not found\n'        # ...and a missing one's
+    $'# whoami\nroot\n# exit\n'
+    $'login: alice\npassword: nope\nlogin incorrect\n'   # init ran login again; a wrong password is refused
+    $'login: alice\npassword: wonderland\n'
+    $'$ id\nuid=1000(alice) gid=100(users)\n'   # alice's ids, named from /etc/passwd and /etc/group
+    $'$ pwd\n/home/alice\n'                     # login went to her home directory
+    $'$ cat /etc/secret\ncat: /etc/secret: permission denied\nsh: cat: exit status 1\n'   # mode 600, root's
+    $'$ login\nlogin: root\npassword: keelroot\nlogin: cannot change user: operation not permitted\n'   # setgid/setuid: root only
+    $'sh: login: exit status 1\n'
+    $'$ su\npassword: nope\nsu: incorrect password\nsh: su: exit status 1\n'
+    $'$ su\npassword: keelroot\n# id\nuid=0(root) gid=0(root)\n'   # su is set-user-ID root
+    $'# cat /etc/secret\nfor root\'s eyes only\n# exit\n'   # root reads it; exit is back to alice
+    $'$ echo note > note\n$ chmod 600 note\n$ ls -l\n-rw------- alice         5 note\n'   # chmod, by the owner
+    $'$ chown root note\nchown: note: operation not permitted\nsh: chown: exit status 1\n'   # chown: root only
+    $'$ su\npassword: keelroot\n# chown root:root /home/alice/note\n# exit\n'
+    $'$ ls -l\n-rw------- root          5 note\n'   # it is root's now...
+    $'$ cat note\ncat: note: permission denied\nsh: cat: exit status 1\n'   # ...so alice cannot read it
+    $'$ whoami\nalice\n$ exit\nlogin: \n'       # the end of the input at the login prompt ends init
+    "init: the console closed after 2 sessions; orphans reaped: 1"   # orphan's child was handed to init and reaped
     "keel: init exited 0"
     "keel: every process reaped"
 )
 # The second boot finds what the first left and removes it, and edits a line: four characters typed,
 # two rubbed out with DEL (each echoed as backspace, space, backspace), two more typed.
 session2=(
+    'root'
+    'keelroot'
     'cat /m9/kept'
     'rm /m9/kept'
     'ls /m9'
     $'echo tyxz\x7f\x7fpo'
     'exit'
+    $'\x04'
 )
 transcript2=(
-    $'$ cat /m9/kept\ndata\n'                   # the file the first boot's shell wrote, read back
-    $'$ rm /m9/kept\n$ ls /m9\nbig.bin\nbig.copy\ncopy.txt\n'
-    $'$ echo tyxz\b \b\b \bpo\ntypo\n'          # the line the shell got is the edited one
-    $'$ exit\n'
-    "init: the shell exited 0; orphans reaped: 0"
+    $'login: root\npassword: keelroot\n'
+    $'# cat /m9/kept\ndata\n'                   # the file the first boot's shell wrote, read back
+    $'# rm /m9/kept\n# ls /m9\nbig.bin\nbig.copy\ncopy.txt\n'
+    $'# echo tyxz\b \b\b \bpo\ntypo\n'          # the line the shell got is the edited one
+    $'# exit\nlogin: \n'
+    "init: the console closed after 1 sessions; orphans reaped: 0"
     "keel: init exited 0"
     "keel: every process reaped"
 )
@@ -170,11 +231,11 @@ shutdown=(
 
 # Printed only if something went wrong: the access after a failed bounds check went ahead, a check in
 # the `files` program failed, the shell was restarted, or a process was left behind.
-not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: sh ended by a fault"
+not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login ended by a fault"
     "keel: processes left unreaped" "keel: processes still running before init")
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
-    init sh mkdir rm rmdir mv false ppid orphan udpecho)
+    init sh mkdir rm rmdir mv false ppid orphan udpecho login su id whoami chmod chown)
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
 frames_min=65000
@@ -211,7 +272,17 @@ print -n "hello from the disk" > $fsroot/hello.txt
 print "inside a directory" > $fsroot/dir/inner.txt
 mkdir -p $fsroot/m9
 perl -e 'srand(9); print map { chr(int(rand(256))) } 1..204800' > $fsroot/m9/big.bin
-$mkfs build $disk 1024 $fsroot
+# Milestone 12: the users. root's password is `keelroot`, alice's `wonderland`; /etc/passwd holds their
+# hashes (mkfs computes them with keel.passwd, the code login checks them with). Everything is root's
+# except alice's home, /bin/su is set-user-ID root, and /etc/secret is root's alone.
+mkdir -p $fsroot/etc $fsroot/home/alice
+print -r -- "root:$($mkfs passwd root keelroot):0:0:/:/bin/sh" > $fsroot/etc/passwd
+print -r -- "alice:$($mkfs passwd alice wonderland):1000:100:/home/alice:/bin/sh" >> $fsroot/etc/passwd
+print -l "root:x:0:" "users:x:100:alice" > $fsroot/etc/group
+print "for root's eyes only" > $fsroot/etc/secret
+owners=$out/owners
+print -l "/home/alice 1000 100 755" "/bin/su 0 0 4755" "/etc/secret 0 0 600" > $owners
+$mkfs build $disk 1024 $fsroot $owners
 sector 7 3 | perl -e 'open(my $f, "+<", $ARGV[0]) or die; seek($f, 512, 0); local $/; print $f <STDIN>' $disk
 
 if [[ $accel == hvf ]]; then

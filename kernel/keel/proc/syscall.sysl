@@ -1,6 +1,7 @@
 module keel.proc
 
-import abi.keel.abi.{EFAULT, ENOSYS, Errno, STDERR, STDIN, STDOUT, SYS_ACCESS, SYS_BRK, SYS_CHDIR, SYS_CLOSE,
+import abi.keel.abi.{EFAULT, EINVAL, ENOSYS, EPERM, Errno, STDERR, STDIN, STDOUT, SYS_CHMOD, SYS_CHOWN, SYS_GETGID,
+    SYS_GETUID, SYS_SETGID, SYS_SETUID, SYS_ACCESS, SYS_BRK, SYS_CHDIR, SYS_CLOSE,
     SYS_EXIT, SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR,
     SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN, SYS_STAT, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINK, SYS_WAIT,
     SYS_WRITE, SYS_SOCKET, SYS_BIND, SYS_RECVFROM, SYS_SENDTO, SYS_SOCKCLOSE}
@@ -51,6 +52,12 @@ private[proc] system_call(regs: *u64)
         SYS_RECVFROM -> sys_recvfrom(p, regs)
         SYS_SENDTO -> sys_sendto(p, regs)
         SYS_SOCKCLOSE -> sys_sockclose(p, regs)
+        SYS_GETUID -> Ok(i64(p.uid))
+        SYS_GETGID -> Ok(i64(p.gid))
+        SYS_SETUID -> sys_setuid(p, regs)
+        SYS_SETGID -> sys_setgid(p, regs)
+        SYS_CHMOD -> fs.sys_chmod(p, regs)
+        SYS_CHOWN -> fs.sys_chown(p, regs)
         else Err(ENOSYS)
     regs[0] = r match
         Ok(v) -> u64(v)
@@ -113,6 +120,23 @@ private sys_read(p: *Process, regs: *u64) -> Result[i64, Errno]
     Ok(i64(console.read(&p.space, regs[1], regs[2])))
 
 private sys_getppid(p: *Process, regs: *u64) -> Result[i64, Errno] = Ok(i64(p.ppid))
+
+// setuid(uid), setgid(gid): only root may become someone else, and only to an id the disk can record
+// as an owner (16 bits). A process that gives up root cannot take it back.
+private sys_setuid(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if !may_change_ids(p) then return Err(EPERM)
+    if regs[0] > 0xffff then return Err(EINVAL)
+    p.uid = u32(regs[0])
+    Ok(0)
+
+private sys_setgid(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if !may_change_ids(p) then return Err(EPERM)
+    if regs[0] > 0xffff then return Err(EINVAL)
+    p.gid = u32(regs[0])
+    Ok(0)
+
+// The one check both make: the caller is root.
+private may_change_ids(p: *Process) -> bool = p.uid == 0
 
 // Whether all of `len` bytes from `addr` are user memory of this space: inside the user range with no
 // wrap around, and every page they touch mapped.

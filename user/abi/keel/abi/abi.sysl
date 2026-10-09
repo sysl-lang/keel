@@ -28,7 +28,7 @@ const SYS_GETCWD: u64 = 17      // getcwd(buf, len) -> bytes of the current dire
 const SYS_CHDIR: u64 = 18       // chdir(path, path_len) -> 0
 const SYS_TRUNCATE: u64 = 19    // truncate(path, path_len, length) -> 0: cut to `length`, or grown with zeros
 const SYS_FTRUNCATE: u64 = 20   // ftruncate(fd, length) -> 0: the same, through a descriptor open for writing
-const SYS_ACCESS: u64 = 21      // access(path, path_len, how) -> 0 if the path is there (keel has no permissions)
+const SYS_ACCESS: u64 = 21      // access(path, path_len, how) -> 0 if the path is there and the caller may (how: r 4, w 2, x 1)
 const SYS_SPAWN: u64 = 22       // spawn(path, path_len, args, args_len, out_fd) -> the child's pid
 const SYS_WAIT: u64 = 23        // wait(pid, *ExitStatus) -> the pid of the child that ended
 const SYS_GETPPID: u64 = 24     // getppid() -> the parent's pid; 0 for a process the kernel started
@@ -37,6 +37,26 @@ const SYS_BIND: u64 = 26        // bind(sd, port) -> 0
 const SYS_RECVFROM: u64 = 27    // recvfrom(sd, buf, len, *SockAddr, timeout_ms) -> bytes of the datagram
 const SYS_SENDTO: u64 = 28      // sendto(sd, buf, len, *SockAddr) -> bytes sent
 const SYS_SOCKCLOSE: u64 = 29   // sockclose(sd) -> 0
+const SYS_GETUID: u64 = 30      // getuid() -> the caller's user id
+const SYS_GETGID: u64 = 31      // getgid() -> the caller's group id
+const SYS_SETUID: u64 = 32      // setuid(uid) -> 0; EPERM unless the caller is root
+const SYS_SETGID: u64 = 33      // setgid(gid) -> 0; EPERM unless the caller is root
+const SYS_CHMOD: u64 = 34       // chmod(path, path_len, mode) -> 0; the owner or root; mode & 0o4777
+const SYS_CHOWN: u64 = 35       // chown(path, path_len, uid, gid) -> 0; root only
+
+// Users. A process has one user id and one group id — there is no real/effective split and there are
+// no supplementary groups — and a child starts with its parent's. Only root (uid 0) may change them.
+// A file's mode is checked the Unix way: root passes every check; otherwise the owner's three bits
+// apply if the process owns the file, else the group's if its gid is the file's, else everyone else's.
+// Opening needs `r` and/or `w`, as the flags ask; spawn needs `x` on the file; making, removing or
+// renaming an entry needs `w` and `x` on its directory; chdir and every directory a path walks through
+// need `x`. An executable with the set-user-ID bit (`0o4000`) runs as its owner, which is how `su`
+// becomes root to ask for a password.
+const ROOT_UID: u32 = 0
+const S_IFMT: u32 = 0o170000
+const S_IFDIR: u32 = 0o040000
+const S_IFREG: u32 = 0o100000
+const S_ISUID: u32 = 0o4000
 
 // A socket is a UDP endpoint on keel's one interface (10.0.2.15). Its number is not a file descriptor:
 // sockets have a table of their own, and a process's are closed when it ends. `recvfrom` waits for a
@@ -108,11 +128,13 @@ const KIND_DIR: u32 = 2
 struct Stat
     ino: u32
     kind: u32                   // KIND_FILE or KIND_DIR
-    mode: u32                   // permission bits
+    mode: u32                   // POSIX's st_mode: S_IFDIR or S_IFREG, S_ISUID, and the nine rwx bits
     links: u32
     size: u64
+    uid: u32                    // the owner
+    gid: u32                    // the group
 
-@assert(sizeof(Stat) == 24, "a Stat is 24 bytes")
+@assert(sizeof(Stat) == 32, "a Stat is 32 bytes")
 
 // What `getdents` fills its buffer with: whole records, `.` and `..` included, as the directory holds
 // them. The same 32 bytes as the directory entry on the disk (keel.ondisk's `Dirent`).
@@ -127,6 +149,7 @@ struct Dirent
 
 // The error numbers, as the negative of what a call answers.
 enum Errno: i64
+    EPERM = 1                   // only root may: setuid, setgid, chown, chmod of someone else's file
     ENOENT = 2                  // no such file or directory
     EIO = 5                     // the disk failed
     E2BIG = 7                   // spawn's arguments are more than ARGS_ROOM
@@ -135,7 +158,8 @@ enum Errno: i64
     ECHILD = 10                 // wait: no such child
     EAGAIN = 11                 // spawn: the process table is full
     ENOMEM = 12
-    EFAULT = 14                 // a pointer argument is not memory the caller may use that way
+    EACCES = 13                 // the mode of the file, or of a directory on the way, refuses the caller
+    EFAULT = 14                // a pointer argument is not memory the caller may use that way
     EBUSY = 16                  // the file is open
     EEXIST = 17
     ENOTDIR = 20

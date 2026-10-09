@@ -7,11 +7,12 @@ module keel.fsys
 // Every hook answers as a system call does — zero or more for success, the code of the `IoError` the
 // call failed with negated for an error — and `status` is the one place a kernel's error number becomes
 // such a code. Paths cross as they arrive — a pointer and a length is what both sysl.fs and keel's
-// calls take — and so does a descriptor. What keel has no call for (permissions, links, a temporary
-// directory) answers `sysl.sys.UNSUPPORTED`, which `sysl.fs` reports as "not supported on this target".
+// calls take — and so does a descriptor. What keel has no call for (links, a temporary directory)
+// answers `sysl.sys.UNSUPPORTED`, which `sysl.fs` reports as "not supported on this target".
 
-import abi.keel.abi.{EBADF, EEXIST, EISDIR, EMFILE, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, Errno, ExitStatus,
-    KIND_DIR, NO_FD, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, SYS_ACCESS, SYS_CHDIR, SYS_CLOSE,
+import abi.keel.abi.{EACCES, EBADF, EEXIST, EISDIR, EMFILE, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EPERM, Errno,
+    ExitStatus, KIND_DIR, NO_FD, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, SYS_ACCESS, SYS_CHDIR, SYS_CHMOD,
+    SYS_CLOSE,
     SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME,
     SYS_RMDIR, SYS_SPAWN, SYS_STAT, SYS_TRUNCATE, SYS_UNLINK, SYS_WAIT, SYS_WRITE}
 import rt.keel.user.{flush, syscall, syscall5}
@@ -44,6 +45,8 @@ private code_of(e: Errno) -> int = e match
     EMFILE -> -IoError.TooManyOpenFiles.code()
     ENOSPC -> -IoError.NoSpaceLeft.code()
     EBADF -> -IoError.NotOpen.code()
+    EACCES -> -IoError.PermissionDenied.code()
+    EPERM -> -IoError.NotPermitted.code()
     ENOSYS -> UNSUPPORTED
     else -IoError.Other(int(i64(e))).code()
 
@@ -92,7 +95,7 @@ seek(fd: int, offset: long, whence: int, at: *long) -> int
 
 @export("sysl_fs_fstat")
 fstat(fd: int, out: *fsys.Stat) -> int
-    var s = Stat(0, 0, 0, 0, 0)
+    var s = Stat(0, 0, 0, 0, 0, 0, 0)
     val r = syscall(SYS_FSTAT, u64(fd), u64(usize(&s)), 0, 0)
     if r >= 0 then *out = converted(s)
     status(r)
@@ -100,18 +103,18 @@ fstat(fd: int, out: *fsys.Stat) -> int
 @export("sysl_fs_ftruncate")
 ftruncate(fd: int, length: long) -> int = status(syscall(SYS_FTRUNCATE, u64(fd), u64(length), 0, 0))
 
-// keel's 24-byte `Stat` as `sysl.fs`'s thirteen numbers: the kind goes into the top bits of `mode`, as
-// POSIX encodes it; keel keeps no owners, devices or times, so those stay zero.
+// keel's 32-byte `Stat` as `sysl.fs`'s thirteen numbers: the mode is POSIX's already, type bits and
+// all, and so are the owner and group (`Meta.owner`, `Meta.group`); keel keeps no devices or times, so
+// those stay zero.
 private converted(s: Stat) -> fsys.Stat
-    val kind: long = if s.kind == KIND_DIR then 0o040000 else 0o100000
-    fsys.Stat(long(s.size), kind | long(s.mode & 0o7777), long(s.links), 0, 0, long(s.ino), 0, 0, 0, 0, 0, 0, 0)
+    fsys.Stat(long(s.size), long(s.mode), long(s.links), long(s.uid), long(s.gid), long(s.ino), 0, 0, 0, 0, 0, 0, 0)
 
 // --- Paths -----------------------------------------------------------------------------------------
 
 // keel has no symbolic links, so `follow` changes nothing.
 @export("sysl_fs_stat")
 stat(path: *u8, len: usize, follow: int, out: *fsys.Stat) -> int
-    var s = Stat(0, 0, 0, 0, 0)
+    var s = Stat(0, 0, 0, 0, 0, 0, 0)
     val r = syscall(SYS_STAT, addr(path), u64(len), u64(usize(&s)), 0)
     if r >= 0 then *out = converted(s)
     status(r)
@@ -136,9 +139,10 @@ rename(from: *u8, from_len: usize, to: *u8, to_len: usize) -> int =
 @export("sysl_fs_access")
 access(path: *u8, len: usize, how: int) -> int = status(syscall(SYS_ACCESS, addr(path), u64(len), u64(how), 0))
 
-// keel has no call that changes permissions.
+// `set_permissions`: keel's chmod takes the set-user-ID and rwx bits, which is all a keel mode has;
+// setgid and sticky are refused as EINVAL, which reaches the program as an `Other(22)`.
 @export("sysl_fs_chmod")
-chmod(path: *u8, len: usize, mode: u32) -> int = UNSUPPORTED
+chmod(path: *u8, len: usize, mode: u32) -> int = status(syscall(SYS_CHMOD, addr(path), u64(len), u64(mode), 0))
 
 // --- Directories -----------------------------------------------------------------------------------
 
@@ -166,7 +170,7 @@ opendir(path: *u8, len: usize, dir: *usize) -> int
     if slot == STREAMS then return -IoError.TooManyOpenFiles.code()
     val fd = syscall(SYS_OPEN, addr(path), u64(len), O_RDONLY, 0)
     if fd < 0 then return status(fd)
-    var s = Stat(0, 0, 0, 0, 0)
+    var s = Stat(0, 0, 0, 0, 0, 0, 0)
     val r = syscall(SYS_FSTAT, u64(fd), u64(usize(&s)), 0, 0)
     if r < 0 || s.kind != KIND_DIR
         val _ = syscall(SYS_CLOSE, u64(fd), 0, 0, 0)

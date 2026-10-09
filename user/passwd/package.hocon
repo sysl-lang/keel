@@ -1,0 +1,8 @@
+// keel.passwd: reading /etc/passwd and /etc/group, and the password hash. Plain sysl over `sysl.fs` and
+// `sysl.crypto`, with no keel system call of its own, so the host's mkfs hashes a password with the
+// same code `login` and `su` check it with. A keel program using it also depends on `fsys`.
+
+package {
+  name    = "passwd"
+  version = "0.0.1"
+}

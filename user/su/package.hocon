@@ -1,0 +1,25 @@
+// `su [user]`: a shell as another user (root by default), after that user's password. /bin/su is
+// set-user-ID root on the disk, which is what lets it change its uid.
+
+package {
+  name    = "su"
+  version = "0.0.1"
+}
+
+dependencies {
+  rt { workspace = true }
+  fsys { workspace = true }
+  passwd { workspace = true }
+}
+
+// keel does not save the FP/SIMD registers yet, and leaves the unit trapping at EL0 too.
+codegen {
+  general_regs_only = true
+}
+
+targets {
+  aarch64-freestanding {
+    linker_script = "../user.ld"
+    entry         = "_start"
+  }
+}

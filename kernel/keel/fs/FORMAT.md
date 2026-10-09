@@ -21,7 +21,7 @@ sectors `8b` to `8b + 7`. The test image is 1024 blocks (4 MiB).
 | offset | field | |
 |---|---|---|
 | 0 | `magic: u32` | `0x6c65656b`, the bytes "keel" |
-| 4 | `version: u32` | 1 |
+| 4 | `version: u32` | 2 (1 had no owners; the kernel refuses a version-1 disk) |
 | 8 | `block_size: u32` | 4096 |
 | 12 | `blocks: u32` | the whole filesystem, boot block included; at most the disk's size |
 | 16 | `bitmap_start: u32` | 2 |
@@ -49,13 +49,19 @@ directory entry naming inode 0 is a free slot; the root directory is inode 1.
 | offset | field | |
 |---|---|---|
 | 0 | `kind: u16` | 0 free, 1 file, 2 directory |
-| 2 | `mode: u16` | permission bits: kept and reported, not enforced |
+| 2 | `mode: u16` | POSIX's `st_mode`: the type (`0o100000` file, `0o040000` directory, agreeing with `kind`), set-user-ID (`0o4000`), and `rwx` for the owner, the group and other (`0o777`) |
 | 4 | `links: u16` | directory entries naming it: 1 for a file; 2 + its subdirectories for a directory |
-| 6 | `reserved: u16` | |
+| 6 | `uid: u16` | the owner; 0 is root |
 | 8 | `size: u64` | bytes |
 | 16 | `direct: [10]u32` | the blocks holding bytes 0 to 40 KiB |
 | 56 | `indirect: u32` | a block of 1024 more block numbers (`u32`), bytes 40 KiB to 4136 KiB |
-| 60 | `reserved2: u32` | |
+| 60 | `gid: u16` | the group |
+| 62 | `reserved: u16` | |
+
+The kernel enforces the mode (Unix's rules: uid 0 passes; otherwise the owner's bits if the process owns
+the inode, else the group's if its gid is the inode's, else other's). A new file is `0o644` and a new
+directory `0o755`, owned by the process that made it. Search (`x`) is needed on every directory a path
+walks through.
 
 A block number of 0 means none. **A file has no holes**: every block up to its size is allocated (a
 write past the end allocates zeroed blocks for the gap), and no block pointer past its size is set.
@@ -78,7 +84,8 @@ A removed entry becomes a free slot, reused before the directory grows; director
 
 ## What `mkfs check` holds an image to
 
-The superblock is valid; inode 0 is free and the root is a directory; every directory reached from
+The superblock is valid; inode 0 is free and the root is a directory; every inode in use has type bits in its mode that agree with its kind, and no
+mode bits outside `0o4777` below them; every directory reached from
 the root has `.` naming itself and `..` naming its parent, no holes, and entries naming only inodes in
 use, of the kind the entry says, each directory reached once; every inode in use is named, exactly
 `links` times, and a directory's `links` is 2 + its subdirectories; every block a file holds is a data
