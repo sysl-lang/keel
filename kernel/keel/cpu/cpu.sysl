@@ -2,8 +2,9 @@ module keel.cpu
 
 // The processor's own state: the exception level, the system registers keel reads and writes, and
 // the instructions that wait for or mask interrupts. A register is read and written with the
-// `read_sysreg`/`write_sysreg` built-ins (DAIFSet and DAIFClr among them); what is still `asm` here is
-// an instruction sysl has no spelling for (`at`, `tlbi`, `dc`, `ic`, `yield`, `wfi`).
+// `read_sysreg`/`write_sysreg` built-ins (DAIFSet and DAIFClr among them), and the barriers, address
+// translation and TLB and cache maintenance are the `dsb`, `isb`, `at`, `tlbi`, `dc` and `ic` built-ins;
+// what is still `asm` here is an instruction sysl has no spelling for (`yield`, `wfi`).
 
 // The exception level the processor is running at, 0 to 3 (CurrentEL bits [3:2]).
 current_el() -> u64 = (read_sysreg("CurrentEL") >> 2) & 3
@@ -60,85 +61,52 @@ ctr() -> u64 = read_sysreg("ctr_el0")
 
 // Ask the MMU to translate `va` as an EL1 read would, and answer PAR_EL1, which holds the result.
 translate_read(va: u64) -> u64
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "at s1e1r, {va}"
-            "isb"
-            "mrs {v}, par_el1"
-            in va : reg
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-    v
+    at(s1e1r, va)
+    isb()
+    read_sysreg("par_el1")
 
-// Maintenance. The barriers are the `dsb(opt)` and `isb()` built-ins; TLB and cache maintenance have
-// no spelling yet (FINDINGS.md 14), so each sequence that needs one is a block of its own.
+// Maintenance: the `dsb(opt)`, `isb()`, `tlbi`, `dc` and `ic` built-ins, in the sequences the
+// architecture asks for around each.
 
 // Forget every EL1 translation this core has cached, wait for that, and refetch.
 flush_tlb()
-    asm
-        [aarch64]
-            "dsb ishst"
-            "tlbi vmalle1"
-            "dsb nsh"
-            "isb"
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    dsb(ishst)
+    tlbi(vmalle1)
+    dsb(nsh)
+    isb()
 
 // Forget every core's cached translation of the page at kernel address `va`, for every address space,
 // and wait until every core has. Inner shareable, so it is already right once there is a second core.
 flush_tlb_page(va: u64)
-    val page = va >> 12
-    asm
-        [aarch64]
-            "dsb ishst"
-            "tlbi vaae1is, {page}"
-            "dsb ish"
-            "isb"
-            in page : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    dsb(ishst)
+    tlbi(vaae1is, va >> 12)
+    dsb(ish)
+    isb()
 
 // Forget every core's cached translation of user page `va` in the address space tagged `asid`.
 flush_tlb_user_page(asid: u64, va: u64)
-    val arg = (asid << 48) | ((va >> 12) & 0xFFF_FFFF_FFFF)
-    asm
-        [aarch64]
-            "dsb ishst"
-            "tlbi vae1is, {arg}"
-            "dsb ish"
-            "isb"
-            in arg : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    dsb(ishst)
+    tlbi(vae1is, (asid << 48) | ((va >> 12) & 0xFFF_FFFF_FFFF))
+    dsb(ish)
+    isb()
 
 // Forget every core's cached translation tagged `asid`, before the ASID is given to another process.
 flush_tlb_asid(asid: u64)
-    val arg = asid << 48
-    asm
-        [aarch64]
-            "dsb ishst"
-            "tlbi aside1is, {arg}"
-            "dsb ish"
-            "isb"
-            in arg : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    dsb(ishst)
+    tlbi(aside1is, asid << 48)
+    dsb(ish)
+    isb()
 
 // Write the data cache line holding `addr` back as far as the point the instruction fetches see, for
 // code the kernel copied in through a data mapping.
-clean_dcache_line_pou(addr: u64)
-    asm
-        [aarch64]
-            "dc cvau, {addr}"
-            in addr : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+clean_dcache_line_pou(addr: u64) = dc(cvau, addr)
 
 // Discard every core's instruction cache, after `clean_dcache_line_pou` over new code, and refetch.
 sync_icache()
-    asm
-        [aarch64]
-            "dsb ish"
-            "ic ialluis"
-            "dsb ish"
-            "isb"
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    dsb(ish)
+    ic(ialluis)
+    dsb(ish)
+    isb()
 
 // Make translation table writes visible to the walker before the next instruction uses them.
 publish_tables()
@@ -163,21 +131,11 @@ relax()
         [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
 
 // Discard the data cache line holding `addr`, so the next cacheable read goes to memory.
-invalidate_dcache_line(addr: u64)
-    asm
-        [aarch64]
-            "dc ivac, {addr}"
-            in addr : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+invalidate_dcache_line(addr: u64) = dc(ivac, addr)
 
 // Write the data cache line holding `addr` back to memory and discard it, so neither a stale copy nor
 // a later eviction can disagree with what a core whose caches are off writes there.
-clean_invalidate_dcache_line(addr: u64)
-    asm
-        [aarch64]
-            "dc civac, {addr}"
-            in addr : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+clean_invalidate_dcache_line(addr: u64) = dc(civac, addr)
 
 // Let IRQs in: clear PSTATE.I.
 enable_irqs() = write_sysreg("daifclr", 2)

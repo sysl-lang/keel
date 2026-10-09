@@ -417,9 +417,13 @@ image, so that `&` always means "where it is now".
 
 ## 14. Barriers and maintenance instructions have no spelling (`dsb`, `isb`, `tlbi`, `dc`, `at`)
 
-**PARTLY FIXED:** `dsb(opt)`, `dmb(opt)` and `isb()` are built-ins, and keel uses them everywhere
-outside an `asm` sequence (branch `lsrm`, prerelease `8619de6609`). `tlbi`, `dc`, `at` and `ic` are
-not in this prerelease, so the TLB, cache and translate sequences in keel.cpu stay `asm`.
+**FIXED:** `dsb(opt)`, `dmb(opt)` and `isb()` are built-ins (branch `lsrm`, prerelease
+`8619de6609`), and since sysl census-35 7e2a32d3 (`cache-tlb-builtins`; prerelease `7e2a32d396`) so
+are `tlbi(op)`/`tlbi(op, x)`, `dc(op, addr)`, `ic(op)`/`ic(op, addr)` and `at(op, va)`, the operation
+a bare name (`vmalle1`, `vae1is`, `civac`, `ialluis`, `s1e1r`, …). keel.cpu's translate, TLB and cache
+functions are now built-in calls with no `asm` (`translate_read` reads PAR_EL1 with `read_sysreg`
+after `at` and `isb()`); the image's disassembly has every `tlbi`/`dc`/`ic`/`at` it had before. Still
+`asm` in keel.cpu: `yield` and `wfi`.
 
 Milestone 2. Turning the MMU on and changing a translation table needs `dsb` (with a domain:
 `sy`, `ish`, `nsh`, `ishst`), `isb`, `tlbi vmalle1`, `dc ivac` over the tables written with the MMU
