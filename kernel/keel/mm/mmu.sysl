@@ -1,0 +1,152 @@
+module keel.mm
+
+import keel.cpu
+
+// The image's section boundaries, from link.ld: page aligned, so each range is mapped with its own
+// permissions. Each is an address and nothing more.
+extern __image_start: u8
+extern __text_end: u8
+extern __rodata_end: u8
+extern __stack_guard: u8
+extern __image_end: u8
+
+// TCR_EL1 (Arm ARM D19.2.139). The `0` halves (T0SZ, EPD0, ...) are the low half, TTBR0's; the `1`
+// halves are the kernel's, TTBR1's.
+@packed
+struct Tcr
+    t0sz: u6                    // [5:0]    the low half spans 2^(64 - t0sz) bytes
+    res0a: u1                   // [6]
+    epd0: u1                    // [7]      1: no walks through TTBR0, a fault instead
+    irgn0: Cacheability         // [9:8]
+    orgn0: Cacheability         // [11:10]
+    sh0: Shareability           // [13:12]
+    tg0: Granule0               // [15:14]
+    t1sz: u6                    // [21:16]
+    a1: u1                      // [22]     which TTBR's ASID is current
+    epd1: u1                    // [23]
+    irgn1: Cacheability         // [25:24]
+    orgn1: Cacheability         // [27:26]
+    sh1: Shareability           // [29:28]
+    tg1: Granule1               // [31:30]
+    ips: u3                     // [34:32]  the intermediate (here: physical) address size
+    res0b: u1                   // [35]
+    asid16: u1                  // [36]
+    tbi0: u1                    // [37]
+    tbi1: u1                    // [38]
+    res0c: u25                  // [63:39]
+
+// How a table walk caches what it reads.
+enum Cacheability: u2
+    NonCacheable = 0
+    WriteBackAllocate = 1
+    WriteThrough = 2
+    WriteBackNoAllocate = 3
+
+// The granule size, which TG0 and TG1 encode differently.
+enum Granule0: u2
+    Kb4 = 0
+    Kb64 = 1
+    Kb16 = 2
+
+enum Granule1: u2
+    Kb16 = 1
+    Kb4 = 2
+    Kb64 = 3
+
+// The low bits of SCTLR_EL1 (Arm ARM D19.2.118); the rest is kept as it was found.
+@packed
+struct Sctlr
+    m: u1                       // [0]      the MMU
+    a: u1                       // [1]      alignment checking
+    c: u1                       // [2]      data caches
+    sa: u1                      // [3]      SP alignment checking
+    middle: u8                  // [11:4]
+    i: u1                       // [12]     instruction caches
+    rest: u51                   // [63:13]
+
+// TTBR0_EL1 and TTBR1_EL1: a root table and an address space identifier.
+@packed
+struct Ttbr
+    cnp: u1                     // [0]
+    res0: u11                   // [11:1]
+    root: Frame                 // [47:12]
+    asid: u16                   // [63:48]
+
+@assert(sizeof(Tcr) == 8, "TCR_EL1 is 64 bits")
+@assert(sizeof(Sctlr) == 8, "SCTLR_EL1 is 64 bits")
+@assert(sizeof(Ttbr) == 8, "TTBRn_EL1 is 64 bits")
+
+// MAIR_EL1 holds eight attribute bytes, and a descriptor's AttrIndx picks one. keel uses two.
+private const NORMAL_WRITE_BACK: u64 = 0xff        // inner and outer write-back, read/write-allocate
+private const DEVICE_NGNRE: u64 = 0x04
+
+private mair() -> u64 = NORMAL_WRITE_BACK << (8 * u64(MemAttr.Normal)) | DEVICE_NGNRE << (8 * u64(MemAttr.Device))
+
+// Both halves 48 bits, 4 KiB granule, walks cached write-back and inner shareable.
+private tcr_value(ips: u3) -> Tcr
+    Tcr(16, 0, 0, WriteBackAllocate, WriteBackAllocate, Inner, Kb4,
+        16, 0, 0, WriteBackAllocate, WriteBackAllocate, Inner, Kb4,
+        ips, 0, 0, 0, 0, 0)
+
+// The two roots the boot maps hang from.
+struct BootMaps
+    identity: PhysAddr          // TTBR0 during the switch
+    kernel: PhysAddr            // TTBR1, for good
+
+// Build both maps. This runs with the MMU off, at physical addresses, so it reaches its tables through
+// whatever `new_table` hands back and works out every physical address with `phys_of`.
+build_boot_maps() -> BootMaps
+    val (id_root, id_pa) = new_table()
+    val ram = PhysAddr(RAM_BASE)
+    map_range(id_root, VirtAddr(RAM_BASE), ram, RAM_SIZE, identity())
+
+    val (root, root_pa) = new_table()
+    val start = phys_of(usize(&__image_start))
+    val text_end = phys_of(usize(&__text_end))
+    val rodata_end = phys_of(usize(&__rodata_end))
+    val guard = phys_of(usize(&__stack_guard))
+    val two_mib = ram + u64(2 << 20)
+
+    map_kernel(root, PhysAddr(0), RAM_BASE, device())
+    map_kernel(root, ram, u64(start) - u64(ram), ram_rw())
+    map_kernel(root, start, u64(text_end) - u64(start), text())
+    map_kernel(root, text_end, u64(rodata_end) - u64(text_end), ram_ro())
+    map_kernel(root, rodata_end, u64(guard) - u64(rodata_end), ram_rw())
+    map_kernel(root, guard + u64(4096), u64(two_mib) - u64(guard) - 4096, ram_rw())
+    map_kernel(root, two_mib, RAM_SIZE - (2 << 20), ram_rw())
+
+    BootMaps(id_pa, root_pa)
+
+private map_kernel(root: *Table, pa: PhysAddr, len: u64, prot: Prot)
+    map_range(root, to_virt(pa), pa, len, prot)
+
+// Turn translation on. The tables were written with the MMU off, so straight to memory; the walker
+// reads them through the cache, which must not hold anything older for those lines.
+enable(maps: BootMaps)
+    cpu.dsb()
+    invalidate_pool()
+    cpu.dsb()
+
+    cpu.set_mair(mair())
+    val parange = cpu.mmfr0() & 0xf
+    cpu.set_tcr(cpu.to_word(tcr_value(u3(if parange > 5 then 5 else parange))))
+    cpu.set_ttbr0(cpu.to_word(Ttbr(0, 0, frame_of(maps.identity), 0)))
+    cpu.set_ttbr1(cpu.to_word(Ttbr(0, 0, frame_of(maps.kernel), 0)))
+    cpu.isb()
+    cpu.flush_tlb()
+
+    var s: Sctlr = cpu.from_word(cpu.sctlr())
+    s.m = 1
+    s.c = 1
+    s.i = 1
+    cpu.set_sctlr(cpu.to_word(s))
+
+// Take the identity map away: no walks through TTBR0 at all, so the whole low half faults. Called
+// first thing in the high half, once nothing runs at a physical address any more.
+drop_identity()
+    var t: Tcr = cpu.from_word(cpu.tcr())
+    t.epd0 = 1
+    cpu.set_tcr(cpu.to_word(t))
+    cpu.set_ttbr0(0)
+    cpu.isb()
+    cpu.flush_tlb()

@@ -1,0 +1,63 @@
+module keel.mm
+
+// keel's address space, with the MMU on.
+//
+//   TTBR1 (the kernel's, VA 0xFFFF_0000_0000_0000 and up) maps physical memory at a fixed offset:
+//
+//     0xFFFF_0000_0000_0000 .. 0xFFFF_0000_3FFF_FFFF   PA 0 .. 1 GiB: QEMU virt's devices (GIC at
+//                                                     0x0800_0000, PL011 at 0x0900_0000, ...), as
+//                                                     Device-nGnRE, never executable; one 1 GiB block
+//     0xFFFF_0000_4000_0000 .. + RAM_SIZE              RAM, Normal write-back. The first 2 MiB, which
+//                                                     holds the image, is mapped page by page so text
+//                                                     is read-only and executable, read-only data is
+//                                                     read-only, everything else is never executable,
+//                                                     and the page below the boot stack is a guard.
+//                                                     The rest of RAM is 2 MiB blocks.
+//     anything else                                    unmapped: a translation fault
+//
+//   TTBR0 (the low half) holds an identity map of RAM only while the MMU is switched on, so the
+//   instructions after the switch can still be fetched at their physical addresses. kmain drops it
+//   first thing: TCR_EL1.EPD0 is set, so the low half has no translation table at all and every
+//   access there faults. It stays empty until user processes, which will each own a TTBR0 table.
+//
+// The kernel is linked at KERNEL_BASE + its physical load address (link.ld), so a kernel virtual
+// address is its physical address plus KERNEL_BASE: one constant converts in either direction.
+
+// Where the kernel half of the address space begins: a 48-bit VA with TCR_EL1.T1SZ = 16.
+const KERNEL_BASE: u64 = 0xFFFF_0000_0000_0000
+
+// The physical bits of an address: a 48-bit output address.
+private const PA_MASK: u64 = 0x0000_FFFF_FFFF_FFFF
+
+// RAM on QEMU virt starts at 1 GiB. `scripts/boot-test.sh` gives the machine 256 MiB, and keel does not
+// read the device tree yet, so the size is this constant.
+const RAM_BASE: u64 = 0x4000_0000
+const RAM_SIZE: u64 = 256 << 20
+
+// The two kinds of address. They are distinct types, so a physical address cannot be dereferenced
+// or handed to something that wants a virtual one without a written conversion.
+type PhysAddr = new u64
+type VirtAddr = new u64
+
+// An address plus a byte count. The derived types already add to themselves (`PhysAddr + PhysAddr`
+// is the base's `+` and cannot be taken away); these say what an offset is.
+impl Add[u64] for PhysAddr
+    add(self, n: u64) -> PhysAddr = PhysAddr(u64(self) + n)
+
+impl Add[u64] for VirtAddr
+    add(self, n: u64) -> VirtAddr = VirtAddr(u64(self) + n)
+
+// The kernel's view of a physical address.
+to_virt(p: PhysAddr) -> VirtAddr = VirtAddr(u64(p) + KERNEL_BASE)
+
+// The physical address behind a kernel virtual address.
+to_phys(v: VirtAddr) -> PhysAddr = PhysAddr(u64(v) - KERNEL_BASE)
+
+// The physical address of something in the kernel image, from a pointer to it. Before the MMU is on
+// the code runs at physical addresses, and `&x` answers the physical address for a module variable
+// (reached PC-relative) but the link address for an `extern` (reached through the GOT); after, both
+// are virtual. Masking off the top sixteen bits is right for all three (FINDINGS.md 13).
+phys_of(addr: usize) -> PhysAddr = PhysAddr(u64(addr) & PA_MASK)
+
+// A pointer to device registers at a physical address, through the kernel's device mapping.
+io[T](p: PhysAddr) -> *T = ptr_cast(usize(u64(to_virt(p))))

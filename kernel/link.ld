@@ -1,22 +1,45 @@
 /* keel's image, for QEMU `virt`: RAM begins at 0x4000_0000 and QEMU puts the device tree at its
-   start, so the image begins half a megabyte in. */
+   start, so the image is loaded half a megabyte in.
+
+   It is LINKED in the high half, at KERNEL_BASE plus that physical address (keel.mm has the map), and
+   LOADED at the physical address: each section's AT() is its address minus KERNEL_BASE. QEMU loads
+   by the physical addresses and, since the entry point lies in an executable segment whose virtual
+   and physical addresses differ, starts at `_start`'s physical address.
+
+   The boundaries keel.mm maps with different permissions are page aligned: text (read-only,
+   executable), read-only data and the GOT, then data, .bss, an unmapped guard page and the stack
+   (read-write, never executable). */
 
 ENTRY(_start)
 
+KERNEL_BASE = 0xFFFF000000000000;   /* keel.mm.KERNEL_BASE */
+LOAD_ADDR   = 0x40080000;
+
 SECTIONS
 {
-    . = 0x40080000;
+    . = KERNEL_BASE + LOAD_ADDR;
+    __image_start = .;
 
-    .text : {
+    .text : AT(ADDR(.text) - KERNEL_BASE) {
         KEEP(*(.text.boot))
         *(.text .text.*)
     }
 
-    .rodata : ALIGN(16) {
+    . = ALIGN(4096);
+    __text_end = .;
+
+    .rodata : AT(ADDR(.rodata) - KERNEL_BASE) {
         *(.rodata .rodata.*)
     }
 
-    .data : ALIGN(16) {
+    .got : AT(ADDR(.got) - KERNEL_BASE) {
+        *(.got .got.plt)
+    }
+
+    . = ALIGN(4096);
+    __rodata_end = .;
+
+    .data : AT(ADDR(.data) - KERNEL_BASE) {
         *(.data .data.*)
     }
 
@@ -28,10 +51,16 @@ SECTIONS
         __bss_end = .;
     }
 
-    .stack (NOLOAD) : ALIGN(16) {
+    . = ALIGN(4096);
+    __stack_guard = .;
+    . += 4096;
+
+    .stack (NOLOAD) : {
         . += 0x10000;
         __stack_top = .;
     }
+
+    __image_end = .;
 
     /DISCARD/ : {
         *(.comment)
@@ -39,3 +68,6 @@ SECTIONS
         *(.eh_frame .eh_frame_hdr)
     }
 }
+
+ASSERT(__image_end <= KERNEL_BASE + 0x40200000,
+       "keel's image has to end inside the first 2 MiB of RAM, which keel.mm maps page by page")

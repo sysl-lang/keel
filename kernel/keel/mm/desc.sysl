@@ -1,0 +1,100 @@
+module keel.mm
+
+// VMSAv8-64 stage 1 translation table descriptors, 4 KiB granule, 48-bit output address (Arm ARM
+// D8.3). Each is one 64-bit word; the first field declared is the low bits.
+
+// A 4 KiB physical frame: a physical address shifted right by twelve, which is what a descriptor holds.
+type Frame = new u36
+
+frame_of(p: PhysAddr) -> Frame = Frame(u36(u64(p) >> 12))
+
+frame_addr(f: Frame) -> PhysAddr = PhysAddr(u64(f) << 12)
+
+// Which MAIR_EL1 attribute a mapping uses. The values are indices into MAIR (see `mair` in mmu.sysl).
+enum MemAttr: u3
+    Normal = 0                  // write-back, read- and write-allocate: RAM
+    Device = 1                  // Device-nGnRE: MMIO
+
+// AP[2:1]: who may read and write.
+enum Access: u2
+    KernelRw = 0
+    UserRw = 1
+    KernelRo = 2
+    UserRo = 3
+
+// SH[1:0]. The encoding 1 is reserved, so a descriptor read back from memory could hold a value no
+// variant has (FINDINGS.md 9); keel only ever writes these.
+enum Shareability: u2
+    NonShareable = 0
+    Outer = 2
+    Inner = 3
+
+// A descriptor that points at the next level's table (levels 0 to 2).
+@packed
+struct TableDesc
+    valid: u1                   // [0]
+    table: u1                   // [1]      1: a table
+    ignored0: u10               // [11:2]
+    next: Frame                 // [47:12]  the next table's physical address
+    res0: u4                    // [51:48]
+    ignored1: u7                // [58:52]
+    pxn_table: u1               // [59]
+    xn_table: u1                // [60]
+    ap_table: u2                // [62:61]
+    ns_table: u1                // [63]
+
+// A descriptor that maps memory: a block at level 1 (1 GiB) or 2 (2 MiB), with `page` 0, or a page at
+// level 3 (4 KiB), with `page` 1. The two have the same attribute fields in the same places; a block's
+// output address simply has more low bits that must be zero.
+@packed
+struct LeafDesc
+    valid: u1                   // [0]
+    page: u1                    // [1]      0: a block (levels 1, 2); 1: a page (level 3)
+    attr: MemAttr               // [4:2]    AttrIndx
+    ns: u1                      // [5]
+    ap: Access                  // [7:6]
+    sh: Shareability            // [9:8]
+    af: u1                      // [10]     access flag: 0 faults on first use
+    ng: u1                      // [11]     not global: tagged with the ASID
+    oa: Frame                   // [47:12]  the output address
+    res0: u2                    // [49:48]
+    gp: u1                      // [50]
+    dbm: u1                     // [51]
+    contiguous: u1              // [52]
+    pxn: u1                     // [53]     never executable at EL1
+    uxn: u1                     // [54]     never executable at EL0
+    software: u4                // [58:55]
+    ignored: u5                 // [63:59]
+
+@assert(sizeof(TableDesc) == 8, "a table descriptor is one 64-bit word")
+@assert(sizeof(LeafDesc) == 8, "a block or page descriptor is one 64-bit word")
+
+// What a mapping lets the kernel do with memory, short of where it is.
+struct Prot
+    attr: MemAttr
+    access: Access
+    exec: bool
+
+// The protections keel maps with. They are functions rather than module `val`s because a module
+// `val` holding any variant but an enum's first is emitted as IR clang refuses (FINDINGS.md 15).
+ram_rw() -> Prot = Prot(Normal, KernelRw, false)
+ram_ro() -> Prot = Prot(Normal, KernelRo, false)
+text() -> Prot = Prot(Normal, KernelRo, true)
+device() -> Prot = Prot(Device, KernelRw, false)
+
+// The identity map is used only between switching the MMU on and branching to the high half, by code
+// that is both running there and still using its stack there.
+identity() -> Prot = Prot(Normal, KernelRw, true)
+
+// RAM is inner shareable so every core will see one coherent copy; device memory's shareability is
+// ignored, and outer shareable is what Arm recommends writing for it.
+private shareability(attr: MemAttr) -> Shareability = if attr == Normal then Inner else Outer
+
+table_desc(next: PhysAddr) -> TableDesc = TableDesc(1, 1, 0, frame_of(next), 0, 0, 0, 0, 0, 0)
+
+// `level` 3 makes a page; 1 or 2 a block.
+leaf_desc(out: PhysAddr, prot: Prot, level: u64) -> LeafDesc
+    val never = if prot.exec then u1(0) else u1(1)
+    val page = if level == 3 then u1(1) else u1(0)
+    LeafDesc(1, page, prot.attr, 0, prot.access, shareability(prot.attr), 1, 0, frame_of(out), 0, 0, 0,
+        0, never, 1, 0, 0)

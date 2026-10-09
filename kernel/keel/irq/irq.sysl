@@ -6,11 +6,12 @@ module keel.irq
 import keel.gic
 import keel.timer
 import keel.pl011.{put_hex, put_str}
+import sysl.sync.{Atomic, Ordering}
 
-// Timer interrupts taken since boot. The IRQ handler is its only writer; kmain reads it between
-// `wfi`s, and sees each new value only because the `wfi` is an asm block, which the compiler assumes
-// writes memory. A loop that read it with no asm in the body would read it once (FINDINGS.md 6).
-var ticks: u64 = 0
+// Timer interrupts taken since boot. The IRQ handler is its only writer and kmain reads it, so it is an
+// atomic: every load is a real load. An exclusive load/store pair needs Normal memory, which is why
+// this waited for the MMU (FINDINGS.md 6).
+var ticks: Atomic[u64] = Atomic(0)
 
 dispatch()
     val id = gic.acknowledge()
@@ -18,7 +19,7 @@ dispatch()
 
     if id == timer.IRQ
         timer.rearm()
-        ticks += 1
+        ticks.add(1, Ordering.Relaxed)
     else
         put_str("keel: unexpected interrupt ")
         put_hex(u64(id))

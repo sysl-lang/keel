@@ -1,17 +1,24 @@
 // keel — a research kernel for aarch64 on QEMU's `virt` machine.
 
-import keel.boot.zero_bss
 import keel.cpu.{current_el, enable_irqs, wait_for_interrupt}
 import keel.gic
 import keel.irq
+import keel.mm
+import keel.pl011.{put_hex, put_str}
 import keel.psci.system_off
 import keel.timer
 import keel.trap
+import sysl.sync.Ordering
 
-// The first instruction the machine runs. QEMU loads the ELF image into RAM and starts the boot
-// processor at `_start`, at EL1 with the MMU off and no stack (under HVF and under TCG alike: `virt`
-// gives the guest no EL2 unless asked to). `_start` gives it a stack and branches to `kmain`, which
-// never returns.
+// The first instruction the machine runs. QEMU loads the ELF image at its physical addresses and
+// starts the boot processor at `_start`'s physical address, at EL1 with the MMU off and no stack
+// (under HVF and under TCG alike: `virt` gives the guest no EL2 unless asked to). The image is linked
+// in the high half (keel.mm), so until the MMU is on only PC-relative addressing is right.
+//
+// `_start` gives the processor a stack at its physical address and calls `keel_boot`, which builds
+// the page tables and turns the MMU on, mapping the kernel high and RAM at its own addresses too. It
+// returns the distance between the two, which moves the stack pointer to the stack's high-half
+// address; kmain is then entered at the address it was linked at, through an absolute literal.
 //
 // It is assembly at the top of the file rather than a function, because a function may save a
 // register on the stack before its first instruction and there is no stack yet. The label is the
@@ -25,17 +32,25 @@ asm
         "adrp x0, __stack_top"
         "add x0, x0, :lo12:__stack_top"
         "mov sp, x0"
-        "b kmain"
+        "bl keel_boot"
+        "add sp, sp, x0"
+        "ldr x1, =kmain"
+        "br x1"
+        ".ltorg"
     [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel boots on aarch64 only"
 
 @export("kmain")
 kmain() -> never
-    zero_bss()
+    mm.drop_identity()
     print("keel: hello")
 
     if current_el() != 1
         print("keel: expected EL1, running at EL", current_el())
         system_off()
+
+    put_str("keel: mmu on, kmain at ")
+    put_hex(u64(usize(&kmain)))
+    put_str("\n")
 
     trap.install()
     breakpoint()
@@ -45,10 +60,17 @@ kmain() -> never
     timer.start(10)
     enable_irqs()
 
-    while irq.ticks < 3
+    while irq.ticks.load(Ordering.Acquire) < 3
         wait_for_interrupt()
 
-    print("keel: tick", irq.ticks)
+    print("keel: tick", irq.ticks.load(Ordering.Acquire))
+
+    // The low half has no translation table any more, so reading the kernel's own physical address
+    // there is a translation fault at level 0. The trap handler reports it and steps over the load.
+    if trap.probe(mm.VirtAddr(mm.RAM_BASE + 0x8_0000))
+        print("keel: the identity map is still there")
+    else
+        print("keel: recovered from the fault")
     system_off()
 
 // Stop at a `brk`, which the trap handler reports and steps over.

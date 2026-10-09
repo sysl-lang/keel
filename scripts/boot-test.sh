@@ -27,8 +27,11 @@ compiler=${KEEL_SYSL:-sysl}
 
 expected=(
     "keel: hello"           # kmain runs
+    "keel: mmu on, kmain at 0xffff"   # ...in the high half, with the MMU on
     "keel: trap brk"        # a synchronous exception reaches the trap handler and returns
-    "keel: tick 3"          # three timer interrupts arrived through the GIC
+    "keel: tick 3"          # three timer interrupts arrived through the GIC, counted by an Atomic
+    "keel: trap translation fault level 0"   # the low half is unmapped once the identity map is gone
+    "keel: recovered from the fault"         # ...and the handler stepped over the faulting load
 )
 
 elf=$out/keel.elf

@@ -1,5 +1,7 @@
 module keel.pl011
 
+import keel.mm
+
 // The ARM PL011 UART that QEMU's `virt` machine puts at 0x0900_0000. QEMU's model transmits without
 // being configured, so this is the transmit half and nothing else: wait for room, write the byte.
 
@@ -10,10 +12,11 @@ private struct Regs
     reserved: [4]u32            // 0x08 .. 0x17
     fr: volatile u32            // 0x18 flags
 
-private const BASE: usize = 0x0900_0000
+private const BASE: u64 = 0x0900_0000  // physical
 private const FR_TXFF: u32 = 1 << 5     // transmit FIFO full
 
-private regs() -> *Regs = ptr_cast(BASE)
+// Through the kernel's device mapping, so only once the MMU is on.
+private regs() -> *Regs = mm.io(mm.PhysAddr(BASE))
 
 put_byte(b: u8)
     val r = regs()

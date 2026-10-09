@@ -1,5 +1,7 @@
 module keel.gic
 
+import keel.mm
+
 // The Arm Generic Interrupt Controller, version 3, as QEMU's `virt` machine provides it with
 // `gic-version=3`. Under HVF that is the only GIC there is: QEMU hands the guest the hypervisor's own
 // GICv3, and a GICv2 CPU interface at 0x0801_0000 reads as zeros.
@@ -43,16 +45,17 @@ private struct Redistributor
 @assert(offsetof(Redistributor, isenabler0) == 0x100, "GICR_ISENABLER0 is at 0x100")
 @assert(offsetof(Redistributor, ipriorityr) == 0x400, "GICR_IPRIORITYR is at 0x400")
 
-private const DIST_BASE: usize = 0x0800_0000
-private const REDIST_BASE: usize = 0x080A_0000
-private const SGI_FRAME: usize = 0x1_0000
+// Physical addresses, reached through the kernel's device mapping.
+private const DIST_BASE: u64 = 0x0800_0000
+private const REDIST_BASE: u64 = 0x080A_0000
+private const SGI_FRAME: u64 = 0x1_0000
 
 // What `acknowledge` answers when nothing is pending after all.
 const SPURIOUS: u32 = 1023
 
-private dist() -> *Distributor = ptr_cast(DIST_BASE)
-private redist_control() -> *RedistributorControl = ptr_cast(REDIST_BASE)
-private redist() -> *Redistributor = ptr_cast(REDIST_BASE + SGI_FRAME)
+private dist() -> *Distributor = mm.io(mm.PhysAddr(DIST_BASE))
+private redist_control() -> *RedistributorControl = mm.io(mm.PhysAddr(REDIST_BASE))
+private redist() -> *Redistributor = mm.io(mm.PhysAddr(REDIST_BASE + SGI_FRAME))
 
 // Switch on the distributor, wake this processor's redistributor, and open the CPU interface to
 // group 1 interrupts of every priority.

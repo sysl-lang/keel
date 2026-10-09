@@ -2,8 +2,10 @@ module keel.trap
 
 import keel.cpu.{esr, far, set_vbar}
 import keel.irq.dispatch
-import keel.pl011.{put_hex, put_str}
+import keel.mm
+import keel.pl011.{put_byte, put_hex, put_str}
 import keel.psci.system_off
+import sysl.sync.{Atomic, Ordering}
 
 // Exception entry. The processor jumps to `VBAR_EL1` plus a fixed offset chosen by what happened and
 // where it was running: sixteen 128-byte slots, four groups of four (synchronous, IRQ, FIQ, SError)
@@ -173,6 +175,8 @@ private synchronous(frame: *Frame)
             put_str("keel: trap brk")
             details(raw, frame)
             frame.elr += 4
+        Some(DataAbort) ->
+            data_abort(s, raw, frame)
         Some(c) ->
             put_str("keel: trap ")
             put_str(ExceptionClass::Image(c))
@@ -183,6 +187,45 @@ private synchronous(frame: *Frame)
             put_hex(u64(s.ec))
             details(raw, frame)
             system_off()
+
+// A data abort taken at EL1. The low six bits of the syndrome's ISS are the fault status (DFSC):
+// 0b0001LL is a translation fault at level LL, 0b0010LL an access flag fault, 0b0011LL a permission
+// fault. A fault during `probe` resumes after the faulting load; any other powers the machine off.
+private data_abort(s: Syndrome, raw: u64, frame: *Frame)
+    val status = u64(s.iss) & 0x3f
+    val level = status & 3
+    put_str("keel: trap ")
+    put_str(fault_kind(status >> 2))
+    put_str(" level ")
+    put_byte(u8('0') + u8(level))
+    details(raw, frame)
+
+    if probing.load(Ordering.Acquire) == 1
+        probe_faulted.store(1, Ordering.Release)
+        frame.elr += 4
+    else
+        system_off()
+
+private fault_kind(group: u64) -> string = group match
+    1 -> "translation fault"
+    2 -> "access flag fault"
+    3 -> "permission fault"
+    else "data abort"
+
+// Whether a probe is in flight, and whether it faulted. Set and read on one core, by kmain and by the
+// handler that interrupts it, so atomics only to make every access a real one.
+private var probing: Atomic[u64] = Atomic(0)
+private var probe_faulted: Atomic[u64] = Atomic(0)
+
+// Read the word at `addr`, and answer whether that worked rather than faulting. The read is one
+// volatile load, which is the one instruction the handler steps over if it faults.
+probe(addr: mm.VirtAddr) -> bool
+    probe_faulted.store(0, Ordering.Relaxed)
+    probing.store(1, Ordering.Release)
+    val p: *volatile u64 = ptr_cast(usize(u64(addr)))
+    val _ = *p
+    probing.store(0, Ordering.Release)
+    probe_faulted.load(Ordering.Acquire) == 0
 
 // The rest of a trap's line: the syndrome, where it was taken, and the faulting address.
 private details(raw: u64, frame: *Frame)

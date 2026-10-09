@@ -1,16 +1,32 @@
 module keel.boot
 
-// What the image has to do for itself before any sysl code may read module storage.
+// What the image does for itself before the kernel proper runs: zero `.bss`, build the page tables
+// and turn the MMU on. All of it runs with the MMU off, at the image's physical load address, though
+// the image is linked in the high half — so nothing here may use an absolute address it did not
+// convert, and nothing here prints.
+
+import keel.mm
 
 // Symbols the linker script defines. Each is an address and nothing more, so each is declared as a
 // byte whose address is the only thing ever taken.
 extern __bss_start: u8
 extern __bss_end: u8
 
-// Zero `.bss`, which the image does not carry.
-zero_bss()
-    var p: *u8 = &__bss_start
-    val end: *u8 = &__bss_end
-    while usize(p) < usize(end)
-        *p = 0
-        p = ptr_cast(usize(p) + 1)
+// Called by `_start` on the boot stack, at physical addresses. Answers how far the kernel's virtual
+// addresses are from its physical ones, which `_start` adds to the stack pointer before branching to
+// kmain's high-half address.
+@export("keel_boot")
+keel_boot() -> u64
+    zero_bss()
+    mm.enable(mm.build_boot_maps())
+    mm.KERNEL_BASE
+
+// Zero `.bss`, which the image does not carry. It is written at its physical address: `&__bss_start`
+// is the link address, in the high half, which is not mapped yet.
+private zero_bss()
+    var p = u64(mm.phys_of(usize(&__bss_start)))
+    val end = u64(mm.phys_of(usize(&__bss_end)))
+    while p < end
+        val b: *u8 = ptr_cast(usize(p))
+        *b = 0
+        p += 1

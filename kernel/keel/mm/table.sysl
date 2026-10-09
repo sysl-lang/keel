@@ -1,0 +1,94 @@
+module keel.mm
+
+import keel.cpu
+import keel.cpu.{from_word, to_word}
+
+// A translation table: 512 descriptors, one 4 KiB page, aligned to its size.
+@align(4096)
+struct Table
+    entries: [512]u64
+
+@assert(sizeof(Table) == 4096, "a translation table is one 4 KiB page")
+
+// Where tables come from until there is a page allocator: a fixed pool in `.bss`. The boot maps use
+// six (two for the identity map, four for the kernel's). `@align` is repeated on the binding because
+// the struct's own `@align(4096)` does not reach module storage (FINDINGS.md 12).
+private const POOL: usize = 16
+
+@align(4096)
+private var pool: [POOL]Table
+
+private var pool_used: usize = 0
+
+// A zeroed table, and its physical address. The pointer is valid at whatever addresses the code is
+// running at: before the MMU is on, `&pool[i]` is physical, after it is virtual.
+new_table() -> (*Table, PhysAddr)
+    if pool_used == POOL then halt()
+    val t: *Table = &pool[pool_used]
+    pool_used += 1
+    (t, phys_of(usize(t)))
+
+// The pool table at a physical address. Every table keel has came from the pool, so this is how a walk
+// follows a table descriptor until there is a linear map to find any page by (milestone 3).
+private table_at(p: PhysAddr) -> *Table
+    val first = phys_of(usize(&pool[0]))
+    val i = usize((u64(p) - u64(first)) / 4096)
+    if u64(p) < u64(first) || i >= pool_used then halt()
+    &pool[i]
+
+// Discard any cached copy of the tables handed out so far. They were written with the MMU off,
+// straight to memory, and the walker reads them through the data cache.
+invalidate_pool()
+    val line = u64(4) << ((cpu.ctr() >> 16) & 0xf)
+    var a = u64(phys_of(usize(&pool[0])))
+    val end = a + u64(pool_used) * 4096
+    while a < end
+        cpu.invalidate_dcache_line(a)
+        a += line
+
+// The bytes one entry covers at each level, and which bits of a virtual address index each level.
+private block_size(level: u64) -> u64 = u64(1) << (39 - 9 * level)
+
+private index(va: VirtAddr, level: u64) -> usize = usize((u64(va) >> (39 - 9 * level)) & 511)
+
+private aligned(a: u64, size: u64) -> bool = a & (size - 1) == 0
+
+// Map `len` bytes at `va` to `pa`, using the largest blocks that fit: 1 GiB, 2 MiB, else 4 KiB pages.
+// Every address and the length must be page aligned. Tables are taken from the pool as needed.
+map_range(root: *Table, va: VirtAddr, pa: PhysAddr, len: u64, prot: Prot)
+    var done: u64 = 0
+    while done < len
+        val v = va + done
+        val p = pa + done
+        var level: u64 = 1
+        while level < 3 && !(aligned(u64(v), block_size(level)) && aligned(u64(p), block_size(level))
+                && len - done >= block_size(level))
+            level += 1
+        set_leaf(root, v, p, level, prot)
+        done += block_size(level)
+
+// Write one block or page descriptor, walking down from `root` and adding tables where an entry is
+// still invalid. An existing block on the way down is a mistake in the caller's map.
+private set_leaf(root: *Table, va: VirtAddr, pa: PhysAddr, level: u64, prot: Prot)
+    var t = root
+    var l: u64 = 0
+    while l < level
+        val slot = &t.entries[index(va, l)]
+        if *slot == 0
+            val (next, next_pa) = new_table()
+            *slot = to_word(table_desc(next_pa))
+            t = next
+        else
+            val d: TableDesc = from_word(*slot)
+            if d.table != 1 then halt()
+            t = table_at(frame_addr(d.next))
+        l += 1
+    t.entries[index(va, level)] = to_word(leaf_desc(pa, prot, level))
+
+// Stop for good. Nothing here can print: before the MMU is on the console is not mapped where `print`
+// looks for it.
+private halt() -> never
+    loop
+        asm
+            [aarch64] "wfe"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
