@@ -5,6 +5,7 @@
 import rt.keel.user
 import sysl.fs
 import sysl.fs.IoError
+import sysl.sys.UNSUPPORTED
 
 var failures = 0
 
@@ -86,8 +87,8 @@ fs.entries("/dir") match
 // What keel has no call for is "not supported", in sysl.fs's own words.
 fs.symlink("/hello.txt", "/link") match
     Ok(_) -> fail("symlink succeeded")
-    Err(e) -> check(e.code() == -1 && s"$e" == "not supported on this target", s"symlink answered '$e'")
-refused(fs.hard_link("/hello.txt", "/link").err(), IoError.Other(-1), "hard_link")
-refused(fs.read_link("/hello.txt").err(), IoError.Other(-1), "read_link")
+    Err(e) -> check(e.code() == UNSUPPORTED && s"$e" == "not supported on this target", s"symlink answered '$e'")
+refused(fs.hard_link("/hello.txt", "/link").err(), IoError.Other(UNSUPPORTED), "hard_link")
+refused(fs.read_link("/hello.txt").err(), IoError.Other(UNSUPPORTED), "read_link")
 
 if failures == 0 then print("user: sysl.fs ok") else exit(1)

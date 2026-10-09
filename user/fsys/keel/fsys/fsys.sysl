@@ -3,11 +3,11 @@ module keel.fsys
 // `sysl.fs` on keel: the twenty-five hooks `sysl.fs.sys` declares, and the three of `sysl.io.sys`, each
 // `@export`ed under the name the standard library calls and answered with keel's system calls (keel.abi).
 //
-// A hook answers 0, or the code of the `IoError` the call failed with; `status` is the one place a
-// kernel's error number becomes such a code. Paths cross as they arrive — a pointer and a length is
-// what both sysl.fs and keel's calls take — and so does a descriptor. What keel has no call for
-// (permissions, links, a temporary directory) answers `UNSUPPORTED`, which `sysl.fs` reports as "not
-// supported on this target".
+// Every hook answers as a system call does — zero or more for success, the code of the `IoError` the
+// call failed with negated for an error — and `status` is the one place a kernel's error number becomes
+// such a code. Paths cross as they arrive — a pointer and a length is what both sysl.fs and keel's
+// calls take — and so does a descriptor. What keel has no call for (permissions, links, a temporary
+// directory) answers `sysl.sys.UNSUPPORTED`, which `sysl.fs` reports as "not supported on this target".
 
 import abi.keel.abi.{EBADF, EEXIST, EISDIR, EMFILE, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, Errno, KIND_DIR,
     O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, SYS_ACCESS, SYS_CHDIR, SYS_CLOSE, SYS_FSTAT,
@@ -16,33 +16,32 @@ import abi.keel.abi.{EBADF, EEXIST, EISDIR, EMFILE, ENOENT, ENOSPC, ENOSYS, ENOT
 import rt.keel.user.{flush, syscall}
 import sysl.fs.IoError
 import sysl.fs.sys as fsys
+import sysl.sys.UNSUPPORTED
 
 // --- Errors ----------------------------------------------------------------------------------------
 
-// The code `sysl.fs` hears for a call it cannot have here; no error number is negative.
-private const UNSUPPORTED: int = -1
-
-// A system call's answer as a hook's status: 0 for a result, or the `IoError` code of the error. keel's
-// numbers are Linux's, which `IoError`'s named cases were recognised from, but the table is written out
-// rather than passed through: a number the cases do not name goes over as `Other`, and ENOSYS — a call
-// this kernel does not have — is "unsupported", which is what it means to a program.
+// A system call's answer as a hook's status: 0 for a result, or the `IoError` code of the error,
+// negated. keel's numbers are Linux's, which `IoError`'s named cases were recognised from, but the table
+// is written out rather than passed through — `IoError`'s own reading of a number is the target's, and
+// ENOTEMPTY is 66 on a BSD — so a number the cases do not name goes over as `Other`, and ENOSYS, a call
+// this kernel does not have, is "unsupported", which is what it means to a program.
 private status(r: i64) -> int
     if r >= 0 then return 0
     Errno.try(-r) match
         Some(e) -> code_of(e)
-        None -> IoError.Other(int(-r)).code()
+        None -> -IoError.Other(int(-r)).code()
 
 private code_of(e: Errno) -> int = e match
-    ENOENT -> IoError.NotFound.code()
-    EEXIST -> IoError.AlreadyExists.code()
-    ENOTDIR -> IoError.NotADirectory.code()
-    EISDIR -> IoError.IsADirectory.code()
-    ENOTEMPTY -> IoError.DirectoryNotEmpty.code()
-    EMFILE -> IoError.TooManyOpenFiles.code()
-    ENOSPC -> IoError.NoSpaceLeft.code()
-    EBADF -> IoError.NotOpen.code()
+    ENOENT -> -IoError.NotFound.code()
+    EEXIST -> -IoError.AlreadyExists.code()
+    ENOTDIR -> -IoError.NotADirectory.code()
+    EISDIR -> -IoError.IsADirectory.code()
+    ENOTEMPTY -> -IoError.DirectoryNotEmpty.code()
+    EMFILE -> -IoError.TooManyOpenFiles.code()
+    ENOSPC -> -IoError.NoSpaceLeft.code()
+    EBADF -> -IoError.NotOpen.code()
     ENOSYS -> UNSUPPORTED
-    else IoError.Other(int(i64(e))).code()
+    else -IoError.Other(int(i64(e))).code()
 
 // --- Descriptors -----------------------------------------------------------------------------------
 
@@ -166,14 +165,14 @@ opendir(path: *u8, len: usize, dir: *usize) -> int
     var slot: usize = 0
     while slot < STREAMS && streams[slot].fd != 0
         slot += 1
-    if slot == STREAMS then return IoError.TooManyOpenFiles.code()
+    if slot == STREAMS then return -IoError.TooManyOpenFiles.code()
     val fd = syscall(SYS_OPEN, addr(path), u64(len), O_RDONLY, 0)
     if fd < 0 then return status(fd)
     var s = Stat(0, 0, 0, 0, 0)
     val r = syscall(SYS_FSTAT, u64(fd), u64(usize(&s)), 0, 0)
     if r < 0 || s.kind != KIND_DIR
         val _ = syscall(SYS_CLOSE, u64(fd), 0, 0, 0)
-        return if r < 0 then status(r) else IoError.NotADirectory.code()
+        return if r < 0 then status(r) else -IoError.NotADirectory.code()
     streams[slot].fd = u64(fd)
     streams[slot].held = 0
     streams[slot].at = 0
@@ -182,7 +181,7 @@ opendir(path: *u8, len: usize, dir: *usize) -> int
 
 @export("sysl_fs_readdir")
 readdir(dir: usize, into: *u8, room: usize, got: *usize) -> int
-    if dir == 0 || dir > STREAMS || streams[dir - 1].fd == 0 then return IoError.NotOpen.code()
+    if dir == 0 || dir > STREAMS || streams[dir - 1].fd == 0 then return -IoError.NotOpen.code()
     val s = &streams[dir - 1]
     if s.at >= s.held
         val r = syscall(SYS_GETDENTS, s.fd, u64(usize(&s.records[0])), u64(RECORDS), 0)
@@ -202,7 +201,7 @@ readdir(dir: usize, into: *u8, room: usize, got: *usize) -> int
 
 @export("sysl_fs_closedir")
 closedir(dir: usize) -> int
-    if dir == 0 || dir > STREAMS || streams[dir - 1].fd == 0 then return IoError.NotOpen.code()
+    if dir == 0 || dir > STREAMS || streams[dir - 1].fd == 0 then return -IoError.NotOpen.code()
     val fd = streams[dir - 1].fd
     streams[dir - 1].fd = 0
     status(syscall(SYS_CLOSE, fd, 0, 0, 0))
@@ -235,13 +234,9 @@ realpath(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> int = UN
 
 // --- sysl.io: the three descriptor hooks `sysl.io.sys` declares ----------------------------------------
 //
-// These answer a count rather than 0, so a failure is the `IoError` code negated, and a call keel does
-// not have is -1, as `sysl.io.sys` asks.
+// These answer a count rather than 0; a failure is `status`'s answer, as for every hook.
 
-private moved(r: i64) -> isize
-    if r >= 0 then return isize(r)
-    val code = status(r)
-    if code == UNSUPPORTED then -1 else isize(-code)
+private moved(r: i64) -> isize = if r >= 0 then isize(r) else isize(status(r))
 
 // Reading the console waits for a whole line, so whatever `print` has collected — a prompt — goes out
 // first, as C's line-buffered standard output does before standard input is read.
