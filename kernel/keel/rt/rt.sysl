@@ -4,36 +4,32 @@ module keel.rt
 // copies memory, and a structure assignment, into calls to these, as any C compiler does
 // (getting-started/cli.md § "Freestanding does not mean self-contained").
 //
-// Every store goes through a `*volatile u8`. Written as an ordinary loop, `memset` compiles to
-// `b memset`: LLVM recognises the loop as a memset and calls the function from inside itself, and
-// sysl has no way to say "this function is the builtin" (FINDINGS.md 18). A volatile store is one
-// LLVM may not merge into a call. Byte at a time is slow, and nothing in keel is big enough yet to care.
+// They are ordinary loops. The compiler marks the code it emits for a freestanding target
+// `no-builtins`, so LLVM does not recognise a loop here as a `memset` and call the function from
+// inside itself. Byte at a time is slow, and nothing in keel is big enough yet to care.
 
 @export("memset")
 mem_set(dst: *u8, c: int, n: usize) -> *u8
-    val d: *volatile u8 = ptr_cast(dst)
     for i in 0..<n
-        d[i] = u8(c)
+        dst[i] = u8(c)
     dst
 
 @export("memcpy")
 mem_copy(dst: *u8, src: *u8, n: usize) -> *u8
-    val d: *volatile u8 = ptr_cast(dst)
     for i in 0..<n
-        d[i] = src[i]
+        dst[i] = src[i]
     dst
 
 @export("memmove")
 mem_move(dst: *u8, src: *u8, n: usize) -> *u8
-    val d: *volatile u8 = ptr_cast(dst)
     if usize(dst) < usize(src)
         for i in 0..<n
-            d[i] = src[i]
+            dst[i] = src[i]
     else
         var i = n
         while i > 0
             i -= 1
-            d[i] = src[i]
+            dst[i] = src[i]
     dst
 
 @export("memcmp")

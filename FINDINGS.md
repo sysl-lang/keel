@@ -530,6 +530,10 @@ None was fixed here.
 
 ## 18. An exported `memset` written as a loop compiles to a call to itself
 
+**FIXED in sysl census-35 8619de66 (prerelease `8619de6609`):** freestanding code is `no-builtins`.
+keel.rt's and the user runtime's `memset`/`memcpy`/`memmove` are plain loops again (branch `lsrm`);
+the disassembly of both images shows a byte loop and `ret`, no call to itself.
+
 Milestone 3, `keel.rt`. A freestanding image defines `memset`, `memcpy`, `memmove` and `memcmp`
 itself (getting-started/cli.md: "Freestanding does not mean self-contained ... `memcpy` and `memset`
 for a structure assignment you never wrote"). LLVM emitted a `memset` call for the frame bitmap's
