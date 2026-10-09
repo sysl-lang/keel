@@ -13,6 +13,13 @@ the language rather than worked around here.
 - **Simple user programs can be written in sysl** — a `cp` command is the yardstick: a sysl program,
   built by `sysl build` for keel, using the standard library's files, running as a user process.
 
+## The mini-Unix (decided 2026-10-09)
+
+- **Users and logins**, a shell with pipes and redirection, and the usual small utilities.
+- **A C library written in sysl**, exporting the C names (`open`, `read`, `printf`, `malloc`, …)
+  over keel's system calls, so C programs can be **ported** to keel with clang. It exists for
+  porting only: **everything written for keel that is not a port is written in sysl.**
+
 ## Milestones
 
 | # | Milestone | Done when |
@@ -29,3 +36,6 @@ the language rather than worked around here.
 | 9 | **sysl targets keel**: a target whose standard library reaches keel's system calls | `cp` written in sysl with `sysl.fs` copies a file ✅ |
 | 10 | Processes and a shell: `fork`/`exec`/`wait` (or `spawn`), a serial shell, `ls`/`cat`/`cp` | a session at the shell ✅ |
 | 11 | Networking: virtio-net, ARP, IPv4, ICMP, UDP | the host pings keel and gets a UDP echo ✅ (slirp cannot forward ICMP to the guest, so keel pings the gateway; the host gets UDP echoes from the kernel and from a sysl program at EL0) |
+| 12 | Users: uid/gid per process, owner and mode bits on disk, permission checks, `/etc/passwd`, `login`, `su`, `id`, `chmod`/`chown` | a user logs in, is refused another user's file, `su`s to root and reads it |
+| 13 | Shell plumbing: `pipe`, `dup2`, `\|`, `<`, `>>`, `&`, environment variables, `$?`; `ps`, `kill`, `wc`, `grep`, `head` | `ls -l / \| grep bin \| wc -l` at the shell |
+| 14 | A C library in sysl: `crt0`, headers, `stdio`/`stdlib`/`string`/`unistd` over keel's calls; clang builds C for keel | a ported C program runs at the shell |
