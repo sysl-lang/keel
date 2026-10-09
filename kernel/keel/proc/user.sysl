@@ -4,10 +4,12 @@ import keel.sched
 
 // Entering user mode, and coming back.
 //
-//   keel_enter_user(kernel, entry, sp, arg) -> status
+//   keel_enter_user(kernel, regs) -> status
 //       Save what a call preserves (x19-x30, SP) in *kernel, as `keel_switch` does, then `eret` to EL0
-//       at `entry` with SP_EL0 = `sp`, x0 = `arg` and every other register zero, so nothing of the
-//       kernel's reaches the program. SPSR = 0 is EL0t with every exception unmasked. IRQs are masked
+//       with every register as `regs` has it: x0-x30, then ELR_EL1 (where the program resumes), SPSR_EL1
+//       and SP_EL0 — the layout of keel.trap's `Frame`, so a forked child can start from a copy of the
+//       frame its parent's `fork` call left. A new program's `UserRegs` is all zero but the entry point,
+//       its stack pointer and x0; SPSR = 0 is EL0t with every exception unmasked. IRQs are masked
 //       first: an interrupt between writing ELR_EL1 and the `eret` would overwrite it.
 //
 //       SP_EL1 stays where it is, just below the caller's frame on the thread's kernel stack: every
@@ -20,7 +22,7 @@ import keel.sched
 //       code's, `keel_trap`'s, the system call's — is abandoned, so none of them may hold a counted
 //       reference (FINDINGS.md 23, 34); they are all in `@no_alloc` code that holds none, by care.
 //
-// The offsets are `sched.Context`'s, which keel.sched's `@assert`s pin.
+// The offsets are `sched.Context`'s, which keel.sched's `@assert`s pin, and `UserRegs`'s below.
 asm
     [aarch64]
         ".globl keel_enter_user"
@@ -34,40 +36,27 @@ asm
         "stp x27, x28, [x0, #64]"
         "stp x29, x30, [x0, #80]"
         "str x9, [x0, #96]"
-        "msr elr_el1, x1"
-        "msr spsr_el1, xzr"
-        "msr sp_el0, x2"
-        "mov x0, x3"
-        "mov x1, xzr"
-        "mov x2, xzr"
-        "mov x3, xzr"
-        "mov x4, xzr"
-        "mov x5, xzr"
-        "mov x6, xzr"
-        "mov x7, xzr"
-        "mov x8, xzr"
-        "mov x9, xzr"
-        "mov x10, xzr"
-        "mov x11, xzr"
-        "mov x12, xzr"
-        "mov x13, xzr"
-        "mov x14, xzr"
-        "mov x15, xzr"
-        "mov x16, xzr"
-        "mov x17, xzr"
-        "mov x18, xzr"
-        "mov x19, xzr"
-        "mov x20, xzr"
-        "mov x21, xzr"
-        "mov x22, xzr"
-        "mov x23, xzr"
-        "mov x24, xzr"
-        "mov x25, xzr"
-        "mov x26, xzr"
-        "mov x27, xzr"
-        "mov x28, xzr"
-        "mov x29, xzr"
-        "mov x30, xzr"
+        "ldp x2, x3, [x1, #{ELR}]"
+        "ldr x4, [x1, #{SP_EL0}]"
+        "msr elr_el1, x2"
+        "msr spsr_el1, x3"
+        "msr sp_el0, x4"
+        "ldp x2, x3, [x1, #16]"
+        "ldp x4, x5, [x1, #32]"
+        "ldp x6, x7, [x1, #48]"
+        "ldp x8, x9, [x1, #64]"
+        "ldp x10, x11, [x1, #80]"
+        "ldp x12, x13, [x1, #96]"
+        "ldp x14, x15, [x1, #112]"
+        "ldp x16, x17, [x1, #128]"
+        "ldp x18, x19, [x1, #144]"
+        "ldp x20, x21, [x1, #160]"
+        "ldp x22, x23, [x1, #176]"
+        "ldp x24, x25, [x1, #192]"
+        "ldp x26, x27, [x1, #208]"
+        "ldp x28, x29, [x1, #224]"
+        "ldr x30, [x1, #240]"
+        "ldp x0, x1, [x1, #0]"
         "eret"
         ".globl keel_leave_user"
         "keel_leave_user:"
@@ -83,5 +72,43 @@ asm
         "ret"
     [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
 
-extern "keel_enter_user" enter_user(kernel: *sched.Context, entry: u64, sp: u64, arg: u64) -> u64
+// What a process's registers are at EL0: keel.trap's `Frame`, which keel.proc cannot name (keel.trap
+// imports keel.proc). A system call's `regs` points at the same layout.
+struct UserRegs
+    x: [31]u64
+    elr: u64
+    spsr: u64
+    sp_el0: u64
+
+private const ELR: usize = offsetof(UserRegs, elr)
+private const SP_EL0: usize = offsetof(UserRegs, sp_el0)
+private const USER_REGS_WORDS: usize = 34
+
+@assert(offsetof(UserRegs, elr) == 248, "x0-x30, then ELR_EL1, as keel.trap's Frame")
+@assert(offsetof(UserRegs, spsr) == ELR + 8, "one ldp loads ELR_EL1 and SPSR_EL1")
+@assert(offsetof(UserRegs, sp_el0) == 264, "SP_EL0 last, as keel.trap's Frame")
+@assert(sizeof(UserRegs) == USER_REGS_WORDS * 8, "34 words")
+
+// A new program's registers: every one zero but where it starts, its stack pointer and x0.
+private[proc] fresh_regs(entry: u64, sp: u64, arg: u64) -> UserRegs
+    var r = UserRegs([0; 31], entry, 0, sp)
+    r.x[0] = arg
+    r
+
+// The registers a system call was made with, as its `regs` points at them.
+private[proc] saved_regs(regs: *u64) -> UserRegs
+    var r = UserRegs([0; 31], 0, 0, 0)
+    val words: *u64 = ptr_cast(&r)
+    for i in 0..<USER_REGS_WORDS
+        words[i] = regs[i]
+    r
+
+// Make the system call whose `regs` these are return into `r` instead: what `execve` does.
+private[proc] replace_regs(regs: *u64, r: UserRegs)
+    var copy = r
+    val words: *u64 = ptr_cast(&copy)
+    for i in 0..<USER_REGS_WORDS
+        regs[i] = words[i]
+
+extern "keel_enter_user" enter_user(kernel: *sched.Context, regs: *UserRegs) -> u64
 extern "keel_leave_user" leave_user(kernel: *sched.Context, status: u64) -> never

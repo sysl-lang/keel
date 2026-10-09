@@ -19,6 +19,19 @@ private var lock: SpinLock = SpinLock(0)
 // The bitmap, as a kernel virtual address once `init_frames` has run.
 private var bitmap: *u64 = null
 
+// Every frame's share count, one u16 per frame, beside the bitmap: how many address spaces map the frame
+// besides the first. Zero for every frame the kernel uses and for every user page only one process maps;
+// `fork` raises it for each page the child shares (copy-on-write), and `release_frame` lowers it, freeing
+// the frame when no one is left. It lives here rather than in keel.mm's user spaces because "lower the
+// count, or free the frame if it was the last" has to be one step under one lock: two processes that
+// shared a page may give it up on two cores at once, and only the allocator's lock sees both the count
+// and the bit. 2 bytes a frame is 128 KiB of 256 MiB.
+private var shares: *u16 = null
+
+// Off only to show what the count is for: with it off, `release_frame` never lowers a count, so a page
+// that was ever shared is never freed, and the boot test's frame count after /bin/forktest is short.
+private[mm] const DROP_SHARES: bool = true
+
 // The frame number of the first frame covered, how many are covered, how many are free, and the
 // bitmap word a search starts from.
 private var first_frame: u64 = 0
@@ -35,17 +48,22 @@ init_frames(base: PhysAddr, size: u64, reserved: []const (PhysAddr, u64))
     frame_count = size / PAGE
     val words = (frame_count + 63) / 64
     val bitmap_pages = (words * 8 + PAGE - 1) / PAGE
+    val share_pages = (frame_count * 2 + PAGE - 1) / PAGE
 
-    // The bitmap goes in the first run of frames after every reserved range that does not overlap one.
+    // The bitmap, then the share counts, go in the first run of frames after every reserved range that
+    // does not overlap one.
     var at = u64(base)
     for r in reserved
         val (start, len) = r
         val end = round_up(u64(start) + len)
         if end > at then at = end
     bitmap = ptr_cast(usize(u64(to_virt(PhysAddr(at)))))
+    shares = ptr_cast(usize(u64(to_virt(PhysAddr(at + bitmap_pages * PAGE)))))
 
     for i in 0..<words
         bitmap[i] = 0
+    for i in 0..<frame_count
+        shares[i] = 0
     // The bits past the last frame are never free.
     for i in frame_count..<words * 64
         set(i)
@@ -53,7 +71,7 @@ init_frames(base: PhysAddr, size: u64, reserved: []const (PhysAddr, u64))
     for r in reserved
         val (start, len) = r
         mark_used(u64(start), len)
-    mark_used(at, bitmap_pages * PAGE)
+    mark_used(at, (bitmap_pages + share_pages) * PAGE)
 
     var n: u64 = 0
     for i in 0..<frame_count
@@ -98,11 +116,54 @@ free_frames(f: Frame, n: u64)
         panic("keel: free_frames: frame outside RAM")
     for k in i..<i + n
         if !is_set(k) then panic("keel: free_frames: frame freed twice")
+        if shares[k] != 0 then panic("keel: free_frames: frame still shared")
         clear(k)
     free_count += n
     if i / 64 < hint then hint = i / 64
     lock.unlock()
     cpu.irq_restore(flags)
+
+// One more address space maps frame `f`, which is in use.
+share_frame(f: Frame)
+    val flags = cpu.irq_save()
+    lock.lock()
+    val i = in_use_index(f)
+    if shares[i] == 0xffff then panic("keel: share_frame: too many sharers")
+    shares[i] += 1
+    lock.unlock()
+    cpu.irq_restore(flags)
+
+// One address space no longer maps frame `f`: the count goes down, or, if that space was the last, the
+// frame is free again.
+release_frame(f: Frame)
+    val flags = cpu.irq_save()
+    lock.lock()
+    val i = in_use_index(f)
+    if shares[i] == 0
+        clear(i)
+        free_count += 1
+        if i / 64 < hint then hint = i / 64
+    else if DROP_SHARES
+        shares[i] -= 1
+    lock.unlock()
+    cpu.irq_restore(flags)
+
+// Whether another address space maps frame `f` besides the caller's. A frame answered false stays
+// unshared until the caller shares it: only a fork of a space that maps a frame shares it.
+frame_shared(f: Frame) -> bool
+    val flags = cpu.irq_save()
+    lock.lock()
+    val shared = shares[in_use_index(f)] != 0
+    lock.unlock()
+    cpu.irq_restore(flags)
+    shared
+
+// The index of frame `f`, which must be RAM this allocator covers and in use. Called with the lock held.
+private in_use_index(f: Frame) -> u64
+    val i = u64(f) - first_frame
+    if u64(f) < first_frame || i >= frame_count then panic("keel: frame outside RAM")
+    if !is_set(i) then panic("keel: a shared frame is not in use")
+    i
 
 // How many frames are free right now.
 frames_free() -> u64

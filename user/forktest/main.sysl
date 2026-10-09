@@ -1,0 +1,176 @@
+// fork and execve, from a program: the two return values, memory that is the parent's until one side
+// writes it (copy-on-write) and separate after, a loop of forks whose pages must all come back (the
+// kernel's selftest counts the frames once this program has ended), and children that replace
+// themselves with /bin/echo, /bin/env and /bin/false — with arguments and an environment — and are
+// waited for. Exits 0 only if every check passed.
+
+import abi.keel.abi.{ENOENT, Errno}
+import rt.keel.user
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8
+
+var failures: u64 = 0
+
+fail(what: string)
+    print(s"user: FAILED: $what")
+    failures += 1
+
+check(ok: bool, what: string)
+    if !ok then fail(what)
+
+// A failure the rest of the test cannot go on from.
+stop(what: string) -> never
+    print(s"user: FAILED: $what")
+    user.exit(1)
+
+// Wait for `pid` and answer its exit code; -1 (and a failure) if it did not exit by itself.
+reaped(pid: u64) -> i64
+    user.wait(i64(pid)) match
+        Ok((who, status)) ->
+            check(who == pid, s"wait answered pid $who, not $pid")
+            if status.fault != 0
+                fail(s"child $pid was killed (fault ${status.fault})")
+                return -1
+            status.code
+        Err(e) ->
+            fail(s"wait for $pid: errno ${i64(e)}")
+            -1
+
+// Everything `fd` gives until the end of its input.
+drained(fd: u64) -> string
+    var all: Buf[u8] = buf()
+    var chunk: [64]u8 = [0; 64]
+    loop
+        val n = user.read(fd, chunk[..]) match
+            Ok(n) -> n
+            Err(_) -> 0
+        if n == 0 then break
+        all.extend(chunk[0..<usize(n)])
+    from_utf8(all.view()) match
+        Ok(s) -> s.copy()
+        Err(_) -> ""
+
+// Four pages of heap, word i holding i, and a word on the stack: the memory both sides check.
+const WORDS: usize = 2048
+var heap: Buf[u64] = buf()
+for i in 0..<WORDS
+    heap.push(u64(i))
+var mark: u64 = 1
+val me = user.getpid()
+
+// --- The return values, and the child's writes ---------------------------------------------------
+user.fork() match
+    Ok(0) ->
+        // The child: the parent's memory, as it was.
+        var ok = mark == 1 && heap.at(5) == 5 && heap.at(2047) == 2047 && user.getppid() == me
+        ok = ok && user.getpid() != me
+        mark = 2
+        heap.set(5, 500)
+        heap.set(2047, 0)
+        ok = ok && mark == 2 && heap.at(5) == 500 && heap.at(2047) == 0
+        user.exit(if ok then 0 else 1)
+    Ok(child) ->
+        check(child != me, "fork answered the parent its own pid")
+        check(reaped(child) == 0, "the child did not see the parent's memory as it was")
+        check(mark == 1 && heap.at(5) == 5 && heap.at(2047) == 2047, "the child's writes reached the parent")
+    Err(e) -> fail(s"fork: errno ${i64(e)}")
+if failures == 0 then print("user: fork ok")
+
+// --- The parent's writes, after the fork ---------------------------------------------------------
+// The parent wrote these pages just before forking, so its TLB may still hold them writable; it
+// writes them again at once, then lets the child look through a pipe. The child must see the values
+// from before the fork.
+val before = failures
+val (r, w) = user.pipe() match
+    Ok(ends) -> ends
+    Err(e) -> stop(s"pipe: errno ${i64(e)}")
+heap.set(7, 70)
+mark = 10
+user.fork() match
+    Ok(0) ->
+        val _ = user.close(w)
+        var go: [1]u8 = [0]
+        val _ = user.read(r, go[..])
+        var ok = heap.at(7) == 70 && mark == 10
+        // Both sides write every page after the fork: each gets copies of its own.
+        for i in 0..<WORDS
+            heap.set(i, u64(i) * 3)
+        for i in 0..<WORDS
+            if heap.at(i) != u64(i) * 3 then ok = false
+        user.exit(if ok then 0 else 1)
+    Ok(child) ->
+        heap.set(7, 71)
+        mark = 11
+        for i in 0..<WORDS
+            heap.set(i, heap.at(i) + 1)
+        val _ = user.write_file(w, [u8(1)])
+        val _ = user.close(w)
+        val _ = user.close(r)
+        check(reaped(child) == 0, "the child saw the parent's writes after the fork")
+        var mine = mark == 11 && heap.at(7) == 72
+        for i in 0..<WORDS
+            if i != 7 && heap.at(i) != u64(i) + 1 then mine = false
+        check(mine, "the parent's pages changed under it")
+    Err(e) -> fail(s"fork: errno ${i64(e)}")
+if failures == before then print("user: cow ok")
+
+// --- A loop of forks: each child writes a page and exits; every frame must come back ------------
+val looped = failures
+for round in 0..<64
+    user.fork() match
+        Ok(0) ->
+            heap.set(usize(round) * 32, 0)
+            user.exit(int(round % 7))
+        Ok(child) ->
+            if reaped(child) != i64(round % 7) then fail(s"round $round: the wrong status")
+        Err(e) ->
+            fail(s"fork round $round: errno ${i64(e)}")
+            break
+if failures == looped then print("user: fork loop ok")
+
+// --- fork, then execve -----------------------------------------------------------------------------
+val execs = failures
+user.fork() match
+    Ok(0) ->
+        val e = user.execve("/bin/echo", ["echo", "user: exec echo", "ok"], Some(["FORKTEST=yes"]))
+        print(s"user: FAILED: execve /bin/echo: errno ${i64(e)}")
+        user.exit(9)
+    Ok(child) -> check(reaped(child) == 0, "echo did not exit 0")
+    Err(e) -> fail(s"fork: errno ${i64(e)}")
+
+// /bin/env's output comes back through a pipe the child made its descriptor 1 before execve: the
+// descriptors survive it, and so does the environment it was handed.
+val (er, ew) = user.pipe() match
+    Ok(ends) -> ends
+    Err(e) -> stop(s"pipe: errno ${i64(e)}")
+user.fork() match
+    Ok(0) ->
+        val _ = user.dup2(ew, 1)
+        val _ = user.close(ew)
+        val _ = user.close(er)
+        val e = user.execve("/bin/env", ["env"], Some(["FORKTEST=yes", "SECOND=2"]))
+        user.exit(int(i64(e)) + 10)
+    Ok(child) ->
+        val _ = user.close(ew)
+        val seen = drained(er)
+        val _ = user.close(er)
+        check(reaped(child) == 0, "env did not exit 0")
+        check(seen == "FORKTEST=yes\nSECOND=2\n", s"env printed '$seen'")
+    Err(e) -> fail(s"fork: errno ${i64(e)}")
+
+// A status other than 0 comes back through execve and wait.
+user.fork() match
+    Ok(0) ->
+        val _ = user.execve("/bin/false", ["false"])
+        user.exit(9)
+    Ok(child) -> check(reaped(child) == 1, "false did not exit 1")
+    Err(e) -> fail(s"fork: errno ${i64(e)}")
+
+// A failed execve answers its error to a caller that carries on as it was.
+mark = 42
+val missing: Errno = user.execve("/bin/missing", ["missing"])
+check(missing == ENOENT, s"execve of a missing file answered errno ${i64(missing)}")
+check(mark == 42 && heap.at(9) == 10, "a failed execve changed the caller's memory")
+if failures == execs then print("user: exec ok")
+
+user.exit(if failures == 0 then 0 else 1)

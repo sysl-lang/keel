@@ -2,14 +2,13 @@ module keel.proc
 
 // Parents and children: the process table, and the `spawn`, `wait` and `getppid` system calls.
 //
-// **The model is spawn, not fork.** `spawn(path, args, attr)` makes a new address space from an
+// **Two ways to make a child.** `spawn(path, args, attr)` makes a new address space from an
 // executable on the disk — exactly what `start` already did for the kernel — and gives the child its
 // parent's current directory, environment and standard descriptors, any of them replaced as `attr`
-// says (a shell's `>`, `<`, a pipeline's ends, an exported variable).
-// `fork` would copy the parent's address space only for `exec` to throw the copy away, and would
-// need a second kernel stack that returns from the same system call into a copy of the trap frame;
-// keel has no copy-on-write, so the copy would be every page, and nothing in keel needs a forked
-// child that runs the parent's code. (posix_spawn exists for the same reasons.)
+// says (a shell's `>`, `<`, a pipeline's ends, an exported variable); the shell uses it, as
+// posix_spawn is used, because it builds nothing only to throw it away. `fork` and `execve`
+// (fork.sysl) are the other way: a copy-on-write copy of the caller, which may then replace its own
+// image.
 //
 // **The table** holds every process from its start until it is reaped, ended or not, as raw pointers
 // under one IrqLock (`family`); each entry keeps its own box alive through `Process.me`, as a thread
@@ -135,7 +134,7 @@ private standard_files(p: *Process, fds: [3]u64) -> Result[[3]OpenFile, Errno]
     Ok(std)
 
 // NUL-terminated arguments, one after another, as strings.
-private unpacked(packed: []const u8) -> Result[Buf[string], Errno]
+private[proc] unpacked(packed: []const u8) -> Result[Buf[string], Errno]
     var out: Buf[string] = buf()
     var start: usize = 0
     for i in 0..<packed.len
@@ -148,7 +147,7 @@ private unpacked(packed: []const u8) -> Result[Buf[string], Errno]
     if start != packed.len then return Err(EINVAL)
     Ok(out)
 
-private errno_of(e: LoadError) -> Errno = e match
+private[proc] errno_of(e: LoadError) -> Errno = e match
     Unreadable(why) -> why
     NoMemory -> ENOMEM
     TooManyArgs -> E2BIG

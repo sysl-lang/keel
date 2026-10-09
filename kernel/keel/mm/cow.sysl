@@ -1,0 +1,110 @@
+module keel.mm
+
+import keel.cpu
+
+// Copy-on-write: what `fork` does to an address space, and what a write to a shared page does after.
+//
+// `fork_space` gives the child a space of its own tables over the parent's frames. Every user page is
+// shared, each frame's share count (frames.sysl) going up by one. A page the parent could write is made
+// read-only in both spaces and marked copy-on-write in the descriptor's first software bit (bit 55,
+// which the walker ignores); a read-only page — text, rodata — is simply shared. Removing write
+// permission from the parent's live mappings needs its stale writable translations gone from every
+// core's TLB before it next runs at EL0, so the parent's ASID is invalidated, inner shareable, once the
+// walk is done: no core runs the parent meanwhile (its one thread is here, in the system call), but any
+// core may have cached its translations before and may run it after.
+//
+// A write to a copy-on-write page is a permission fault at EL0 (keel.proc's `user_sync`), or a system
+// call about to write the page for the program (`user_range`); either calls `break_cow`. If another
+// space still maps the frame, the page gets a copy of its own; if it was the last sharer — the other
+// side wrote first, or ended — the page is simply made writable again. Either way only that page's
+// translation is invalidated, for this space's ASID.
+
+// Off only to show what each is for. Without COPY_ON_WRITE a forked child maps the parent's writable
+// frames writable, so each sees the other's writes (/bin/forktest: "memory is shared"). Without
+// FLUSH_AFTER_PROTECT the parent may keep writing through a writable translation its TLB still holds,
+// straight into the frame its child now shares.
+private[mm] const COPY_ON_WRITE: bool = true
+private[mm] const FLUSH_AFTER_PROTECT: bool = true
+
+// A copy of `parent` for a forked child: new tables, the same frames, every writable page copy-on-write
+// in both. None when there is no frame or no ASID for it; the parent's pages may then be left
+// copy-on-write, which costs a fault each and changes nothing they hold.
+fork_space(parent: *Space) -> Option[Space]
+    var child = new_space() match
+        Some(s) -> s
+        None -> return None
+    val copied = copy_level(&child, parent.root, child.root, 0)
+    cpu.publish_tables()
+    if FLUSH_AFTER_PROTECT then cpu.flush_tlb_asid(parent.asid)
+    if !copied
+        free_space(&child)
+        return None
+    Some(child)
+
+// Copy the level-`level` table at `from` (the parent's) into the empty one at `to` (the child's).
+private copy_level(child: *Space, from: PhysAddr, to: PhysAddr, level: u64) -> bool
+    val src = table_of(from)
+    val dst = table_of(to)
+    for i in 0..<512
+        val word = src.entries[i]
+        if word == 0 then continue
+        if level < 3
+            val d: TableDesc = cpu.from_word(word)
+            val next = zeroed_frame() match
+                Some(p) -> p
+                None -> return false
+            dst.entries[i] = cpu.to_word(table_desc(next))
+            if !copy_level(child, frame_addr(d.next), next, level + 1) then return false
+        else
+            var leaf: LeafDesc = cpu.from_word(word)
+            if COPY_ON_WRITE && leaf.ap == UserRw
+                leaf.ap = UserRo
+                leaf.software = 1
+                src.entries[i] = cpu.to_word(leaf)
+            share_frame(leaf.oa)
+            dst.entries[i] = cpu.to_word(leaf)
+            child.pages += 1
+    true
+
+// Give the copy-on-write page holding `va` a frame this space may write: a copy, while another space
+// still maps the frame, or the same frame once none does. False when the page is not copy-on-write
+// (a real fault) or there is no frame for the copy.
+break_cow(s: *Space, va: u64) -> bool
+    val page = va & ~(PAGE_SIZE - 1)
+    if page >= USER_STACK_TOP then return false
+    val slot = leaf_slot(s, page, false) match
+        Some(p) -> p
+        None -> return false
+    if *slot == 0 then return false
+    var leaf: LeafDesc = cpu.from_word(*slot)
+    if (leaf.software & 1) == 0 then return false
+    val old = leaf.oa
+    val copied = frame_shared(old)
+    if copied
+        val f = alloc_frame() match
+            Some(f) -> f
+            None -> return false
+        copy_frame(frame_addr(old), frame_addr(f), leaf.uxn == 0)
+        leaf.oa = f
+    leaf.ap = UserRw
+    leaf.software = 0
+    *slot = cpu.to_word(leaf)
+    flush_user_page(s, page)
+    // The old frame is let go only once this space's translation no longer leads to it: the last
+    // sharer left may then write it at once.
+    if copied then release_frame(old)
+    true
+
+// Copy one frame's bytes to another, through the linear map; code is cleaned to the point the
+// instruction fetches see.
+private copy_frame(from: PhysAddr, to: PhysAddr, code: bool)
+    val src: *u64 = ptr_cast(usize(u64(to_virt(from))))
+    val dst: *u64 = ptr_cast(usize(u64(to_virt(to))))
+    for i in 0..<512
+        dst[i] = src[i]
+    if code
+        var line: u64 = 0
+        while line < PAGE_SIZE
+            cpu.clean_dcache_line_pou(u64(to_virt(to)) + line)
+            line += 64
+        cpu.sync_icache()

@@ -1,0 +1,105 @@
+module keel.proc
+
+// `fork` and `execve`.
+//
+// **fork** copies the calling process: its address space copy-on-write (keel.mm's cow.sysl), every
+// descriptor (each counted open once more, so a pipe sees one more reader or writer; a descriptor's
+// offset is copied, not shared, as everywhere in keel), its current directory, uid and gid, and its
+// environment. The child's thread enters EL0 from a copy of the registers the parent's `svc` left in its
+// trap frame, with x0 = 0: it returns from the same system call, answered 0, where the parent is
+// answered the child's pid. Sockets are not descriptors in keel and are not inherited.
+//
+// **execve** replaces the calling process's image: the same pid, parent, descriptors and current
+// directory; a new address space loaded from the file, the arguments and the environment laid on its
+// stack as `spawn` lays them, and the uid of the file's owner when it is set-user-ID, as `spawn` honours
+// it. There is no close-on-exec flag. Everything that can fail — the path, the file, the permission,
+// the load, the room for the arguments — is done before the old image is touched, so a failed
+// `execve` returns its error to a caller exactly as it was.
+
+import abi.keel.abi.{ARGS_ROOM, E2BIG, EAGAIN, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOMEM, ENV_ROOM, Errno}
+import keel.cpu
+import keel.fs
+import keel.mm
+import keel.sched
+import keel.sched.{Context, Env, Process}
+import sysl.buf.{Buf, buf}
+import sysl.sync.Atomic
+
+private const MAX_EXEC_PATH: usize = 256
+
+// fork() -> the child's pid; 0 in the child
+private[proc] sys_fork(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val space = mm.fork_space(&p.space) match
+        Some(s) -> s
+        None -> return Err(ENOMEM)
+    val child: &sync Process = Process(new_pid(), space, p.heap_base, p.brk, Context([0; 12], 0, 0), Atomic(0), 0,
+        0, None, 0, sched.no_files(), p.cwd, p.cwd_len, p.pid, false, None, p.uid, p.gid, copied_env(p))
+    val raw: *Process = &*child
+    for fd in 0..<sched.OPEN_FILES
+        raw.files[fd] = p.files[fd]
+        duplicate(raw.files[fd])
+    if !enter(child)
+        close_all(raw)
+        mm.free_space(&raw.space)
+        return Err(EAGAIN)
+    var regs_copy = saved_regs(regs)
+    regs_copy.x[0] = 0
+    child.thread = Some(sched.spawn(() -> run(raw, regs_copy)))
+    Ok(i64(raw.pid))
+
+// The parent's environment, in a box of the child's own. Read by index: a `&sync` box's array has no
+// slice.
+private copied_env(p: *Process) -> &sync Env
+    var bytes: Buf[u8] = buf()
+    for i in 0..<p.env.len
+        bytes.push(p.env.bytes[i])
+    sched.env_of(bytes.view())
+
+// execve(path, path_len, args, args_len, env, env_len) -> does not return; an error leaves the caller
+// as it was. `args` are NUL-separated, argv[0] first; `env` is `NAME=value` entries, each ending in NUL.
+private[proc] sys_execve(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val path_len = regs[1]
+    if path_len == 0 then return Err(ENOENT)
+    if path_len > u64(MAX_EXEC_PATH) then return Err(ENAMETOOLONG)
+    var path: [MAX_EXEC_PATH]u8 = [0; MAX_EXEC_PATH]
+    if !mm.copy_from_user(&p.space, regs[0], path[0..<usize(path_len)]) then return Err(EFAULT)
+    if regs[3] > ARGS_ROOM || regs[5] > ENV_ROOM then return Err(E2BIG)
+    val packed = copied_in(p, regs[2], regs[3])?
+    val args = unpacked(packed.view())?
+    val env = copied_in(p, regs[4], regs[5])?
+    if env.len() > 0 && env.at(env.len() - 1) != 0 then return Err(EINVAL)
+
+    val image = fs.read_executable(p.cwd[0..<p.cwd_len], path[0..<usize(path_len)], sched.cred_of(p))?
+    var l = load(image.bytes.view()) match
+        Ok(l) -> l
+        Err(e) -> return Err(errno_of(e))
+    val sp = lay_out_args(&l.space, args.view(), env.view()) match
+        Some(sp) -> sp
+        None ->
+            mm.free_space(&l.space)
+            return Err(E2BIG)
+
+    // Nothing can fail from here on: the new image takes the old one's place.
+    var old = p.space
+    val t = sched.current()
+    val flags = cpu.irq_save()
+    p.space = l.space
+    t.ttbr0 = mm.ttbr0_of(&p.space)
+    sched.load_ttbr0(t.ttbr0)
+    cpu.irq_restore(flags)
+    mm.free_space(&old)
+    p.heap_base = l.heap_base
+    p.brk = l.heap_base
+    p.uid = image.run_as.uid
+    p.gid = image.run_as.gid
+    p.env = sched.env_of(env.view())
+    replace_regs(regs, fresh_regs(l.entry, sp, 0))
+    Ok(0)
+
+// `len` bytes from the caller's `va`.
+private copied_in(p: *Process, va: u64, len: u64) -> Result[Buf[u8], Errno]
+    var bytes: Buf[u8] = buf()
+    for _ in 0..<len
+        bytes.push(0)
+    if len > 0 && !mm.copy_from_user(&p.space, va, bytes.view()) then return Err(EFAULT)
+    Ok(bytes)

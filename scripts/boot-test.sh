@@ -64,6 +64,13 @@ before_user_line=(
     "user: echo one two"    # a program started with arguments got them, through sysl's main(args)
     "keel: argv ok"         # ...and 600 of them, more than fit at the top of the stack, were refused
     "keel: processes reclaimed"    # every frame, table and ASID the processes had came back
+    "user: fork ok"         # fork answered 0 and the child's pid; the child's writes stayed its own (milestone 15a)
+    "user: cow ok"          # the parent's writes after the fork stayed its own; both sides copied every page
+    "user: fork loop ok"    # 64 forks, each child writing a page and exiting with a status the parent waited for
+    "user: exec echo ok"    # a forked child execve'd /bin/echo with argv and an environment
+    "user: exec ok"         # /bin/env through a pipe saw the environment; /bin/false's 1; a failed execve's ENOENT
+    "keel: forktest exited 0"
+    "keel: fork frames reclaimed"  # every frame the forked children shared or copied came back, and every ASID
     "keel: fs smp ok"       # one process per core wrote, read back, removed a file of its own, synced
     "user: hello.txt says hello from the disk"   # a sysl program read a file mkfs put on the disk
     "user: write ok"        # ...wrote /out.txt (12 blocks, the indirect one too), reopened it, read it back
@@ -272,7 +279,7 @@ not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login e
     "keel: processes left unreaped" "keel: processes still running before init")
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
-    init sh mkdir rm rmdir mv false ppid orphan udpecho login su id whoami chmod chown env wc grep head true)
+    init sh mkdir rm rmdir mv false ppid orphan udpecho login su id whoami chmod chown env wc grep head true forktest)
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
 frames_min=65000

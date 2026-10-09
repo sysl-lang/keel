@@ -46,6 +46,8 @@ const SYS_CHOWN: u64 = 35       // chown(path, path_len, uid, gid) -> 0; root on
 const SYS_PIPE: u64 = 36        // pipe(*[2]u32) -> 0: the read end's descriptor, then the write end's
 const SYS_DUP2: u64 = 37        // dup2(old, new) -> new: `new` closed first if open, then the same as `old`
 const SYS_DUP: u64 = 38         // dup(old) -> the lowest free descriptor, now the same as `old`
+const SYS_FORK: u64 = 39        // fork() -> the child's pid in the parent, 0 in the child
+const SYS_EXECVE: u64 = 40      // execve(path, path_len, args, args_len, env, env_len) -> never on success
 
 // Descriptors are a table of what each one is: the console, a file, or one end of a pipe. A new
 // process's 0 to 2 are the console unless its parent gave it something else (`SpawnAttr`); a child is

@@ -4,14 +4,15 @@ import abi.keel.abi.{EINVAL, ENOSYS, EPERM, Errno, SYS_CHMOD, SYS_CHOWN, SYS_DUP
     SYS_GETUID, SYS_SETGID, SYS_SETUID, SYS_ACCESS, SYS_BRK, SYS_CHDIR, SYS_CLOSE,
     SYS_EXIT, SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR,
     SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN, SYS_STAT, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINK, SYS_WAIT,
-    SYS_WRITE, SYS_SOCKET, SYS_BIND, SYS_RECVFROM, SYS_SENDTO, SYS_SOCKCLOSE}
+    SYS_WRITE, SYS_SOCKET, SYS_BIND, SYS_RECVFROM, SYS_SENDTO, SYS_SOCKCLOSE, SYS_FORK, SYS_EXECVE}
 import keel.fs
 import keel.mm
 import keel.sched.Process
 
 // System calls (user/abi has the numbers): `svc #0` from EL0 arrives here with the saved registers, the
 // number in x8 and the arguments in x0 to x5; the answer goes back in x0, an error as its negative
-// errno.
+// errno. `regs` is the whole trap frame (user.sysl's `UserRegs`): `fork` copies it and `execve`
+// rewrites it.
 //
 // Every handler has the same shape — the process and its saved registers in, a `Result` out — and the
 // dispatch is a `match` on the number. A table of the handlers' addresses (`[5]*extern(*Process, *u64)
@@ -59,6 +60,8 @@ private[proc] system_call(regs: *u64)
         SYS_PIPE -> sys_pipe(p, regs)
         SYS_DUP2 -> sys_dup2(p, regs)
         SYS_DUP -> sys_dup(p, regs)
+        SYS_FORK -> sys_fork(p, regs)
+        SYS_EXECVE -> sys_execve(p, regs)
         else Err(ENOSYS)
     regs[0] = r match
         Ok(v) -> u64(v)

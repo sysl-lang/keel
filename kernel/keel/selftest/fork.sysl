@@ -1,0 +1,29 @@
+module keel.selftest
+
+// What milestone 15a is for: /bin/forktest forks, writes on both sides of copy-on-write pages, forks
+// 64 times in a loop, and forks children that execve other programs. The kernel starts it, waits, and
+// then counts: every frame its children shared and copied must have come back, and every ASID.
+
+import keel.heap
+import keel.mm
+import keel.proc
+
+forking()
+    val frames_before = mm.frames_free()
+    val blocks_before = heap.live()
+    proc.start_with("/bin/forktest", ["forktest"]) match
+        Ok(p) ->
+            proc.wait(p)
+            if proc.exited(p)
+                print("keel: forktest exited", proc.exit_code(p))
+            else
+                print(s"keel: forktest killed: ${proc.why(p)}")
+        Err(_) ->
+            print("keel: forktest did not load")
+            return
+    val frames_after = mm.frames_free()
+    if frames_after == frames_before && mm.asids_in_use() == 0 && heap.live() == blocks_before
+        print("keel: fork frames reclaimed")
+    else
+        print("keel: fork frames leaked: frames free", frames_after, "of", frames_before, "asids",
+            mm.asids_in_use(), "blocks live", heap.live(), "of", blocks_before)

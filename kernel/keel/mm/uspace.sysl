@@ -90,7 +90,7 @@ unmap_user_page(s: *Space, va: u64)
     val leaf: LeafDesc = cpu.from_word(*slot)
     *slot = 0
     flush_user_page(s, va)
-    free_frame(frame_of(frame_addr(leaf.oa)))
+    release_frame(leaf.oa)
     s.pages -= 1
 
 // Where `va` leads in this space, if it is mapped: the physical address of the byte, and whether a user
@@ -135,14 +135,15 @@ copy_to_user(s: *Space, va: u64, src: []const u8) -> bool
     true
 
 // Whether all of `len` bytes from `va` are user memory of this space — inside the user range with no
-// wrap around, every page mapped, and writable where `write` asks.
+// wrap around, every page mapped, and writable where `write` asks. A copy-on-write page is writable: it
+// is given its own frame here, before the kernel writes it, as the program's own write would have been.
 user_range(s: *Space, va: u64, len: u64, write: bool) -> bool
     if len == 0 then return true
     if va >= USER_STACK_TOP || len > USER_STACK_TOP - va then return false
     var page = va & ~(PAGE_SIZE - 1)
     while page < va + len
         val ok = user_translate(s, page) match
-            Some((_, writable)) -> writable || !write
+            Some((_, writable)) -> writable || !write || break_cow(s, page)
             None -> false
         if !ok then return false
         page += PAGE_SIZE
@@ -169,7 +170,7 @@ private free_level(table: PhysAddr, level: u64)
         if word == 0 then continue
         if level == 3
             val leaf: LeafDesc = cpu.from_word(word)
-            free_frame(frame_of(frame_addr(leaf.oa)))
+            release_frame(leaf.oa)
         else
             val d: TableDesc = cpu.from_word(word)
             free_level(frame_addr(d.next), level + 1)
@@ -177,7 +178,7 @@ private free_level(table: PhysAddr, level: u64)
 
 // The level-3 entry for `va`, adding the tables on the way down when `create` says so. None when a table
 // is missing and may not be added, or there is no frame for one.
-private leaf_slot(s: *Space, va: u64, create: bool) -> Option[*u64]
+private[mm] leaf_slot(s: *Space, va: u64, create: bool) -> Option[*u64]
     var t = table_of(s.root)
     var level: u64 = 0
     while level < 3
@@ -198,9 +199,9 @@ private leaf_slot(s: *Space, va: u64, create: bool) -> Option[*u64]
 private user_index(va: u64, level: u64) -> usize = usize((va >> (39 - 9 * level)) & 511)
 
 // A table (or any frame) through the kernel's linear map of RAM.
-private table_of(p: PhysAddr) -> *Table = ptr_cast(usize(u64(to_virt(p))))
+private[mm] table_of(p: PhysAddr) -> *Table = ptr_cast(usize(u64(to_virt(p))))
 
-private zeroed_frame() -> Option[PhysAddr]
+private[mm] zeroed_frame() -> Option[PhysAddr]
     alloc_frame() match
         Some(f) ->
             val pa = frame_addr(f)
@@ -217,7 +218,7 @@ private user_leaf(pa: PhysAddr, prot: UserProt) -> LeafDesc
     val uxn = if prot.exec then u1(0) else u1(1)
     LeafDesc(1, 1, Normal, 0, access, Inner, 1, 1, frame_of(pa), 0, 0, 0, 0, 1, uxn, 0, 0)
 
-private flush_user_page(s: *Space, va: u64) = cpu.flush_tlb_user_page(s.asid, va)
+private[mm] flush_user_page(s: *Space, va: u64) = cpu.flush_tlb_user_page(s.asid, va)
 
 // ASIDs: 8 bits (TCR_EL1.AS = 0), 0 kept for the kernel's empty TTBR0, so 255 processes at once. A
 // freed ASID is reused only after `free_space` flushed it from every core's TLB, so no generations.

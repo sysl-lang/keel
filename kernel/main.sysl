@@ -115,6 +115,7 @@ kmain(dtb_pa: u64) -> never
     if !selftest.mount()
         system_off()
     selftest.user()
+    selftest.forking()
     selftest.files()
 
     // Milestone 11: the network, from the kernel and then from a user program.
