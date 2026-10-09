@@ -18,8 +18,8 @@ module keel.mm
 //
 //   TTBR0 (the low half) holds an identity map of RAM only while the MMU is switched on, so the
 //   instructions after the switch can still be fetched at their physical addresses. kmain drops it
-//   first thing: TCR_EL1.EPD0 is set, so the low half has no translation table at all and every
-//   access there faults. It stays empty until user processes, which will each own a TTBR0 table.
+//   first thing: TTBR0 gets an empty table, so every access there faults for a kernel thread. A user
+//   process has a TTBR0 table of its own (uspace.sysl), which the scheduler switches in.
 //
 // The kernel is linked at KERNEL_BASE + its physical load address (link.ld), so a kernel virtual
 // address is its physical address plus KERNEL_BASE: one constant converts in either direction.

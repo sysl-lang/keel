@@ -973,6 +973,211 @@ are taken together), and keel's `Mutex` is not hot. Recorded for when it is.
 Clean form: `@align(n)` on a field (C's `_Alignas` on a member), and finding 29 fixed so the struct's
 size follows.
 
+## Milestone 6: user mode
+
+Findings 31-35 are against the newer prerelease `1a7aee7358` (module-level `volatile`, the
+`read_sysreg`/`dsb`/`isb` built-ins, dso_local externs on freestanding), which keel moved to at the
+start of the milestone after the milestone-5 boot test passed with it unchanged. Found while giving
+keel processes (`keel.proc`: a TTBR0 table and an ASID each, an ELF loader, `eret` to EL0 and back,
+four system calls) and writing five user programs in sysl (`user/`, a workspace beside the kernel).
+Ranked: 31 is silent — module storage the image never fills, read as zeros, found as a jump to
+address 0; 32 is the type a kernel most wants at its system-call boundary; 33 is how a kernel carries
+its first programs; 34 extends finding 23 to the one place a kernel abandons frames by design; 35 is
+minor. None was fixed here.
+
+## 31. Module storage whose initializer does not fold is filled by a `main` nothing calls, silently
+
+Milestone 6, the system-call table. The natural dispatch is a table of the handlers' addresses:
+
+    private type Call = *extern(*Process, *u64) -> i64
+    private val calls: [5]Call = [&sys_unknown, &sys_exit, &sys_write, &sys_getpid, &sys_brk]
+
+    system_call(regs: *u64)
+        val f = if regs[8] < 5 then calls[usize(regs[8])] else calls[0]
+        regs[0] = u64(f(current_process(), regs))
+
+It builds with no diagnostic, and the first `svc` from EL0 jumps to address zero:
+
+    keel: trap InstructionAbort esr=0x0000000086000006 elr=0x0000000000000000 far=0x0000000000000000
+
+The table is not static data. `sysl emit-llvm` shows `@keel.proc$calls = private global [5 x ptr]
+zeroinitializer`, and a `define dso_local i32 @main` storing the five addresses into it — a `main`
+the image never runs, because its entry is `_start` (packages.md § "When the image has a `main`": "calling
+it is the entry's job"). The same `main` already held two stores keel never noticed, because both
+happen to write zeros: `boot_maps = BootMaps(PhysAddr(0), PhysAddr(0))` (milestone 2) and
+`empty_root = PhysAddr(0)` (this milestone) — a constructor of a `new` type does not fold either.
+
+And keel has no point at which calling that `main` would be right. Before the MMU is on (in `_start`),
+`&sys_write` computes PC-relative to the *physical* address, which faults once the identity map is
+dropped (finding 13's rule, now for function addresses). After it (in kmain), `main` would overwrite
+`boot_maps`, which `keel_boot` filled with the MMU off and the secondaries read.
+
+C puts a function's address in `.data` with a relocation, and a constant struct in `.rodata`; the
+linker resolves both. Spec: packages.md says `main` is emitted "where there is something to do" and
+that an image with no top-level statements, no declared `main` and "no module `val` computed at run
+time" gets none — it does not say which initializers are computed at run time, and nothing reports
+that one is in an image that will never run it.
+
+Workaround (used): the dispatch is a `match` on the number, with no table.
+
+Clean form: an address of a function, and a constructor of a `new` type or a struct over constants,
+fold into the image like any other constant; and an image whose `entry` is not `main` but whose
+`main` has work in it is refused (or warned), naming the storage — the `build-c` refusal quoted in the
+org notes ("module storage an initializer fills before the program's own statements run. This artifact
+has no entry point to fill it in") applied to a linked freestanding image.
+
+## 32. No user-pointer type: a distinct type cannot take a parameter, and nothing marks a pointer's address space
+
+Milestone 6, `write(fd, buf, len)`. A system call's pointer argument is an address in *another*
+address space (the process's), which the kernel must check before it reads a byte. What sysl offers is
+a distinct integer, and it does the important half:
+
+    type UserAddr = new u64
+
+    val b = *a           error: '*' needs a pointer or a reference, not UserAddr
+    val q: *u8 = ptr_cast(a)
+                         error: 'ptr_cast' reads an address, and ulong is not address-width —
+                         convert it first, as 'ptr_cast(usize(n))'
+
+so a `UserAddr` cannot be read through by mistake. (The second message names the base, `ulong`, not
+`UserAddr`.) What it lacks:
+
+- **A typed one.** `UserPtr[T]`, so `copy_from_user[T]` knows the size and a `*Stat` argument stays
+  distinct from a `*u8` one, is refused:
+
+      type UserPtr[T] = new u64
+      error: 'UserPtr' takes type parameters, and only a transparent alias may — a 'new', 'within',
+      'where', 'wrapping' or '@export' type is one type of its own, with one range, one check and
+      one name in a header, so there is nothing for an argument to fill
+
+  A generic `struct UserPtr[T]` with one `u64` field is the fallback; it gives up the one-word
+  `new`'s arithmetic and conversions.
+- **Anything that knows the address belongs to another space.** `ptr_cast(usize(u64(a)))` launders
+  it in one line, and the control below is exactly that line. An ordinary `*T` built from a
+  register value is indistinguishable from one into kernel memory; Linux's `__user` is a checker
+  annotation (sparse) for the same reason.
+- **A fault-tolerant copy.** The check keel uses walks the process's own tables (`mm.user_translate`)
+  for every page of the buffer, then reads each through the kernel's linear map. The other design, a
+  copy that may fault and whose fault resumes at a fixup (Linux's exception table), needs a way to
+  name the faulting instruction's address from sysl and attach a recovery to it; `trap.probe` fakes
+  one load of it with a volatile load the handler steps over.
+
+Control: with `VALIDATE_USER_POINTERS = false` the write reads `buf` directly, and the bad-pointer
+program's first call brings the kernel down — `keel: trap translation fault level 2 ...
+far=0x0000000000001000`, power off, no `keel: bad pointer rejected`.
+
+Workaround (used): `UserAddr = new u64` for the argument, a page-table walk before any byte is read,
+and the bytes read through `to_virt` of the physical address the walk found — so the kernel never
+dereferences a user address at all.
+
+Clean form: a distinct type may take type parameters (`type UserPtr[T] = new u64`); and, further, a
+pointer qualifier for another address space that `ptr_cast` refuses to drop without a named
+conversion.
+
+## 33. A file's bytes cannot be named; `.incbin` works, against the directory the build was started in
+
+Milestone 6, carrying the user programs. The kernel has no file system yet, so the programs' ELF
+images go in its read-only data. sysl has no `include_bytes`. Assembly at the top of a file has the
+assembler's `.incbin`:
+
+    @section(".rodata.programs")
+    asm
+        [aarch64]
+            ".balign 8"
+            ".globl keel_prog_hello, keel_prog_hello_end"
+            "keel_prog_hello:"
+            ".incbin \"scratch/user/hello.elf\""
+            "keel_prog_hello_end:"
+        ...
+
+    extern keel_prog_hello: u8
+    extern keel_prog_hello_end: u8
+
+    hello() -> []const u8 = image(&keel_prog_hello, &keel_prog_hello_end)
+
+That works, with three costs. The path is resolved against the working directory of `sysl build`, not
+the source file: the same build started from `/tmp` fails
+
+    <inline asm>:19:9: error: Could not find incbin file 'scratch/user/hello.elf'
+    error: cannot compile inline asm
+
+and `--include-path <dir>` does not reach the assembler (same error), so `scripts/boot-test.sh` `cd`s to
+the repository's root first. The bytes are reached as two `extern`s and a subtraction, per image. And
+the build does not know the kernel depends on the file — it happens to recompile every time (a changed
+`hello.elf` did reach the next kernel build's `.rodata`), so nothing goes stale today, but nothing
+says it will not.
+
+Workaround (used): the `.incbin` block above, one pair of labels per program, built from the root.
+
+Clean form: `embed("path") -> []const u8` (Rust's `include_bytes!`, C23's `#embed`), a constant
+resolved against the file it is written in, with alignment, which the build tracks as an input.
+
+## 34. Leaving user mode abandons every frame between the exception and the entry, and nothing says so
+
+Milestone 6, `keel.proc`. A process's thread enters EL0 from `run` and comes back only when the
+process ends — by `exit`, a fault, or `kill` — from inside an exception handler three or four frames
+deeper on the same kernel stack (the vector code, `keel_trap`, `user_sync`, the system call). The
+return is a `longjmp`: `keel_leave_user` (module-level asm) restores the callee-saved registers and SP
+that `keel_enter_user` saved, and `enter_user` "returns" a second time with the status.
+
+    extern "keel_enter_user" enter_user(kernel: *sched.Context, entry: u64, sp: u64, arg: u64) -> u64
+    extern "keel_leave_user" leave_user(kernel: *sched.Context, status: u64) -> never
+
+Everything those frames hold is abandoned. Today they hold nothing counted, because `keel.trap` is
+`@no_alloc` and everything it reaches is checked through every call — but `@no_alloc` forbids
+*allocation*, not *holding a share*: a syscall handler that matched an `Option[&T]` field would take a
+count and leak it at every `exit`, silently (finding 23's mechanism). The asm `extern` declarations are
+the only statement of the contract, and neither says "returns twice" or "abandons its callers".
+
+Workaround (used): the abandoned path holds only raw pointers and scalars, by care; `run` (which does
+hold the process) is above the saved SP and returns normally.
+
+Clean form: finding 23's — a way to say a call abandons frames, so the frames it abandons are checked
+to hold no counts (or have them released); here, as an attribute on the `extern` that `leave_user`
+is, propagated to every function that can reach it, the shape `@no_alloc` already has.
+
+## 35. A runtime cannot call `main`, though on a freestanding image calling it is the entry's job (minor)
+
+Milestone 6, `user/rt`. A user program's statements are compiled into `main`, and its entry `_start`
+is the runtime's. The runtime's sysl half wanted to call `main` and pass its answer to `exit`:
+
+    extern "main" program_main() -> int
+    error: 'main' is where the platform starts this program, so an 'extern' may not name that symbol
+
+On a target whose `entry` is `_start` the platform starts at `_start`, and packages.md says calling
+`main` is the entry's job. Workaround (used): `_start` is `bl main; bl keel_user_finish` in assembly,
+and `keel_user_finish(code) -> never` is the sysl half. Clean form: allow it when the manifest's
+`entry` is not `main`.
+
+## What worked in milestone 6
+
+- **A user program is ordinary sysl.** `print`, `s"..."` interpolation, `val`/`var`, `loop`, a
+  `for` over a range, `*volatile u64` — all at EL0, built by `sysl build --target
+  aarch64-freestanding` with the program's own `targets` block naming `../user.ld` (linked at 4 MiB).
+  The runtime it needs is one 150-line module, `user/rt`: `_start` (three instructions), four `svc`
+  wrappers (an `asm` block each, `in nr : "x8"` / `out r : "x0"`), `putchar` line-buffered over
+  `write`, `exit` for `panic`, and a first-fit allocator over `brk`. `hello` is 2.5 KB of text.
+- **A workspace holds the kernel and the programs.** `workspace = ["kernel", "user/*"]`; `user/abi`
+  (the call numbers and errno values) is a member the kernel and the runtime both depend on with
+  `abi { workspace = true }`, so the two sides cannot disagree about a number; `user/rt`'s manifest
+  declares the `allocator` once for every program (with link.ld aliases, finding 19). Each program
+  states its own `codegen` and `targets` — only the root project's apply — which is right.
+- **The ELF loader's structs are sysl structs.** `ElfHeader` and `ProgramHeader` with `offsetof`
+  `@assert`s against the specification, read by a generic `read_at[T](bytes, at) -> Option[T]` that
+  copies into a zero-initialized `var out: T` byte by byte — no alignment assumption under
+  `strict_align`, the byte order aarch64's and ELF's alike. (`sysl.encoding.get_u32_le` is there for a
+  format of the other order.)
+- **`@no_alloc` held across the new trap path.** System calls, user faults and the kill check are
+  reached from `keel_trap`, and the module-level check went through all of `keel.proc`'s handlers and
+  the page-table code without a change.
+- **`*extern(A) -> R` spells a handler table**; only finding 31 stopped it.
+- **A `new` type for a user address** refuses `*a` and `ptr_cast(a)`, which is most of finding 32's
+  value already.
+- Controls: `TTBR0_SWITCH = false` in sched.sysl (TTBR0 loaded once, when a process starts) breaks the
+  preemption test — a spinner resumed on another core finds another process's pid in its own memory
+  (`keel: process 5 exited 3`), another takes a translation fault (`process 6 killed`), and `preempt
+  user wrong: spinners killed 2 of 4`. `VALIDATE_USER_POINTERS = false` is finding 32's control.
+
 ## What worked in milestone 5
 
 - **Starting a core is one PSCI call and six instructions of module-level asm.** `psci.cpu_on`

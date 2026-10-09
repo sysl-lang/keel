@@ -18,7 +18,7 @@ import keel.sched
 //       Called from inside such an exception, on the same stack, when the process is over: load what
 //       `keel_enter_user` saved and return from it with `status`. Every frame in between — the vector
 //       code's, `keel_trap`'s, the system call's — is abandoned, so none of them may hold a counted
-//       reference (FINDINGS.md 23); they are all in `@no_alloc` code that holds none.
+//       reference (FINDINGS.md 23, 34); they are all in `@no_alloc` code that holds none, by care.
 //
 // The offsets are `sched.Context`'s, which keel.sched's `@assert`s pin.
 asm

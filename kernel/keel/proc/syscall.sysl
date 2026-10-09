@@ -12,7 +12,7 @@ import sysl.sync.SpinLock
 // Every handler has the same shape — the process and its saved registers — and the dispatch is a
 // `match` on the number. A table of the handlers' addresses (`[5]*extern(*Process, *u64) -> i64` in a
 // module `val`) is the natural form, but its initializer is not folded into the image: it is computed
-// in a `main` that an image entered at `_start` never runs, so every entry read as null (FINDINGS.md 32).
+// in a `main` that an image entered at `_start` never runs, so every entry read as null (FINDINGS.md 31).
 private[proc] system_call(regs: *u64)
     val p = current_process()
     val r = regs[8] match
@@ -31,7 +31,8 @@ private sys_getpid(p: *Process, regs: *u64) -> i64 = i64(p.pid)
 
 // A user address: what a system call's pointer argument is. It is a number and nothing more — it has
 // no dereference, so the kernel cannot read through one by mistake; `user_bytes` checks it against the
-// process's own tables and answers where its bytes really are.
+// process's own tables and answers where its bytes really are. A typed `UserPtr[T]` is not spellable
+// as a distinct type (FINDINGS.md 32).
 type UserAddr = new u64
 
 // Off only to show what the check is for: with it off, `write` reads through whatever address the

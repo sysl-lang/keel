@@ -21,7 +21,7 @@ asm
 
 // Where `_start` goes with what `main` answered. `main` is called from the assembly because sysl code
 // may not name it: an `extern "main"` is refused as the platform's entry, even on a target whose entry
-// is `_start` (FINDINGS.md 36).
+// is `_start` (FINDINGS.md 35).
 @export("keel_user_finish")
 finish(code: int) -> never = exit(code)
 
