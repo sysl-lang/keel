@@ -2315,6 +2315,82 @@ Shapes to choose between: `exec(program, args, env) -> IoError` (answers only on
 `sysl_proc_exec` hook, with `fork` left out; or both, `fork` documented as for programs that own
 their whole runtime; or neither, with a target's own runtime the place for them, as now.
 
+## Milestone 15b: signals and job control
+
+## 69. The standard library has no signal surface, and `sysl.process` cannot put a child in a process group or give it the terminal
+
+Milestone 15b. keel now has POSIX-shaped signals (41 sigaction, 42 sigprocmask, 43 sigreturn, 44
+kill), process groups (45 setpgid, 46 getpgid) and a console foreground group (47 tcsetpgrp, 48
+tcgetpgrp). A sysl program can reach none of it through the standard library. `sysl.process` can
+send a signal to a `Child` it started (`Child.kill`, over the `sysl_proc_kill` hook, which keel.fsys
+now answers with SYS_KILL) and report `Signalled(n)` from `wait`; that is the whole surface. There is
+no way to install a handler, ignore a signal, block one, or start a child in a group of its own:
+
+    import sysl.process
+
+    process.on_signal(2, (n) -> print(n))
+    val c = process.start("/bin/sleep", ["1"], group = process.NewGroup)
+
+    $ sysl build -o p main.sysl
+    error: undefined function 'sysl.process.on_signal'
+    error: function 'sysl.process.start' declares no parameter named 'group' — it takes 'program',
+    'args', 'dir', 'env', 'stderr', 'timeout' and 'inherit_env'
+
+(`grep -rl sigaction` over the library finds only `sysl/posix/tty/mode.sysl`, whose comments explain
+why it installs no handler, and a C file.) The second half cost the shell its use of `sysl.process`:
+a job needs its own process group and must be the console's foreground group from its first
+instruction, or a Ctrl-C typed as it starts goes to the shell — so every command, the single ones
+included, now goes through keel's raw spawn with `SPAWN_SETPGROUP | SPAWN_FOREGROUND`, and the
+milestone-13 `env > f` line no longer exercises `sysl.process` at all.
+
+Whether the library should have either is partly design. A handler is the hard half: it runs between
+two instructions of whatever the program was doing, so almost nothing a sysl body ordinarily does is
+safe inside one — it may not allocate, release a counted reference that might reach zero, or print
+through a buffered writer — and `sysl/posix/tty/mode.sysl` already records a hang from exactly that.
+Rust's standard library has no handler API either (the `signal-hook` crate does, by a self-pipe and
+an atomic flag); Go's `os/signal` delivers to a channel rather than running user code in the handler.
+Process groups and the terminal are the easy half: posix_spawn has `POSIX_SPAWN_SETPGROUP`, Rust has
+`CommandExt::process_group`, Go `SysProcAttr.Setpgid`/`Foreground`.
+
+Stopgap (used): `rt.keel.user` — `sigaction(sig, handler, mask)`, `sigprocmask`, `kill`, `setpgid`,
+`getpgid`, `tcsetpgrp`, `tcgetpgrp`, `nanosleep`, `procs`, `poll` (a WNOHANG wait), and `spawn(…,
+group, foreground)`, ~70 lines; the restorer is a four-line top-of-file `asm` block in the runtime
+(`keel_sigreturn_trampoline`), its address taken through an `extern` variable as keel.trap takes its
+vector table's. A handler is a plain top-level function `(sig: u64)`, its address `u64(usize(&f))` —
+the kernel calls it with the signal in x0, which a scalar parameter receives.
+
+Shapes to choose between: a flag-setting surface only (`on_signal(sig) -> &Atomic[bool]`, or a
+`Stream` of signal numbers fed by a self-pipe), with the raw handler left to targets' runtimes; a
+`group`/`foreground` pair on `start` and `run` over a `sysl_proc_spawn` that takes them; or neither,
+with job control the business of a target's own runtime, as now.
+
+## What worked in milestone 15b
+
+- **The whole design fitted the existing shapes.** The signal state is a `&sync Signals` box beside
+  `env` (a `Process` built by value already sits close to the 16 KiB kernel stack at -O0), holding an
+  `IrqLock`, an `Atomic[u64]` pending set read lock-free on the way to EL0, and a `[32]Action` array;
+  a `&sync` box took all three. `keel_returning_to_user` is an `extern` from keel.trap exactly as
+  `keel_user_sync` is (FINDINGS 47), and Ctrl-C reaches keel.proc from keel.console the same way
+  (`keel_console_interrupt`), both for the `@no_alloc` check and because keel.proc imports
+  keel.console.
+- **The signal frame is `SigFrame`, declared once in keel.abi and `@assert`-pinned in keel.proc to
+  start with the trap frame's 34 words**, so pushing it is a word copy from the saved registers and
+  `sigreturn` a word copy back, with SPSR cut to NZCV. One `@assert(offsetof(...))` per seam was
+  enough to keep three declarations of one layout (keel.trap's `Frame`, keel.proc's `UserRegs`,
+  keel.abi's `SigFrame`) in step.
+- **A handler in a single-file program needs its storage `static`**: a function of the entry file
+  that reads an ordinary top-level `var` is a nested function and has no address (*"'on_signal' is a
+  nested function, so it has no address to take … A top-level function is what has an address"*);
+  with the counters declared `static var` it captures nothing and `&on_signal` is accepted. The
+  diagnostic said what to do.
+- **`match` over string literals** (`"KILL" -> 9`) read the signal names in `kill` and the shell
+  with no table.
+- **Every control failed its test**: a pipe read that ignores signals hangs `sigtest` at its
+  interrupted read; a `sigreturn` that restores x19-x30, SP, PC and flags but not x0-x18 makes the
+  interrupted read answer 2 bytes (the handler's leftover x0) instead of EINTR; and with the
+  foreground group never handed to a spawned job, Ctrl-C goes to the shell, which ignores it, and the
+  spinner runs on until the boot times out.
+
 ## What worked in milestone 15a
 
 - **One assembly entry serves both a new program and a forked child**: `keel_enter_user` now takes
