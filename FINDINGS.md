@@ -621,6 +621,220 @@ Clean form: a box of a type whose alignment exceeds the allocator's guarantee is
 boundary, by over-allocation or by an optional `aligned_alloc` member of the `allocator` block — or
 refused, naming the type and the allocator's alignment.
 
+## Milestone 4: kernel threads, a preemptive scheduler, locks
+
+Findings 21-26 are against the same prerelease (`census-34` at `7a59452170`), found while writing
+`keel.sched` (threads, the context switch, a round-robin scheduler preempted by the timer, `IrqLock`,
+`WaitQueue`, a blocking `Mutex[T]`) and its boot tests. Ranked: 21 and 22 are silent corruption of
+reference counts once threads are preemptive; 23 and 24 are silent leaks or a lock that stays held;
+25 has a cheap workaround; 26 is cosmetic. None was fixed here.
+
+## 21. The per-thread drain list the runtime asks a scheduler for cannot be supplied from sysl
+
+Milestone 4, `keel.sched`. memory.md § "On a freestanding target the worklist is asked for rather
+than assumed" says a release that reaches zero fetches the running task's drain list through a weak
+`__sysl_arc_reaper`, and a port that schedules defines it ("Define it in an RTOS port and `&sync T`
+means on that target what it means everywhere else"). keel is such a port: a thread preempted half
+way through draining would otherwise have its list taken over by the next thread. Written:
+
+    struct Reaper
+        head: *u8
+        draining: u8
+
+    @export("__sysl_arc_reaper")
+    arc_reaper() -> *Reaper = &this_cpu().current.reaper
+
+    sysl: error: clang failed (exit 1):
+    p1.elf.ll:6352:12: error: invalid redefinition of function '__sysl_arc_reaper'
+     6352 | define ptr @__sysl_arc_reaper() #99 {
+
+The weak default is emitted into the program's own module (`define weak ptr @__sysl_arc_reaper()`
+returning `@arc.reaper.self`), so a sysl definition is a second `define` of the same name in the same
+IR — finding 19's shape, for a hook whose only documented implementation is C. Every release path
+calls it (`arc.reap`), plain `&T` as well as `&sync T`.
+
+Without a definition nothing fails: one global list serves every thread, and a preemption inside a
+drain corrupts it later.
+
+Workaround (used): keel.sched exports `keel_arc_reaper` and `link.ld` assigns
+`__sysl_arc_reaper = keel_arc_reaper;`, which wins over the weak definition (the two `bl`s in the
+image go to keel's). Free, but only because keel has a linker script.
+
+Clean form: the weak default goes into a separately compiled object (as `extern exit` does, finding
+19), or is not emitted when the program defines the symbol; or the hook is named in the manifest
+(`runtime { reaper = "..." }`), like the allocating pair.
+
+## 22. The `&sync` capture check stops at module storage: a `&T` in a module `var` reaches every thread
+
+Milestone 4, probing what a spawned closure may touch. The check on a `&sync Fn` is good (see "What
+worked"): capturing a `&Cell` is refused at the closure. But the same `&Cell` held in module storage
+is reached from two threads with no complaint:
+
+    private struct Cell
+        n: u64
+
+    private var shared: Option[&Cell] = None
+
+    module_probe()
+        shared = Some(Cell(2))
+        join(spawn(() -> touch_shared()))
+        join(spawn(() -> touch_shared()))
+
+    private touch_shared()
+        shared match
+            Some(c) -> c.n += 1               // a non-atomic retain and release, from either thread
+            None -> ()
+
+builds for aarch64-freestanding with no diagnostic. The `match` takes a share of the non-atomic count
+on each thread, which is exactly the race memory.md § "Crossing a concurrency domain" says `&T` may
+not have ("a `&T` may not leave its domain"). declarations.md says a module `var` "is one object the
+whole program shares, which is what makes it the thing two threads can disagree about", and stops
+there; `@thread_local` is the only module-storage rule.
+
+A kernel's shared state is module storage (keel's run queue, per-core records, allocator state), so
+this is the case that matters most there. keel's own globals hold only raw pointers, scalars and
+`sysl.sync` types, by care rather than by check.
+
+Clean form: a module `var` whose type reaches a non-atomic count is refused (or warned) when a body
+reachable from a `&sync Fn` or a `@crossing` parameter names it — or, more simply, a module `var` in
+a program that ever crosses a domain must hold only crossable types, `@thread_local` excepted.
+
+## 23. A frame abandoned by a context switch keeps every count it holds, silently
+
+Milestone 4, the thread entry. A thread ends by calling `exit() -> never`, which switches away and is
+never switched back to; its stack is freed. Written the natural way:
+
+    thread_entry(t: *Thread) -> never
+        ...
+        t.entry match
+            Some(f) ->
+                f()
+                exit()                       // the share of `f` the match took is never released
+            None -> exit()
+
+the boot test reports `keel: threads leaked: ... blocks live 16 of 3`: thirteen heap blocks (the
+closures and what they captured) for the nine test threads. No diagnostic: calling a `-> never` function is
+treated like a trap, which statements.md § `defer` says "runs nothing". That is right for `panic`; a
+kernel's `exit` is the ordinary end of a thread's life, and the frame is gone for good.
+
+The same rule shapes the scheduler: every local holding a count across `keel_switch` is held for as
+long as that thread is switched out, and for ever by a thread that exits. So the run queue and the
+wait queues are intrusive lists of raw `*Thread` linked through a `next` field, and a thread keeps its
+own `&sync Thread` box alive through a `me` self-reference that `join` drops — the counted
+alternative (`next: Option[&sync Thread]`) would put retains and releases on the switch path, where
+this finding makes them leak.
+
+Workaround (used): the closure is called from a helper, `run(t)`, that returns before `exit()` is
+called, so the frame that calls `exit` holds nothing counted; the scheduler's queues hold raw pointers.
+
+Clean form: a way to say a call abandons the frame (an attribute on `exit`, or a `become`-like form)
+so the frame's counts are released and its `defer`s run before it; or at least a warning when a frame
+holding counts calls a `-> never` function that is not a trap.
+
+## 24. A lock guard's `Drop` never runs, and the warning the reference promises for it is not emitted
+
+Milestone 4, `Mutex[T]`. The natural guard is a value whose destructor unlocks:
+
+    struct MGuard
+        m: *Mutex[u64]
+
+    impl Drop for MGuard
+        drop(self)
+            print("probe: guard dropped")
+            self.m.unlock()
+
+    guard_of(m: *Mutex[u64]) -> MGuard
+        val _ = m.lock()
+        MGuard(m)
+
+    guard_probe()
+        var m = mutex(u64(0))
+        if true
+            val g = guard_of(&m)
+            print("probe: guard held", usize(g.m) != 0)
+        print("probe: scope left")
+
+prints `probe: guard held true`, `probe: scope left`, and never `guard dropped`: the mutex stays
+locked. That much is the documented model (memory.md: a destructor runs when a *box's* count reaches
+zero), and boxing a guard costs an allocation per lock, which `@no_alloc` code such as the IRQ path
+cannot make. But memory.md also says "The compiler says so now": `warning: 'open_bad' hands back
+'Encoder' by value, and 'Encoder' has a 'Drop' ...`. The self-hosted prerelease emits no such
+warning for `guard_of`, nor for memory.md's own `open_bad() -> Encoder` built for the host — a
+documented check that is absent (a bug, not a gap).
+
+So keel's `Mutex[T]` is `lock(*self) -> *T` plus `defer m.unlock()`, as `sysl.posix.threads.Mutex`
+is. It works, and nothing ties the `*T` to the hold: `val p = m.lock(); m.unlock(); *p += 1`
+compiles.
+
+Workaround (used): `defer m.unlock()` beside every `lock`; `IrqLock.lock()` answers the saved
+interrupt mask, which the caller passes back to `unlock`.
+
+Clean form: the warning restored; and a scoped form for a guard — a value whose `Drop` runs at the
+end of its block when it was never boxed or moved, or a `with`-style borrow that hands the body a
+reference which cannot outlive it.
+
+## 25. `@thread_local` is refused on a freestanding target even where the program owns the thread pointer
+
+Milestone 4, per-thread data. keel writes TPIDR_EL1 itself (each core's record) and could lay down a
+TLS block per thread and point a thread register at it on every switch. sysl does not let it say so:
+
+    @thread_local var per_thread: u64 = 0
+
+    error: 'keel.probe.per_thread' cannot be '@thread_local' on 'aarch64-freestanding': there is no
+    loader and no libc on this target, so nothing lays a thread's storage down and nothing writes the
+    thread pointer the offset would be read from. Declare it as a plain module 'var' and let the port's
+    scheduler answer for which task is running, which is what the ownership runtime's reaper slot does
+
+The message's advice is what keel does, and it works: per-thread data are fields of `Thread`, reached
+through `sched.current()` (one `mrs tpidr_el1` and two loads). But a kernel *is* the thing that
+writes the thread pointer, and has no way to tell the compiler which register (LLVM's
+`-mtp=el1`/`tpidr_el1`) or how big a thread's block is (the `.tdata`/`.tbss` image size), so every
+per-thread variable is a field added to one struct in the scheduler.
+
+Clean form: a target or manifest key that says the program supplies the thread pointer (register,
+and the symbols bounding the TLS image), after which `@thread_local` compiles to TPIDR-relative
+accesses and the scheduler copies the image per thread.
+
+## 26. An exported function may not be `private`, though its only caller is assembly in the same module (minor)
+
+    @export("keel_thread_entry")
+    private thread_entry(t: *Thread) -> never
+
+    error: 'keel.sched.thread_entry' is private, which promises every caller is inside its own module —
+    and an export promises the opposite. A definition cannot make both claims
+
+Its only caller is `keel_thread_start`, top-of-file asm in `keel.sched` itself, which reaches sysl only
+through a symbol. The same holds for `keel_trap` and `keel_arc_reaper`. Workaround: not `private`, so
+the module's public surface carries three functions nothing in sysl may call.
+
+Clean form: an `@export` may stay `private` (the symbol is for the linker, not for sysl), or the
+module's own asm may name a private function's symbol.
+
+## What worked in milestone 4
+
+- **`&sync Fn() -> unit` is the right type for a thread's body, and its capture check is exact.**
+  Capturing a `&Cell` is refused at the closure ("the 'c' it captures reaches a '&keel.selftest.Cell',
+  whose count is not. Hold it as a '&sync keel.selftest.Cell'"); capturing a `&sync` struct holding
+  `Atomic`s, arrays and plain fields works, and mutating through it works. The check also looks
+  inside a generic: `&sync Mutex[&Cell]` is refused at its declaration because the mutex's private
+  `value` reaches a `&Cell`. `@crossing(f)` on `spawn` adds nothing once `f` is a `&sync Fn`: removed,
+  the same closure is refused the same way.
+- **The context switch is 17 instructions of top-of-file asm** called through an ordinary
+  `extern "keel_switch" switch_context(from: *Context, to: *Context)`, plus 3 for a new thread's first
+  return; `Context`'s offsets are `@assert`ed as `Frame`'s are (finding 7 still means writing them
+  twice). Everything else — run queue, lock handover, preemption, wait queues, `Mutex[T]`, stacks with
+  guard pages mapped into a window of their own — is sysl.
+- **`@no_alloc` on `keel.trap` checked the whole preemption path**: `preempt`, `switch_locked`,
+  `finish_switch` and the wait-queue wakes are reached from the IRQ handler and proven allocation-free.
+- **`defer m.unlock()`** inside a loop body releases on every iteration, which is what the mutex test's
+  40,000 locks rely on.
+- A thread's `&sync Thread` box, its stack from the frame allocator, and its closure all come back once
+  it is joined (`keel: threads reclaimed`), and the controls show each half: no `free_stack` leaves 36
+  frames and 9 stacks behind; finding 23's natural `exit` leaks 13 blocks.
+- `sysl.sync.Atomic` and `SpinLock` were enough for every scheduler structure; the only new asm
+  wrappers are TPIDR_EL1 (read, write), MPIDR_EL1, a broadcast `tlbi vaae1is`, a table-publishing
+  `dsb ishst; isb`, and `yield` (findings 10 and 14's pattern, six functions, ten instructions).
+
 ## What worked in milestone 3
 
 - **sysl's own allocation in the kernel**: `Buf[u64]` grown to 10,000 elements, an interpolated
