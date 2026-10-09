@@ -292,7 +292,8 @@ private run(s: usize, kind: u32, sector: u64) -> u8
         slots[s].waiters.sleep(&disk.lock)
     sh.status[s]
 
-private next_index(i: u16) -> u16 = u16((u32(i) + 1) & 0xffff)
+// The ring indices are free-running 16-bit counters, as sysl's `u16` arithmetic is.
+private next_index(i: u16) -> u16 = i + 1
 
 // The disk's interrupt, from keel.irq.dispatch (IRQ context, so under keel.trap's `@no_alloc`):
 // acknowledge it, then take every completion the used ring holds. Acknowledging first means a
