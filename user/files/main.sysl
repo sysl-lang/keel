@@ -1,9 +1,10 @@
 // The filesystem, from a program: read a file mkfs put on the disk, write one and read it back,
-// make, list, rename and remove directories and files — the error answers included — and say whether
+// make, list, rename and remove directories and files — the error answers included — move bytes through
+// a pipe with dup2 and dup, and say whether
 // the previous boot's /out.txt is still there. scripts/boot-test.sh boots twice on one disk image, so
 // the second boot finds the first one's file. Exits 0 only if every check passed.
 
-import abi.keel.abi.{Dirent, EEXIST, EINVAL, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, Errno, KIND_DIR, KIND_FILE,
+import abi.keel.abi.{Dirent, EBADF, EPIPE, EEXIST, EINVAL, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, Errno, KIND_DIR, KIND_FILE,
     O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY, SEEK_SET, Stat}
 import rt.keel.user
 import sysl.buf.{Buf, buf}
@@ -214,7 +215,39 @@ dirs() match
     Ok(_) -> if failures == before then print("user: dirs ok")
     Err(e) -> fail(s"directories: errno ${i64(e)}")
 
-// --- 4. What the previous boot wrote -----------------------------------------------------------------
+// --- 4. Pipes and descriptors ------------------------------------------------------------------------
+
+descriptors() -> Result[unit, Errno]
+    val (r, w) = user.pipe()?
+    // dup2 puts the write end exactly where it is asked; dup takes the lowest free descriptor.
+    check(user.dup2(w, 9)? == 9, "dup2 did not answer its target")
+    val d = user.dup(r)?
+    check(d < 9 && d != r && d != w, s"dup answered $d")
+    check(user.write_file(9, "through nine".bytes)? == 12, "a write through dup2's descriptor fell short")
+    user.close(w)?
+    user.close(9)?
+    var room: [32]u8 = [0; 32]
+    val n = user.read(d, room[..])?
+    check(n == 12 && room[0..<12] == "through nine".bytes, "the pipe did not hand back what went in")
+    // Both of its read ends are open, its write ends are all closed: the end of the input.
+    check(user.read(r, room[..])? == 0, "no end of input once every write end closed")
+    user.close(r)?
+    user.close(d)?
+    refused(user.close(d), EBADF, "closing a closed descriptor")
+
+    // With every read end closed, a write is refused.
+    val (r2, w2) = user.pipe()?
+    user.close(r2)?
+    refused(user.write_file(w2, "x".bytes), EPIPE, "a write with no reader")
+    user.close(w2)?
+    Ok(())
+
+val before_pipes = failures
+descriptors() match
+    Ok(_) -> if failures == before_pipes then print("user: pipes ok")
+    Err(e) -> fail(s"pipes: errno ${i64(e)}")
+
+// --- 5. What the previous boot wrote -----------------------------------------------------------------
 
 previous match
     Some(b) ->

@@ -68,6 +68,7 @@ before_user_line=(
     "user: hello.txt says hello from the disk"   # a sysl program read a file mkfs put on the disk
     "user: write ok"        # ...wrote /out.txt (12 blocks, the indirect one too), reopened it, read it back
     "user: dirs ok"         # mkdir, getdents, rename (into and out of directories), unlink, rmdir, errors
+    "user: pipes ok"        # pipe, dup2 to 9, dup, the end of input, EBADF, EPIPE (milestone 13)
 )
 after_user_line=(
     "keel: cp ok"           # cp, written with sysl.fs, copied /hello.txt to /m9, and cmp found the copy the same
