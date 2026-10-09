@@ -1384,6 +1384,10 @@ target that does not declare it.
 
 ## 41. An integer that is not one of an enum's values traps on conversion, and there is no conversion that answers instead
 
+**WITHDRAWN (2026-10-08): the premise is wrong.** sysl has the fallible conversion: `E.try(n)`
+(`reference/errors.md`, lowered by `emit_enum.sysl`'s `gen_enum_try`) answers instead of trapping. The
+user runtime should use `Errno.try(n)`; what follows is kept as the record of the probe.
+
 Milestone 8, the system-call boundary. The kernel's errors are `abi.Errno`, an `enum Errno: i64` with
 Linux's numbers (`ENOENT = 2`, …); the kernel answers `-i64(e)` and that direction is clean. The user
 runtime turns the answer back:
