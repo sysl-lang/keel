@@ -1,0 +1,34 @@
+module keel.selftest
+
+// What milestone 6 is for, run by kmain after the SMP tests: user programs, each in an address space of
+// its own at EL0, reaching the kernel only through system calls — and a program that misbehaves ending
+// alone, with the kernel carrying on.
+
+import keel.heap
+import keel.mm
+import keel.proc
+import keel.sched
+import keel.trap
+import sysl.sync.{Atomic, Ordering}
+
+user()
+    val frames_before = mm.frames_free()
+    hello_process()
+
+// --- Hello ----------------------------------------------------------------------------------------
+//
+// The first process prints through `write` (the line is the program's own) and exits 0.
+
+private hello_process()
+    proc.start(proc.hello()) match
+        Ok(p) ->
+            proc.wait(p)
+            report(p)
+        Err(e) -> print("keel: hello did not load")
+
+// "keel: process <pid> exited <code>", or "keel: process <pid> killed: <why>".
+private report(p: &sync sched.Process)
+    if proc.exited(p)
+        print("keel: process", proc.pid(p), "exited", proc.exit_code(p))
+    else
+        print(s"keel: process ${proc.pid(p)} killed: ${proc.why(p)}")

@@ -1,0 +1,114 @@
+module keel.proc
+
+import abi.keel.abi.{EBADF, EFAULT, ENOSYS, STDERR, STDOUT, SYS_BRK, SYS_EXIT, SYS_GETPID, SYS_WRITE}
+import keel.mm
+import keel.pl011.put_byte
+import keel.sched.Process
+import sysl.sync.SpinLock
+
+// System calls (user/abi has the numbers): `svc #0` from EL0 arrives here with the saved registers, the
+// number in x8 and the arguments in x0 to x5; the answer goes back in x0.
+//
+// Every handler has the same shape — the process and its saved registers — and the dispatch is a
+// `match` on the number. A table of the handlers' addresses (`[5]*extern(*Process, *u64) -> i64` in a
+// module `val`) is the natural form, but its initializer is not folded into the image: it is computed
+// in a `main` that an image entered at `_start` never runs, so every entry read as null (FINDINGS.md 32).
+private[proc] system_call(regs: *u64)
+    val p = current_process()
+    val r = regs[8] match
+        SYS_EXIT -> sys_exit(p, regs)
+        SYS_WRITE -> sys_write(p, regs)
+        SYS_GETPID -> sys_getpid(p, regs)
+        SYS_BRK -> sys_brk(p, regs)
+        else -ENOSYS
+    regs[0] = u64(r)
+
+private sys_exit(p: *Process, regs: *u64) -> i64
+    p.exit_code = i64(regs[0])
+    end(p, 0)
+
+private sys_getpid(p: *Process, regs: *u64) -> i64 = i64(p.pid)
+
+// A user address: what a system call's pointer argument is. It is a number and nothing more — it has
+// no dereference, so the kernel cannot read through one by mistake; `user_bytes` checks it against the
+// process's own tables and answers where its bytes really are.
+type UserAddr = new u64
+
+// Off only to show what the check is for: with it off, `write` reads through whatever address the
+// program passed, and a bad one is a fault in the kernel.
+private const VALIDATE_USER_POINTERS: bool = true
+
+// write(fd, buf, len): the bytes go to the console. Every page of the buffer is checked against the
+// process's translation tables first — mapped, and mapped for the user — so a bad pointer anywhere in
+// it answers EFAULT and prints nothing, rather than faulting in the kernel or printing kernel memory.
+private sys_write(p: *Process, regs: *u64) -> i64
+    val fd = regs[0]
+    val buf = UserAddr(regs[1])
+    val len = regs[2]
+    if fd != STDOUT && fd != STDERR then return -EBADF
+    if len == 0 then return 0
+
+    if !VALIDATE_USER_POINTERS
+        for i in 0..<len
+            val b: *u8 = ptr_cast(usize(u64(buf) + i))
+            put_byte(*b)
+        return i64(len)
+
+    if !user_readable(&p.space, buf, len) then return -EFAULT
+    console.lock()
+    var done: u64 = 0
+    while done < len
+        val va = u64(buf) + done
+        val chunk = min(len - done, mm.PAGE_SIZE - (va & (mm.PAGE_SIZE - 1)))
+        val (pa, _) = mm.user_translate(&p.space, va) match
+            Some(t) -> t
+            None -> (mm.PhysAddr(0), false)
+        val src: *u8 = ptr_cast(usize(u64(mm.to_virt(pa))))
+        for i in 0..<chunk
+            put_byte(src[usize(i)])
+        done += chunk
+    console.unlock()
+    i64(len)
+
+// One write's bytes stay together on the console, whichever cores are writing.
+private var console: SpinLock = SpinLock(0)
+
+// Whether all of `len` bytes from `addr` are user memory of this space: inside the user range with no
+// wrap around, and every page they touch mapped.
+private user_readable(s: *mm.Space, addr: UserAddr, len: u64) -> bool
+    val a = u64(addr)
+    if a >= mm.USER_STACK_TOP || len > mm.USER_STACK_TOP - a then return false
+    var page = a & ~(mm.PAGE_SIZE - 1)
+    while page < a + len
+        val mapped = mm.user_translate(s, page) match
+            Some(_) -> true
+            None -> false
+        if !mapped then return false
+        page += mm.PAGE_SIZE
+    true
+
+private min(a: u64, b: u64) -> u64 = if a < b then a else b
+
+// brk(addr): move the end of the heap to `addr`, mapping fresh zeroed pages or giving pages back, and
+// answer the end as it now is — unchanged when `addr` is outside [heap start, heap limit] or memory ran
+// out, which is how a caller tells. brk(0) asks where it is.
+private sys_brk(p: *Process, regs: *u64) -> i64
+    val want = regs[0]
+    if want < p.heap_base || want > mm.heap_limit() then return i64(p.brk)
+    val old_top = page_up(p.brk)
+    val new_top = page_up(want)
+    var va = old_top
+    while va < new_top
+        mm.map_user_page(&p.space, va, mm.UserProt(true, false)) match
+            Some(_) -> va += mm.PAGE_SIZE
+            None ->
+                while va > old_top
+                    va -= mm.PAGE_SIZE
+                    mm.unmap_user_page(&p.space, va)
+                return i64(p.brk)
+    va = new_top
+    while va < old_top
+        mm.unmap_user_page(&p.space, va)
+        va += mm.PAGE_SIZE
+    p.brk = want
+    i64(want)

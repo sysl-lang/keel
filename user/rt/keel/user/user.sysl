@@ -1,0 +1,149 @@
+module keel.user
+
+// A user program's runtime on keel.
+//
+// The kernel enters a program at `_start`, at EL0, with SP_EL0 at the top of the stack it mapped and
+// every other register zero. `_start` calls the program — sysl's `main`, which fills the module storage
+// and runs the entry file's statements — and ends the process with whatever `main` answered.
+
+import abi.keel.abi.{STDOUT, SYS_BRK, SYS_EXIT, SYS_GETPID, SYS_WRITE}
+import sysl.slices.as_ptr
+
+@section(".text.start")
+asm
+    [aarch64]
+        ".globl _start"
+        "_start:"
+        "bl main"
+        "bl keel_user_finish"
+        "brk #0"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// Where `_start` goes with what `main` answered. `main` is called from the assembly because sysl code
+// may not name it: an `extern "main"` is refused as the platform's entry, even on a target whose entry
+// is `_start` (FINDINGS.md 36).
+@export("keel_user_finish")
+finish(code: int) -> never = exit(code)
+
+// The system calls, one `svc` each. The kernel preserves every register but x0.
+
+write(fd: u64, buf: *u8, len: u64) -> i64
+    val nr = SYS_WRITE
+    var r: i64 = 0
+    asm
+        [aarch64]
+            "svc #0"
+            in nr : "x8"
+            in fd : "x0"
+            in buf : "x1"
+            in len : "x2"
+            out r : "x0"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    r
+
+getpid() -> u64
+    val nr = SYS_GETPID
+    var r: u64 = 0
+    asm
+        [aarch64]
+            "svc #0"
+            in nr : "x8"
+            out r : "x0"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    r
+
+brk(addr: u64) -> u64
+    val nr = SYS_BRK
+    var r: u64 = 0
+    asm
+        [aarch64]
+            "svc #0"
+            in nr : "x8"
+            in addr : "x0"
+            out r : "x0"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    r
+
+sys_exit(code: u64) -> never
+    val nr = SYS_EXIT
+    asm
+        [aarch64]
+            "svc #0"
+            in nr : "x8"
+            in code : "x0"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    loop
+        asm
+            [aarch64] "brk #1"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// Write a string to standard output, all of it unless the kernel refuses.
+put(s: string) -> i64 = write_bytes(STDOUT, s.bytes)
+
+// `write` over a byte view.
+write_bytes(fd: u64, bytes: []const u8) -> i64 = write(fd, as_ptr(bytes), u64(bytes.len))
+
+// The standard library's `print` writes through C's `putchar`. A system call per byte would be slow,
+// so bytes collect in a line and go to the kernel at a newline or when the line is full.
+private const LINE: usize = 256
+private var line: [LINE]u8
+private var used: usize = 0
+
+@export("putchar")
+putchar(c: int) -> int
+    line[used] = u8(c & 0xff)
+    used += 1
+    if c == 10 || used == LINE then flush()
+    c
+
+// Hand whatever `print` has collected to the kernel.
+flush()
+    if used == 0 then return
+    val _ = write(STDOUT, &line[0], u64(used))
+    used = 0
+
+// The standard library's `exit`, which `panic` and a failed `unwrap` end in, and where `_start` ends.
+@export("exit")
+exit(code: int) -> never
+    flush()
+    sys_exit(u64(code))
+
+// The heap: blocks carved from the region `brk` grows, each with a 16-byte header holding its size,
+// and a free list searched first fit. Freed blocks are reused, never returned to the kernel.
+private struct Header
+    size: usize                 // the whole block, header included
+    next: *Header               // the next free block, while this one is free
+
+private const HEADER: usize = 16
+@assert(sizeof(Header) == 16, "a block header is 16 bytes, so the bytes after it stay 16-aligned")
+
+private var free_list: *Header = null
+private var heap_end: u64 = 0
+
+@export("keel_user_alloc")
+alloc(n: usize) -> *u8
+    val need = (n + HEADER + 15) & ~usize(15)
+    var prev: *Header = null
+    var h = free_list
+    while h != null
+        if h.size >= need
+            if prev == null then free_list = h.next else prev.next = h.next
+            return ptr_cast(usize(h) + HEADER)
+        prev = h
+        h = h.next
+    if heap_end == 0 then heap_end = brk(0)
+    val start = heap_end
+    val want = start + u64(need)
+    if brk(want) != want then return null
+    heap_end = want
+    val b: *Header = ptr_cast(usize(start))
+    b.size = need
+    b.next = null
+    ptr_cast(usize(start) + HEADER)
+
+@export("keel_user_free")
+free(p: *u8)
+    if p == null then return
+    val h: *Header = ptr_cast(usize(p) - HEADER)
+    h.next = free_list
+    free_list = h

@@ -27,6 +27,7 @@ module keel.sched
 
 import keel.cpu
 import keel.gic
+import keel.mm
 import sysl.sync.{Atomic, Ordering, SpinLock}
 
 const MAX_CPUS: usize = 4
@@ -84,7 +85,7 @@ init()
     c.reaper = Reaper(null, 0)
 
     val boot: &sync Thread = Thread(Context([0; 12], 0, 0), next_id.add(1), Running, null, None, None, None,
-        empty_wait_queue(), Reaper(null, 0), 0)
+        empty_wait_queue(), Reaper(null, 0), 0, null, 0)
     val bp: *Thread = &*boot
     bp.me = Some(boot)
 
@@ -111,7 +112,7 @@ init_secondary()
     cpu.set_tpidr(u64(usize(c)))
 
     val idle: &sync Thread = Thread(Context([0; 12], 0, 0), next_id.add(1), Running, null, None, None, None,
-        empty_wait_queue(), Reaper(null, 0), 0)
+        empty_wait_queue(), Reaper(null, 0), 0, null, 0)
     val ip: *Thread = &*idle
     ip.me = Some(idle)
 
@@ -181,6 +182,17 @@ private wake_an_idle_core()
             gic.send_sgi(gic.RESCHEDULE, c.id)
             return
 
+// Off only to show what it is for: without it a process resumed on a core keeps whatever address space
+// that core last loaded, and reads another process's memory at its own addresses.
+private const TTBR0_SWITCH: bool = true
+
+// Put a thread's address space in TTBR0: a process's table and ASID, or the kernel's empty table. The
+// kernel half is TTBR1's and does not change, so the code doing this keeps running; the ASID tags every
+// translation, so nothing is flushed.
+load_ttbr0(v: u64)
+    cpu.set_ttbr0(if v == 0 then mm.kernel_ttbr0() else v)
+    cpu.isb()
+
 // The reschedule interrupt's part: switch on the way out of it, if anything is ready.
 reschedule_requested()
     if !started then return
@@ -206,6 +218,7 @@ private[sched] switch_locked()
     c.last = prev
     c.slice = SLICE
     c.need_resched = false
+    if TTBR0_SWITCH && next.ttbr0 != prev.ttbr0 then load_ttbr0(next.ttbr0)
     switch_context(&prev.ctx, &next.ctx)
     finish_switch()
 

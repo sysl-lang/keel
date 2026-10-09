@@ -187,12 +187,14 @@ translate(va: VirtAddr) -> Option[(PhysAddr, u8)]
 // The attribute byte a device mapping must have: Device-nGnRE.
 const DEVICE_ATTR: u8 = u8(DEVICE_NGNRE)
 
-// Take the identity map away: no walks through TTBR0 at all, so the whole low half faults. Called
-// first thing in the high half, once nothing runs at a physical address any more.
+// Take the identity map away: TTBR0 gets the empty table kernel threads run with (uspace.sysl), so the
+// whole low half faults until a process's own table is switched in. Called first thing in the high
+// half, once nothing runs at a physical address any more — first by the boot core, which makes the
+// empty table, then by each secondary.
 drop_identity()
-    var t: Tcr = cpu.from_word(cpu.tcr())
-    t.epd0 = 1
-    cpu.set_tcr(cpu.to_word(t))
-    cpu.set_ttbr0(0)
+    if u64(empty_root) == 0
+        val (_, pa) = new_table()
+        empty_root = pa
+    cpu.set_ttbr0(kernel_ttbr0())
     cpu.isb()
     cpu.flush_tlb()

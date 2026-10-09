@@ -1,0 +1,20 @@
+// A keel user program's runtime: everything a sysl program needs from an operating system that the
+// standard library would otherwise take from a C library — an entry point, `putchar` for `print`,
+// `exit` for `panic`, and a heap — written over keel's system calls.
+
+package {
+  name    = "rt"
+  version = "0.0.1"
+}
+
+dependencies {
+  abi { workspace = true }
+}
+
+// The program's allocating pair: a heap grown with `brk`. The names are aliases user/user.ld defines
+// for `keel_user_alloc` and `keel_user_free` (naming an exported sysl function here declares and
+// defines one symbol twice, FINDINGS.md 19).
+allocator {
+  alloc = "keel_user_heap_alloc"
+  free  = "keel_user_heap_free"
+}

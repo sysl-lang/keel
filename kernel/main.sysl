@@ -108,6 +108,7 @@ kmain(dtb_pa: u64) -> never
     // something; now the others.
     print("keel: cores", smp.start())
     selftest.smp()
+    selftest.user()
     system_off()
 
 // Give the frame allocator every frame of RAM that the image and the device tree do not occupy. RAM's

@@ -1,0 +1,6 @@
+// keel's system call interface: what the kernel and a user program agree on.
+
+package {
+  name    = "abi"
+  version = "0.0.1"
+}

@@ -1,0 +1,108 @@
+module keel.proc
+
+import keel.cpu
+import keel.mm
+import keel.sched
+import keel.sched.{Context, Process}
+import sysl.sync.{Atomic, Ordering}
+
+// User processes: made from an ELF image, run by a kernel thread of their own, ended by `exit`, by a
+// fault, or by `kill`.
+//
+// The process's thread enters user mode from `run` and stays there: every system call, interrupt and
+// fault it takes is handled on its kernel stack, below `run`'s frame, and returns to EL0. When the
+// process ends, `keel_leave_user` (user.sysl) unwinds straight back to `run`, which drops the address
+// space from TTBR0 and returns, and the thread ends as any kernel thread does. Whoever started the
+// process `wait`s for it: that joins the thread and frees the address space.
+
+private var next_pid: Atomic[u64] = Atomic(1)
+
+// Load `image` and start it running. The process gets the next pid.
+start(image: []const u8) -> Result[&sync Process, LoadError]
+    val l = load(image)?
+    val p: &sync Process = Process(next_pid.add(1), l.space, l.heap_base, l.heap_base, Context([0; 12], 0, 0),
+        Atomic(0), 0, 0, None)
+    val raw: *Process = &*p
+    val entry = l.entry
+    p.thread = Some(sched.spawn(() -> run(raw, entry)))
+    Ok(p)
+
+// The process's thread: switch to its address space and enter it; come back when it is over.
+private run(p: *Process, entry: u64)
+    val t = sched.current()
+    val flags = cpu.irq_save()
+    t.process = p
+    t.ttbr0 = mm.ttbr0_of(&p.space)
+    sched.load_ttbr0(t.ttbr0)
+    cpu.irq_restore(flags)
+
+    val _ = enter_user(&p.kernel, entry, mm.USER_STACK_TOP, 0)
+
+    // Back from `keel_leave_user`, with IRQs masked as the exception left them.
+    t.process = null
+    t.ttbr0 = 0
+    sched.load_ttbr0(0)
+    cpu.enable_irqs()
+
+// Wait for the process to end, then give its address space back.
+wait(p: &sync Process)
+    p.thread match
+        Some(t) -> sched.join(t)
+        None -> ()
+    p.thread = None
+    val raw: *Process = &*p
+    mm.free_space(&raw.space)
+
+// Ask the process to end. It does at its next return to user mode — at the latest the next timer tick.
+kill(p: &sync Process) = p.kill.store(1, Ordering.Release)
+
+// How the process ended, as the boot test prints it: "exited <code>" or "killed: <why>".
+pid(p: &sync Process) -> u64 = p.pid
+exited(p: &sync Process) -> bool = p.fault == 0
+exit_code(p: &sync Process) -> i64 = p.exit_code
+was_killed_by_request(p: &sync Process) -> bool = p.fault == KILLED
+
+why(p: &sync Process) -> string = reason(p.fault)
+
+// The process the calling thread runs, or null for a kernel thread.
+private[proc] current_process() -> *Process = sched.current().process
+
+// `fault` for a process ended by `kill`. Any other non-zero `fault` is ESR_EL1's exception class
+// shifted left eight, with the fault status code (the low six bits of the ISS) below it.
+private const KILLED: u64 = 0xffff
+
+private reason(fault: u64) -> string
+    if fault == KILLED then return "killed"
+    val ec = fault >> 8
+    if ec == 0x20 || ec == 0x24
+        return (fault & 0x3f) >> 2 match
+            1 -> "translation fault"
+            2 -> "access flag fault"
+            3 -> "permission fault"
+            else "abort"
+    ec match
+        0x00 -> "undefined instruction"
+        0x07 -> "floating point access"
+        0x22 -> "pc alignment fault"
+        0x26 -> "sp alignment fault"
+        0x3c -> "breakpoint"
+        else "exception"
+
+// Called by the trap handler for a synchronous exception from EL0: a system call, or anything else,
+// which ends the process.
+user_sync(regs: *u64, ec: u64, iss: u64)
+    if ec == 0x15
+        system_call(regs)
+        returning_to_user()
+    else
+        end(current_process(), (ec << 8) | (iss & 0x3f))
+
+// Called on every way back to EL0 after the kernel had the processor: a process asked to end ends here.
+returning_to_user()
+    val p = current_process()
+    if p != null && p.kill.load(Ordering.Acquire) != 0 then end(p, KILLED)
+
+// End `p` — the calling thread's process — with `fault` (0: it exited).
+private[proc] end(p: *Process, fault: u64) -> never
+    p.fault = fault
+    leave_user(&p.kernel, fault)

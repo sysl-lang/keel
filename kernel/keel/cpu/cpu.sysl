@@ -184,6 +184,49 @@ flush_tlb_page(va: u64)
             in page : reg
         [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
 
+// Forget every core's cached translation of user page `va` in the address space tagged `asid`.
+flush_tlb_user_page(asid: u64, va: u64)
+    val arg = (asid << 48) | ((va >> 12) & 0xFFF_FFFF_FFFF)
+    asm
+        [aarch64]
+            "dsb ishst"
+            "tlbi vae1is, {arg}"
+            "dsb ish"
+            "isb"
+            in arg : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// Forget every core's cached translation tagged `asid`, before the ASID is given to another process.
+flush_tlb_asid(asid: u64)
+    val arg = asid << 48
+    asm
+        [aarch64]
+            "dsb ishst"
+            "tlbi aside1is, {arg}"
+            "dsb ish"
+            "isb"
+            in arg : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// Write the data cache line holding `addr` back as far as the point the instruction fetches see, for
+// code the kernel copied in through a data mapping.
+clean_dcache_line_pou(addr: u64)
+    asm
+        [aarch64]
+            "dc cvau, {addr}"
+            in addr : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// Discard every core's instruction cache, after `clean_dcache_line_pou` over new code, and refetch.
+sync_icache()
+    asm
+        [aarch64]
+            "dsb ish"
+            "ic ialluis"
+            "dsb ish"
+            "isb"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
 // Make translation table writes visible to the walker before the next instruction uses them.
 publish_tables()
     asm

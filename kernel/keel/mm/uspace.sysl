@@ -1,0 +1,211 @@
+module keel.mm
+
+import keel.cpu
+import sysl.sync.SpinLock
+
+// User address spaces: the low half, TTBR0, one per process.
+//
+//   0 .. USER_BASE                     never mapped, so a null pointer (and anything near it) faults
+//   USER_BASE ..                       the program's segments, where its ELF image says (user/user.ld
+//                                      links at USER_BASE), then the heap, which `brk` grows upward
+//   .. stack_bottom - PAGE             the heap's limit
+//   stack_bottom - PAGE                the guard page: never mapped, so running off the stack faults
+//   stack_bottom .. USER_STACK_TOP     the stack, USER_STACK_PAGES pages, mapped from the start
+//   USER_STACK_TOP .. 2^48             unmapped
+//
+// Every page is mapped from a frame of its own, with user access, never executable at EL1, and
+// not-global: its translations are tagged with the space's ASID, so a switch between processes changes
+// TTBR0 and nothing has to be flushed. The tables themselves are frames too, reached through the
+// kernel's linear map of RAM (to_virt), and a space's every frame goes back when it is freed.
+//
+// Kernel threads run with TTBR0 at `empty_root`, a table with nothing in it, and ASID 0, which no
+// process is given: the low half faults for them exactly as it did before there were processes.
+
+const USER_BASE: u64 = 0x40_0000
+const USER_STACK_TOP: u64 = 0x1_0000_0000           // 4 GiB
+const USER_STACK_PAGES: u64 = 16                    // 64 KiB
+const PAGE_SIZE: u64 = 4096
+
+stack_bottom() -> u64 = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE
+
+// The highest address a segment or the heap may reach: the bottom of the guard page.
+heap_limit() -> u64 = stack_bottom() - PAGE_SIZE
+
+// One process's translation tables.
+struct Space
+    root: PhysAddr              // the level-0 table
+    asid: u64                   // 1..255
+    pages: u64                  // pages mapped, tables not counted
+
+// What a user page allows. Every user page is readable; whether it may be written or executed is the
+// segment's to say.
+struct UserProt
+    write: bool
+    exec: bool
+
+// A fresh space with nothing mapped, or None when there is no frame or no ASID for it.
+new_space() -> Option[Space]
+    val asid = alloc_asid() match
+        Some(a) -> a
+        None -> return None
+    zeroed_frame() match
+        Some(root) -> Some(Space(root, asid, 0))
+        None ->
+            free_asid(asid)
+            None
+
+// What TTBR0 holds while the space's process runs.
+ttbr0_of(s: *Space) -> u64 = cpu.to_word(Ttbr(0, 0, frame_of(s.root), u16(s.asid)))
+
+// Map one page at `va` (page aligned) to a new zeroed frame, and answer the frame. A page already
+// mapped there keeps its frame, and is widened to allow whatever `prot` allows besides: two ELF segments
+// may share a page.
+map_user_page(s: *Space, va: u64, prot: UserProt) -> Option[PhysAddr]
+    val slot = leaf_slot(s, va, true) match
+        Some(p) -> p
+        None -> return None
+    if *slot != 0
+        var old: LeafDesc = cpu.from_word(*slot)
+        val was_write = old.ap == UserRw
+        val was_exec = old.uxn == 0
+        old.ap = if was_write || prot.write then UserRw else UserRo
+        old.uxn = if was_exec || prot.exec then u1(0) else u1(1)
+        *slot = cpu.to_word(old)
+        flush_user_page(s, va)
+        return Some(frame_addr(old.oa))
+    val pa = zeroed_frame() match
+        Some(p) -> p
+        None -> return None
+    *slot = cpu.to_word(user_leaf(pa, prot))
+    s.pages += 1
+    cpu.publish_tables()
+    Some(pa)
+
+// Take the page at `va` away and give its frame back; nothing happens if none is mapped there.
+unmap_user_page(s: *Space, va: u64)
+    val slot = leaf_slot(s, va, false) match
+        Some(p) -> p
+        None -> return
+    if *slot == 0 then return
+    val leaf: LeafDesc = cpu.from_word(*slot)
+    *slot = 0
+    flush_user_page(s, va)
+    free_frame(frame_of(frame_addr(leaf.oa)))
+    s.pages -= 1
+
+// Where `va` leads in this space, if it is mapped: the physical address of the byte, and whether a user
+// program may write it. A walk of the space's own tables, which is what a system call checks a pointer
+// against.
+user_translate(s: *Space, va: u64) -> Option[(PhysAddr, bool)]
+    if va >= USER_STACK_TOP then return None
+    val slot = leaf_slot(s, va & ~(PAGE_SIZE - 1), false) match
+        Some(p) -> p
+        None -> return None
+    if *slot == 0 then return None
+    val leaf: LeafDesc = cpu.from_word(*slot)
+    Some((frame_addr(leaf.oa) + (va & (PAGE_SIZE - 1)), leaf.ap == UserRw))
+
+// Give every frame of the space back — its pages, its tables, its root — and its ASID, after flushing
+// whatever translations any core still caches under it. No core may be running the space.
+free_space(s: *Space)
+    free_level(s.root, 0)
+    cpu.flush_tlb_asid(s.asid)
+    free_asid(s.asid)
+    s.pages = 0
+
+private free_level(table: PhysAddr, level: u64)
+    val t = table_of(table)
+    for i in 0..<512
+        val word = t.entries[i]
+        if word == 0 then continue
+        if level == 3
+            val leaf: LeafDesc = cpu.from_word(word)
+            free_frame(frame_of(frame_addr(leaf.oa)))
+        else
+            val d: TableDesc = cpu.from_word(word)
+            free_level(frame_addr(d.next), level + 1)
+    free_frame(frame_of(table))
+
+// The level-3 entry for `va`, adding the tables on the way down when `create` says so. None when a table
+// is missing and may not be added, or there is no frame for one.
+private leaf_slot(s: *Space, va: u64, create: bool) -> Option[*u64]
+    var t = table_of(s.root)
+    var level: u64 = 0
+    while level < 3
+        val slot = &t.entries[user_index(va, level)]
+        if *slot == 0
+            if !create then return None
+            val next = zeroed_frame() match
+                Some(p) -> p
+                None -> return None
+            *slot = cpu.to_word(table_desc(next))
+            t = table_of(next)
+        else
+            val d: TableDesc = cpu.from_word(*slot)
+            t = table_of(frame_addr(d.next))
+        level += 1
+    Some(&t.entries[user_index(va, 3)])
+
+private user_index(va: u64, level: u64) -> usize = usize((va >> (39 - 9 * level)) & 511)
+
+// A table (or any frame) through the kernel's linear map of RAM.
+private table_of(p: PhysAddr) -> *Table = ptr_cast(usize(u64(to_virt(p))))
+
+private zeroed_frame() -> Option[PhysAddr]
+    alloc_frame() match
+        Some(f) ->
+            val pa = frame_addr(f)
+            val t = table_of(pa)
+            for i in 0..<512
+                t.entries[i] = 0
+            Some(pa)
+        None -> None
+
+// A page descriptor for user memory: Normal, inner shareable, readable at EL0, never executable at EL1,
+// and tagged with the ASID.
+private user_leaf(pa: PhysAddr, prot: UserProt) -> LeafDesc
+    val access = if prot.write then UserRw else UserRo
+    val uxn = if prot.exec then u1(0) else u1(1)
+    LeafDesc(1, 1, Normal, 0, access, Inner, 1, 1, frame_of(pa), 0, 0, 0, 0, 1, uxn, 0, 0)
+
+private flush_user_page(s: *Space, va: u64) = cpu.flush_tlb_user_page(s.asid, va)
+
+// ASIDs: 8 bits (TCR_EL1.AS = 0), 0 kept for the kernel's empty TTBR0, so 255 processes at once. A
+// freed ASID is reused only after `free_space` flushed it from every core's TLB, so no generations.
+private var asid_lock: SpinLock = SpinLock(0)
+private var asids: [4]u64 = [1, 0, 0, 0]               // bit n: ASID n is taken; ASID 0 always
+
+private alloc_asid() -> Option[u64]
+    val flags = cpu.irq_save()
+    asid_lock.lock()
+    var found: Option[u64] = None
+    for i in 0..<256
+        val w = usize(i / 64)
+        val bit = u64(1) << u64(i % 64)
+        if asids[w] & bit == 0
+            asids[w] |= bit
+            found = Some(u64(i))
+            break
+    asid_lock.unlock()
+    cpu.irq_restore(flags)
+    found
+
+private free_asid(a: u64)
+    val flags = cpu.irq_save()
+    asid_lock.lock()
+    asids[usize(a / 64)] &= ~(u64(1) << (a % 64))
+    asid_lock.unlock()
+    cpu.irq_restore(flags)
+
+// How many ASIDs processes hold right now.
+asids_in_use() -> u64
+    var n: u64 = 0
+    for i in 1..<256
+        if asids[usize(i / 64)] & (u64(1) << u64(i % 64)) != 0 then n += 1
+    n
+
+// The empty level-0 table kernel threads run with in TTBR0, and the TTBR0 value naming it (ASID 0).
+// Made by `drop_identity` on the boot core, before any other core is up.
+private[mm] var empty_root: PhysAddr = PhysAddr(0)
+
+kernel_ttbr0() -> u64 = cpu.to_word(Ttbr(0, 0, frame_of(empty_root), 0))

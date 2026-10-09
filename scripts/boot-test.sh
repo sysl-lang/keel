@@ -47,7 +47,11 @@ expected=(
     "keel: smp ran on "     # threads ran on more than one core (the count is checked below)
     "keel: smp mutex ok"    # 4 threads x 100,000 additions under the Mutex, on >= 2 cores at once
     "keel: smp heap ok"     # 4 threads x 10,000 Bufs on the heap at once; every block and frame back
+    "user: hello from EL0"  # a sysl program at EL0, in its own address space, printing through `write`
+    "keel: process 1 exited 0"   # ...and ending with `exit(0)`
 )
+
+user_programs=(hello)
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
 frames_min=65000
@@ -56,6 +60,13 @@ frames_max=65536
 elf=$out/keel.elf
 log=$out/boot.log
 
+# The user programs first: the kernel embeds their images with `.incbin`, whose path the assembler
+# resolves against the directory the build runs in, so the kernel is built from the repository's root.
+mkdir -p $out/user
+for prog in $user_programs; do
+    $compiler build --target aarch64-freestanding ${opt:+$opt} -o $out/user/$prog.elf $root/user/$prog
+done
+cd $root
 $compiler build --target aarch64-freestanding ${opt:+$opt} -o $elf $root/kernel
 
 if [[ $accel == hvf ]]; then

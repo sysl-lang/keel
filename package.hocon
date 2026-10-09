@@ -1,0 +1,7 @@
+// keel's workspace: the kernel, and the user programs it carries inside its image.
+//
+//   kernel        the kernel (an image QEMU boots)
+//   user/abi      the system call numbers and error codes, shared by both sides
+//   user/rt       a user program's runtime: its entry, the system call wrappers, `putchar`, a heap
+//   user/<prog>   one user program each, linked low (user/user.ld) and embedded in the kernel
+workspace = ["kernel", "user/abi", "user/rt", "user/hello"]

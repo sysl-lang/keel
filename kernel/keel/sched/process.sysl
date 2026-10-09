@@ -1,0 +1,22 @@
+module keel.sched
+
+import keel.mm
+import sysl.sync.Atomic
+
+// A user process: an address space, and the one thread running in it (keel.proc creates, enters and
+// ends them). It is declared here, beside `Thread`, because a thread names the process it runs and the
+// scheduler loads that process's address space; keel.proc, which does everything else with it, imports
+// this module, and modules may not import each other in a cycle.
+//
+// One thread per process for now. A second would share `space` and `brk` (under a lock of the
+// process's own), and `kernel` and `kill` would move to the thread.
+struct Process
+    pid: u64
+    space: mm.Space
+    heap_base: u64              // where the heap starts: the page after the last segment
+    brk: u64                    // where it ends now; `brk` moves it, up to mm.heap_limit()
+    kernel: Context             // the kernel side of entering user mode, which leaving it returns to
+    kill: Atomic[u64]           // non-zero: end the process the next time it would return to user mode
+    exit_code: i64              // what it passed to `exit`
+    fault: u64                  // why it was killed (keel.proc's encoding); 0 when it exited by itself
+    thread: Option[&sync Thread]

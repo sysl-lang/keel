@@ -1,0 +1,12 @@
+// keel's first user program. It runs at EL0 in an address space of its own, and everything it does
+// that a program cannot do by itself — printing, finding its process id, growing its heap — is a system
+// call (keel.user).
+
+import rt.keel.user
+
+print("user: hello from EL0")
+
+// A string built at run time lives on the heap, which `brk` grew for it.
+val pid = user.getpid()
+val greeting = s"user: process $pid has a heap"
+print(greeting)

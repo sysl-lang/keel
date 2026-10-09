@@ -9,6 +9,7 @@ module keel.trap
 import keel.cpu.{core_id, esr, far, irq_restore, irq_save, set_vbar}
 import keel.irq.dispatch
 import keel.mm
+import keel.proc
 import keel.pl011.{put_byte, put_hex, put_str}
 import keel.psci.system_off
 import keel.sched.preempt
@@ -55,14 +56,16 @@ asm
         "stp x28, x29, [sp, #224]"
         "mrs x2, elr_el1"
         "mrs x3, spsr_el1"
+        "mrs x4, sp_el0"
         "stp x30, x2, [sp, #240]"
-        "str x3, [sp, #256]"
+        "stp x3, x4, [sp, #256]"
         "mov x0, sp"
         "bl keel_trap"
-        "ldr x3, [sp, #256]"
+        "ldp x3, x4, [sp, #256]"
         "ldp x30, x2, [sp, #240]"
         "msr elr_el1, x2"
         "msr spsr_el1, x3"
+        "msr sp_el0, x4"
         "ldp x0, x1, [sp, #0]"
         "ldp x2, x3, [sp, #16]"
         "ldp x4, x5, [sp, #32]"
@@ -86,22 +89,30 @@ asm
 extern keel_vectors: u8
 
 // What the entry code saved, in the order it saved it: x0 to x30, then where the exception was taken
-// (`ELR_EL1`) and the PSTATE it interrupted (`SPSR_EL1`). The last word keeps the frame a multiple of
-// sixteen bytes, which SP has to stay.
+// (`ELR_EL1`), the PSTATE it interrupted (`SPSR_EL1`), and a user program's stack pointer (`SP_EL0`).
+// SP_EL0 is saved on every entry, so a thread switched away from inside an exception gets its own back
+// when it returns to EL0, whatever other processes ran on the core in between.
 struct Frame
     x: [31]u64
     elr: u64
     spsr: u64
-    pad: u64
+    sp_el0: u64
 
 @assert(sizeof(Frame) == 272, "the vector code reserves 272 bytes for a Frame")
 @assert(offsetof(Frame, x) == 0, "the vector code saves x0 at the frame's base")
 @assert(offsetof(Frame, elr) == 248, "the vector code saves ELR_EL1 at 248")
 @assert(offsetof(Frame, spsr) == 256, "the vector code saves SPSR_EL1 at 256")
+@assert(offsetof(Frame, sp_el0) == 264, "the vector code saves SP_EL0 at 264")
 
-// The slots keel can take an exception in. It runs at EL1 on SP_EL1, so the second group of four.
+// The slots keel takes an exception in: its own code runs at EL1 on SP_EL1, the second group of four;
+// a user program at EL0 in AArch64, the third.
 private const SYNC_CURRENT: u64 = 4
 private const IRQ_CURRENT: u64 = 5
+private const SYNC_LOWER: u64 = 8
+private const IRQ_LOWER: u64 = 9
+
+// Interrupts taken while a user program ran: what shows the timer reaches EL0.
+var user_irqs: Atomic[u64] = Atomic(0)
 
 // `ESR_EL1`, as its fields. The struct is the 64-bit register: the first field is the low bits.
 @packed
@@ -166,6 +177,14 @@ keel_trap(frame: *Frame, slot: u64)
         preempt()
     else if slot == SYNC_CURRENT
         synchronous(frame)
+    else if slot == IRQ_LOWER
+        user_irqs.add(1)
+        dispatch()
+        preempt()
+        proc.returning_to_user()
+    else if slot == SYNC_LOWER
+        val raw = esr()
+        proc.user_sync(&frame.x[0], u64(syndrome(raw).ec), u64(syndrome(raw).iss))
     else
         put_str("keel: unexpected exception in slot ")
         put_hex(slot)

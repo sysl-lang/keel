@@ -1,0 +1,159 @@
+module keel.proc
+
+import keel.cpu
+import keel.mm
+
+// A static aarch64 ELF executable (ELF-64 Object File Format; the AArch64 ELF ABI): the file header,
+// and one program header per segment. keel loads ET_EXEC files only — linked at fixed addresses, no
+// relocation, no interpreter — and of their program headers reads only PT_LOAD.
+
+struct ElfHeader
+    ident: [16]u8               // 0x7f 'E' 'L' 'F', class, data (byte order), version, ABI, padding
+    kind: u16                   // e_type: 2 is ET_EXEC
+    machine: u16                // e_machine: 183 is EM_AARCH64
+    version: u32
+    entry: u64
+    phoff: u64                  // where the program headers are
+    shoff: u64
+    flags: u32
+    ehsize: u16
+    phentsize: u16              // the size of one program header
+    phnum: u16                  // how many there are
+    shentsize: u16
+    shnum: u16
+    shstrndx: u16
+
+struct ProgramHeader
+    kind: u32                   // p_type: 1 is PT_LOAD
+    flags: u32                  // p_flags: 1 execute, 2 write, 4 read
+    offset: u64                 // where the segment's bytes are in the file
+    vaddr: u64                  // where they go
+    paddr: u64
+    filesz: u64                 // how many bytes the file holds
+    memsz: u64                  // how many the segment occupies; the rest is zero (.bss)
+    align: u64
+
+@assert(sizeof(ElfHeader) == 64, "Elf64_Ehdr is 64 bytes")
+@assert(sizeof(ProgramHeader) == 56, "Elf64_Phdr is 56 bytes")
+@assert(offsetof(ElfHeader, entry) == 24, "e_entry is at 24")
+@assert(offsetof(ElfHeader, phnum) == 56, "e_phnum is at 56")
+@assert(offsetof(ProgramHeader, memsz) == 40, "p_memsz is at 40")
+
+private const ET_EXEC: u16 = 2
+private const EM_AARCH64: u16 = 183
+private const PT_LOAD: u32 = 1
+private const PF_X: u32 = 1
+private const PF_W: u32 = 2
+private const MAX_SEGMENTS: u16 = 16
+
+// Why an image was refused.
+enum LoadError
+    NotElf                      // no ELF magic, or the header runs off the end
+    WrongKind                   // not 64-bit, little-endian, ET_EXEC, AArch64
+    BadSegment                  // a segment outside the file, or outside the user range
+    BadEntry                    // the entry point is in no executable segment
+    NoMemory                    // no frame, or no ASID
+
+// What loading made: the address space, where to start, and where the heap begins.
+struct Loaded
+    space: mm.Space
+    entry: u64
+    heap_base: u64
+
+// A `T` laid out in `bytes` at `at`, copied out byte by byte: an ELF file's fields are little-endian,
+// as aarch64 is, and the copy makes no assumption about the alignment of `bytes` (the kernel is built
+// with `strict_align`). None when it would run past the end.
+private read_at[T](bytes: []const u8, at: u64) -> Option[T]
+    val n = u64(sizeof(T))
+    if at > u64(bytes.len) || n > u64(bytes.len) - at then return None
+    var out: T
+    val dst: *u8 = ptr_cast(&out)
+    for i in 0..<n
+        dst[usize(i)] = bytes[usize(at + i)]
+    Some(out)
+
+// Load `image` into a new address space: every PT_LOAD segment at its address, the file's bytes copied
+// and the rest zeroed, writable only if the segment says so, executable only if it says that; then the
+// stack. Nothing of the space is left behind when it fails.
+load(image: []const u8) -> Result[Loaded, LoadError]
+    val h = read_at[ElfHeader](image, 0) match
+        Some(h) -> h
+        None -> return Err(NotElf)
+    if h.ident[0] != 0x7f || h.ident[1] != u8('E') || h.ident[2] != u8('L') || h.ident[3] != u8('F')
+        return Err(NotElf)
+    if h.ident[4] != 2 || h.ident[5] != 1 || h.kind != ET_EXEC || h.machine != EM_AARCH64
+        return Err(WrongKind)
+    if h.phentsize != 56 || h.phnum == 0 || h.phnum > MAX_SEGMENTS then return Err(WrongKind)
+
+    var space = mm.new_space() match
+        Some(s) -> s
+        None -> return Err(NoMemory)
+
+    var end: u64 = mm.USER_BASE
+    var entry_ok = false
+    for i in 0..<u64(h.phnum)
+        val ph = read_at[ProgramHeader](image, h.phoff + i * 56) match
+            Some(p) -> p
+            None ->
+                mm.free_space(&space)
+                return Err(NotElf)
+        if ph.kind != PT_LOAD then continue
+        load_segment(&space, image, ph) match
+            Err(e) ->
+                mm.free_space(&space)
+                return Err(e)
+            Ok(_) -> ()
+        val seg_end = ph.vaddr + ph.memsz
+        if seg_end > end then end = seg_end
+        if ph.flags & PF_X != 0 && h.entry >= ph.vaddr && h.entry < seg_end then entry_ok = true
+
+    if !entry_ok
+        mm.free_space(&space)
+        return Err(BadEntry)
+
+    var va = mm.stack_bottom()
+    while va < mm.USER_STACK_TOP
+        mm.map_user_page(&space, va, mm.UserProt(true, false)) match
+            Some(_) -> ()
+            None ->
+                mm.free_space(&space)
+                return Err(NoMemory)
+        va += mm.PAGE_SIZE
+
+    cpu.sync_icache()
+    Ok(Loaded(space, h.entry, page_up(end)))
+
+// One segment, mapped and filled.
+private load_segment(space: *mm.Space, image: []const u8, ph: ProgramHeader) -> Result[unit, LoadError]
+    if ph.memsz == 0 then return Ok(())
+    if ph.filesz > ph.memsz || ph.offset > u64(image.len) || ph.filesz > u64(image.len) - ph.offset
+        return Err(BadSegment)
+    if ph.vaddr < mm.USER_BASE || ph.vaddr > mm.heap_limit() || ph.memsz > mm.heap_limit() - ph.vaddr
+        return Err(BadSegment)
+
+    val prot = mm.UserProt(ph.flags & PF_W != 0, ph.flags & PF_X != 0)
+    var page = ph.vaddr & ~(mm.PAGE_SIZE - 1)
+    val last = ph.vaddr + ph.memsz
+    while page < last
+        val pa = mm.map_user_page(space, page, prot) match
+            Some(p) -> p
+            None -> return Err(NoMemory)
+        // The part of the file that lands in this page; a fresh frame is already zero, and a page
+        // shared with the previous segment keeps what that one put there.
+        val from = if page > ph.vaddr then page else ph.vaddr
+        val file_end = ph.vaddr + ph.filesz
+        val to = if page + mm.PAGE_SIZE < file_end then page + mm.PAGE_SIZE else file_end
+        val dst: *u8 = ptr_cast(usize(u64(mm.to_virt(pa))))
+        var a = from
+        while a < to
+            dst[usize(a - page)] = image[usize(ph.offset + (a - ph.vaddr))]
+            a += 1
+        if ph.flags & PF_X != 0
+            var line: u64 = 0
+            while line < mm.PAGE_SIZE
+                cpu.clean_dcache_line_pou(u64(mm.to_virt(pa)) + line)
+                line += 64
+        page += mm.PAGE_SIZE
+    Ok(())
+
+private[proc] page_up(a: u64) -> u64 = (a + mm.PAGE_SIZE - 1) & ~(mm.PAGE_SIZE - 1)

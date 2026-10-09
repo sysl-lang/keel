@@ -22,6 +22,11 @@ allocator {
   free  = "keel_heap_free"
 }
 
+// The system call numbers and error codes, which user programs build against too.
+dependencies {
+  abi { workspace = true }
+}
+
 targets {
   aarch64-freestanding {
     linker_script = "link.ld"
