@@ -1182,6 +1182,11 @@ is, propagated to every function that can reach it, the shape `@no_alloc` alread
 
 ## 35. A runtime cannot call `main`, though on a freestanding image calling it is the entry's job (minor)
 
+**FIXED in sysl census-35 7e2a32d3 (`entry-main-extern`; prerelease `7e2a32d396`):** where the
+manifest's `entry` is not `main`, `extern "main" program_main(argc: int, argv: **u8) -> int` is
+accepted. `user/rt`'s `_start` is now three instructions that hand argc/argv to the sysl
+`keel_user_start`, which calls `main` and exits with its answer; `keel_user_finish` is gone.
+
 Milestone 6, `user/rt`. A user program's statements are compiled into `main`, and its entry `_start`
 is the runtime's. The runtime's sysl half wanted to call `main` and pass its answer to `exit`:
 

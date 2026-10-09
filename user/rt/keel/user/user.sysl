@@ -22,16 +22,17 @@ asm
         "_start:"
         "ldr x0, [sp]"
         "add x1, sp, #8"
-        "bl main"
-        "bl keel_user_finish"
+        "bl keel_user_start"
         "brk #0"
     [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
 
-// Where `_start` goes with what `main` answered. `main` is called from the assembly because sysl code
-// may not name it: an `extern "main"` is refused as the platform's entry, even on a target whose entry
-// is `_start` (FINDINGS.md 35).
-@export("keel_user_finish")
-finish(code: int) -> never = exit(code)
+// The program, as the compiler builds it: C's `main`. The manifest's entry is `_start`, so `main` is
+// an ordinary symbol this runtime calls.
+extern "main" program_main(argc: int, argv: **u8) -> int
+
+// Where `_start` goes with the arguments: the program runs, and what it answered ends the process.
+@export("keel_user_start")
+start(argc: int, argv: **u8) -> never = exit(program_main(argc, argv))
 
 // The system calls, one `svc` each. The kernel preserves every register but x0.
 
