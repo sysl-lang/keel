@@ -1,0 +1,195 @@
+module keel.trap
+
+import keel.cpu.{esr, far, set_vbar}
+import keel.irq.dispatch
+import keel.pl011.{put_hex, put_str}
+import keel.psci.system_off
+
+// Exception entry. The processor jumps to `VBAR_EL1` plus a fixed offset chosen by what happened and
+// where it was running: sixteen 128-byte slots, four groups of four (synchronous, IRQ, FIQ, SError)
+// for "this EL on SP_EL0", "this EL on SP_ELx", "a lower EL in AArch64" and "a lower EL in AArch32".
+//
+// Every slot does the same thing: make room for a `Frame` on the stack, save x0 and x1, put the slot's
+// number in x1 and branch to the shared tail, which saves the rest, calls `keel_trap(frame, slot)`,
+// and restores everything from the frame — including `ELR_EL1` and `SPSR_EL1`, so a handler that
+// changes `frame.elr` changes where `eret` returns to.
+//
+// The offsets written here (272, 240, 248, 256) are `Frame`'s layout, which the `@assert`s below pin.
+@align(2048)
+@section(".text.vectors")
+asm
+    [aarch64]
+        ".globl keel_vectors"
+        "keel_vectors:"
+        ".irp slot, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
+        ".balign 128"
+        "sub sp, sp, #272"
+        "stp x0, x1, [sp, #0]"
+        "mov x1, #\\slot"
+        "b keel_trap_entry"
+        ".endr"
+        ".balign 128"
+        "keel_trap_entry:"
+        "stp x2, x3, [sp, #16]"
+        "stp x4, x5, [sp, #32]"
+        "stp x6, x7, [sp, #48]"
+        "stp x8, x9, [sp, #64]"
+        "stp x10, x11, [sp, #80]"
+        "stp x12, x13, [sp, #96]"
+        "stp x14, x15, [sp, #112]"
+        "stp x16, x17, [sp, #128]"
+        "stp x18, x19, [sp, #144]"
+        "stp x20, x21, [sp, #160]"
+        "stp x22, x23, [sp, #176]"
+        "stp x24, x25, [sp, #192]"
+        "stp x26, x27, [sp, #208]"
+        "stp x28, x29, [sp, #224]"
+        "mrs x2, elr_el1"
+        "mrs x3, spsr_el1"
+        "stp x30, x2, [sp, #240]"
+        "str x3, [sp, #256]"
+        "mov x0, sp"
+        "bl keel_trap"
+        "ldr x3, [sp, #256]"
+        "ldp x30, x2, [sp, #240]"
+        "msr elr_el1, x2"
+        "msr spsr_el1, x3"
+        "ldp x0, x1, [sp, #0]"
+        "ldp x2, x3, [sp, #16]"
+        "ldp x4, x5, [sp, #32]"
+        "ldp x6, x7, [sp, #48]"
+        "ldp x8, x9, [sp, #64]"
+        "ldp x10, x11, [sp, #80]"
+        "ldp x12, x13, [sp, #96]"
+        "ldp x14, x15, [sp, #112]"
+        "ldp x16, x17, [sp, #128]"
+        "ldp x18, x19, [sp, #144]"
+        "ldp x20, x21, [sp, #160]"
+        "ldp x22, x23, [sp, #176]"
+        "ldp x24, x25, [sp, #192]"
+        "ldp x26, x27, [sp, #208]"
+        "ldp x28, x29, [sp, #224]"
+        "add sp, sp, #272"
+        "eret"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// The table's first instruction. Only its address is ever taken.
+extern keel_vectors: u8
+
+// What the entry code saved, in the order it saved it: x0 to x30, then where the exception was taken
+// (`ELR_EL1`) and the PSTATE it interrupted (`SPSR_EL1`). The last word keeps the frame a multiple of
+// sixteen bytes, which SP has to stay.
+struct Frame
+    x: [31]u64
+    elr: u64
+    spsr: u64
+    pad: u64
+
+@assert(sizeof(Frame) == 272, "the vector code reserves 272 bytes for a Frame")
+@assert(offsetof(Frame, x) == 0, "the vector code saves x0 at the frame's base")
+@assert(offsetof(Frame, elr) == 248, "the vector code saves ELR_EL1 at 248")
+@assert(offsetof(Frame, spsr) == 256, "the vector code saves SPSR_EL1 at 256")
+
+// The slots keel can take an exception in. It runs at EL1 on SP_EL1, so the second group of four.
+private const SYNC_CURRENT: u64 = 4
+private const IRQ_CURRENT: u64 = 5
+
+// `ESR_EL1`, as its fields. The struct is the 64-bit register: the first field is the low bits.
+@packed
+struct Syndrome
+    iss: u25                    // [24:0]  the class's own details
+    il: u1                      // [25]    the trapped instruction was 32 bits
+    ec: u6                      // [31:26] the exception class
+    iss2: u5                    // [36:32]
+    res0: u27                   // [63:37]
+
+// The exception classes keel names (Arm ARM D19.2.40, ESR_ELx.EC). The others are reserved or belong
+// to features keel does not use, and are printed by number.
+enum ExceptionClass: u6
+    Unknown = 0x00
+    WaitForInterrupt = 0x01
+    FpAccess = 0x07
+    IllegalState = 0x0e
+    Svc = 0x15
+    Hvc = 0x16
+    Smc = 0x17
+    SystemRegister = 0x18
+    InstructionAbortLower = 0x20
+    InstructionAbort = 0x21
+    PcAlignment = 0x22
+    DataAbortLower = 0x24
+    DataAbort = 0x25
+    SpAlignment = 0x26
+    SError = 0x2f
+    BreakpointLower = 0x30
+    Breakpoint = 0x31
+    StepLower = 0x32
+    Step = 0x33
+    WatchpointLower = 0x34
+    Watchpoint = 0x35
+    Brk = 0x3c
+
+// The class an EC field names, if keel knows it. `ExceptionClass(ec)` traps on a number no variant
+// has, and the hardware may report one, so the declared variants are searched instead.
+class_of(ec: u6) -> Option[ExceptionClass]
+    for i in 0..ExceptionClass::Pos(ExceptionClass::Last)
+        val c = ExceptionClass::Val(i)
+        if u6(c) == ec then return Some(c)
+    None
+
+// A raw `ESR_EL1` value as its fields. `Syndrome` is that integer, but there is no conversion between
+// the two, so the value goes through memory.
+syndrome(raw: u64) -> Syndrome
+    var word = raw
+    val s: *Syndrome = ptr_cast(&word)
+    *s
+
+// Install the vector table. Until this runs, an exception jumps to whatever `VBAR_EL1` held at reset.
+install()
+    set_vbar(u64(usize(&keel_vectors)))
+
+// The one function every vector slot calls, with the saved registers and the slot's number. What it
+// leaves in `frame` is what the interrupted code resumes with.
+@export("keel_trap")
+keel_trap(frame: *Frame, slot: u64)
+    if slot == IRQ_CURRENT
+        dispatch()
+    else if slot == SYNC_CURRENT
+        synchronous(frame)
+    else
+        put_str("keel: unexpected exception in slot ")
+        put_hex(slot)
+        details(esr(), frame)
+        system_off()
+
+// A synchronous exception: an instruction that trapped. `brk` is a deliberate stop and resumes at the
+// next instruction; anything else is a fault keel cannot recover from yet.
+private synchronous(frame: *Frame)
+    val raw = esr()
+    val s = syndrome(raw)
+
+    class_of(s.ec) match
+        Some(Brk) ->
+            put_str("keel: trap brk")
+            details(raw, frame)
+            frame.elr += 4
+        Some(c) ->
+            put_str("keel: trap ")
+            put_str(ExceptionClass::Image(c))
+            details(raw, frame)
+            system_off()
+        None ->
+            put_str("keel: trap class ")
+            put_hex(u64(s.ec))
+            details(raw, frame)
+            system_off()
+
+// The rest of a trap's line: the syndrome, where it was taken, and the faulting address.
+private details(raw: u64, frame: *Frame)
+    put_str(" esr=")
+    put_hex(raw)
+    put_str(" elr=")
+    put_hex(frame.elr)
+    put_str(" far=")
+    put_hex(far())
+    put_str("\n")

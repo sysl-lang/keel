@@ -1,11 +1,17 @@
 // keel — a research kernel for aarch64 on QEMU's `virt` machine.
 
 import keel.boot.zero_bss
+import keel.cpu.{current_el, enable_irqs, wait_for_interrupt}
+import keel.gic
+import keel.irq
 import keel.psci.system_off
+import keel.timer
+import keel.trap
 
 // The first instruction the machine runs. QEMU loads the ELF image into RAM and starts the boot
-// processor at `_start`, at EL1 with the MMU off and no stack. `_start` gives it a stack and branches
-// to `kmain`, which never returns.
+// processor at `_start`, at EL1 with the MMU off and no stack (under HVF and under TCG alike: `virt`
+// gives the guest no EL2 unless asked to). `_start` gives it a stack and branches to `kmain`, which
+// never returns.
 //
 // It is assembly at the top of the file rather than a function, because a function may save a
 // register on the stack before its first instruction and there is no stack yet. The label is the
@@ -26,4 +32,18 @@ asm
 kmain() -> never
     zero_bss()
     print("keel: hello")
+
+    if current_el() != 1
+        print("keel: expected EL1, running at EL", current_el())
+        system_off()
+
+    trap.install()
+    breakpoint()
+
     system_off()
+
+// Stop at a `brk`, which the trap handler reports and steps over.
+breakpoint()
+    asm
+        [aarch64] "brk #0"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"

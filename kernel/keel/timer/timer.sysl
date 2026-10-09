@@ -1,0 +1,49 @@
+module keel.timer
+
+// The EL1 virtual timer of the Arm generic timer. It counts the system counter at `CNTFRQ_EL0` ticks
+// a second and raises private interrupt 27 when its countdown (`CNTV_TVAL_EL0`) reaches zero. Under
+// HVF the virtual timer is the one the hypervisor gives the guest.
+
+// The timer's interrupt ID at the GIC.
+const IRQ: u32 = 27
+
+// How many counter ticks one period is; set by `start`.
+private var period: u64 = 0
+
+// The system counter's frequency, in Hz.
+private frequency() -> u64
+    var v: u64 = 0
+    asm
+        [aarch64]
+            "mrs {v}, cntfrq_el0"
+            out v : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    v
+
+// Count down `ticks` from now. Writing the countdown also clears a condition already met.
+private set_countdown(ticks: u64)
+    asm
+        [aarch64]
+            "msr cntv_tval_el0, {ticks}"
+            "isb"
+            in ticks : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// Bit 0 enables the timer; bit 1 would mask its interrupt.
+private set_control(bits: u64)
+    asm
+        [aarch64]
+            "msr cntv_ctl_el0, {bits}"
+            "isb"
+            in bits : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// Raise the timer's interrupt every `ms` milliseconds.
+start(ms: u64)
+    period = frequency() * ms / 1000
+    set_countdown(period)
+    set_control(1)
+
+// Begin the next period. The interrupt handler calls this, or the timer's condition stays met and the
+// interrupt stays raised.
+rearm() = set_countdown(period)

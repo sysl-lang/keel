@@ -20,6 +20,19 @@ put_byte(b: u8)
     while (r.fr & FR_TXFF) != 0 do ()
     r.dr = u32(b)
 
+// Write a string with no line ending, for a line built from several pieces.
+put_str(s: string)
+    for b in s.bytes
+        put_byte(b)
+
+// Write `v` as `0x` and sixteen hexadecimal digits. The standard library prints integers in decimal
+// only, and a register value is read in hexadecimal.
+put_hex(v: u64)
+    put_str("0x")
+    for i in 0..<16
+        val d = u8((v >> (60 - 4 * i)) & 0xf)
+        put_byte(if d < 10 then u8('0') + d else u8('a') + d - 10)
+
 // The standard library's `print` writes through C's `putchar`, and a freestanding image has no C
 // library to supply it, so the console is the supplier.
 @export("putchar")

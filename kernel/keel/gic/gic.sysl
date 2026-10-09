@@ -1,0 +1,68 @@
+module keel.gic
+
+// The Arm Generic Interrupt Controller, version 2, that QEMU's `virt` machine provides by default: a
+// distributor at 0x0800_0000 that decides which interrupts are enabled and routed, and a CPU interface
+// at 0x0801_0000 through which this processor acknowledges and completes them.
+
+// The distributor's registers keel uses, at the offsets the GICv2 architecture specification gives
+// them. Each bank is one bit (or one byte, for priorities) per interrupt ID.
+private struct Distributor
+    ctlr: volatile u32                  // 0x000 enable
+    typer: volatile u32                 // 0x004
+    iidr: volatile u32                  // 0x008
+    reserved0: [29]u32                  // 0x00c .. 0x07f
+    igroupr: [32]volatile u32           // 0x080 group
+    isenabler: [32]volatile u32         // 0x100 set-enable
+    icenabler: [32]volatile u32         // 0x180 clear-enable
+    ispendr: [32]volatile u32           // 0x200 set-pending
+    icpendr: [32]volatile u32           // 0x280 clear-pending
+    isactiver: [32]volatile u32         // 0x300 set-active
+    icactiver: [32]volatile u32         // 0x380 clear-active
+    ipriorityr: [255]volatile u32       // 0x400 priority, a byte per interrupt
+
+@assert(offsetof(Distributor, igroupr) == 0x080, "GICD_IGROUPR is at 0x080")
+@assert(offsetof(Distributor, isenabler) == 0x100, "GICD_ISENABLER is at 0x100")
+@assert(offsetof(Distributor, ipriorityr) == 0x400, "GICD_IPRIORITYR is at 0x400")
+
+// The CPU interface's registers.
+private struct CpuInterface
+    ctlr: volatile u32                  // 0x000 enable
+    pmr: volatile u32                   // 0x004 priority mask
+    bpr: volatile u32                   // 0x008 binary point
+    iar: volatile u32                   // 0x00c acknowledge: reading it takes the interrupt
+    eoir: volatile u32                  // 0x010 end of interrupt
+
+@assert(offsetof(CpuInterface, iar) == 0x00c, "GICC_IAR is at 0x00c")
+@assert(offsetof(CpuInterface, eoir) == 0x010, "GICC_EOIR is at 0x010")
+
+private const DIST_BASE: usize = 0x0800_0000
+private const CPU_BASE: usize = 0x0801_0000
+
+// What `acknowledge` answers when nothing is pending after all.
+const SPURIOUS: u32 = 1023
+
+private dist() -> *Distributor = ptr_cast(DIST_BASE)
+private cpu() -> *CpuInterface = ptr_cast(CPU_BASE)
+
+// Switch on the distributor and this processor's interface, letting through every priority.
+init()
+    dist().ctlr = 1
+    cpu().pmr = 0xff
+    cpu().ctlr = 1
+
+// Enable interrupt `id` at the middle priority. A private peripheral interrupt (16-31) is this
+// processor's own, so it needs no routing.
+enable(id: u32)
+    val d = dist()
+    val word = usize(id / 4)
+    val shift = (id % 4) * 8
+    d.ipriorityr[word] = (d.ipriorityr[word] & ~(u32(0xff) << shift)) | (u32(0x80) << shift)
+    d.isenabler[usize(id / 32)] = u32(1) << (id % 32)
+
+// Take the highest-priority pending interrupt, answering its ID. Its source then waits for
+// `complete` before it can be delivered again.
+acknowledge() -> u32 = cpu().iar & 0x3ff
+
+// Signal that interrupt `id` has been handled.
+complete(id: u32)
+    cpu().eoir = id

@@ -1,0 +1,26 @@
+module keel.irq
+
+// What an IRQ does once the vector code has saved the interrupted registers: ask the GIC which
+// interrupt it is, handle it, and tell the GIC it is done.
+
+import keel.gic
+import keel.timer
+import keel.pl011.{put_hex, put_str}
+
+// Timer interrupts taken since boot. The IRQ handler is its only writer; kmain reads it between
+// `wfi`s.
+var ticks: u64 = 0
+
+dispatch()
+    val id = gic.acknowledge()
+    if id == gic.SPURIOUS then return
+
+    if id == timer.IRQ
+        timer.rearm()
+        ticks += 1
+    else
+        put_str("keel: unexpected interrupt ")
+        put_hex(u64(id))
+        put_str("\n")
+
+    gic.complete(id)

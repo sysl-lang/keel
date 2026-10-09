@@ -1,0 +1,58 @@
+module keel.cpu
+
+// The processor's own state: the exception level, the system registers keel reads and writes, and
+// the instructions that wait for or mask interrupts. A system register is named inside the
+// instruction rather than passed to it, so each register is a function of its own.
+
+// The exception level the processor is running at, 0 to 3 (CurrentEL bits [3:2]).
+current_el() -> u64
+    var v: u64 = 0
+    asm
+        [aarch64]
+            "mrs {v}, CurrentEL"
+            out v : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    (v >> 2) & 3
+
+// Point exception entry at a vector table. The `isb` makes the new base take effect before the next
+// instruction can fault.
+set_vbar(base: u64)
+    asm
+        [aarch64]
+            "msr vbar_el1, {base}"
+            "isb"
+            in base : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// The syndrome of the exception being handled: its class and the class's own details.
+esr() -> u64
+    var v: u64 = 0
+    asm
+        [aarch64]
+            "mrs {v}, esr_el1"
+            out v : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    v
+
+// The faulting virtual address, for an abort or a misaligned PC or SP.
+far() -> u64
+    var v: u64 = 0
+    asm
+        [aarch64]
+            "mrs {v}, far_el1"
+            out v : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    v
+
+// Let IRQs in: clear PSTATE.I.
+enable_irqs()
+    asm
+        [aarch64] "msr daifclr, #2"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// Sleep until an interrupt is pending. The block clobbers memory, so whatever the loop around it
+// reads is read again after it.
+wait_for_interrupt()
+    asm
+        [aarch64] "wfi"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
