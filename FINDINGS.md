@@ -1275,6 +1275,191 @@ Workaround (used): none needed — the driver is kernel threads and wait queues,
 Clean form: an interrupt-safe waker kind in the executor contract, as above; and finding 22's check
 extended to module storage, so the probe above is refused.
 
+## Milestone 8: a filesystem
+
+Findings 39-42 are against the same prerelease `1a7aee7358`. Found while writing `keel.fs` (a buffer
+cache, inodes, directories, twelve system calls), `keel.ondisk` (the on-disk structs, compiled into
+both the kernel and a hosted tool), `tools/mkfs` (build, check and read an image on the host) and two
+user programs over the new calls. Ranked: 39 is silent — bytes read off a disk become typed values
+nothing checked, and the one helper every filesystem writes is a raw cast; 40 is milestone 9's whole
+question, what `sysl.fs` needs from a target; 41 is a trap waiting at the system-call boundary; 42 is
+minor. None was fixed here.
+
+## 39. Bytes cannot be viewed as a struct, or a struct as bytes, except by a raw cast that checks nothing
+
+Milestone 8, `keel.ondisk`. An on-disk format is structs laid in blocks: a superblock, 64-byte inodes,
+32-byte directory entries. Both sides read and write them in place, through one helper both compile:
+
+    at[T](bytes: []u8, offset: usize) -> *T
+        if offset + sizeof(T) > bytes.len then panic("a struct past the end of its block")
+        ptr_cast(usize(as_mut_ptr(bytes)) + offset)
+
+and the other direction, for `fstat` and `getdents` copying a `Stat` or a `Dirent` out to a program, is
+`val b: *u8 = ptr_cast(v); b[0..<sizeof(T)]`. Both are `ptr_cast`, the raw tier, and that is the only
+way there is. The bounds check above is the helper's own; nothing else is checked, and the probe shows
+what that leaves (hosted, `sysl run`):
+
+    enum Kind: u16
+        File = 1
+        Dir = 2
+    struct Node
+        kind: Kind
+        open: bool
+        next: &Node
+    var disk: [64]u8 = [0xff; 64]
+    val n: *Node = at(disk[..], 1)
+    print(n.open)                          // true — a bool whose byte is 0xff
+    print(n.kind match                     // dir — 0xffff is neither variant, and the match took the
+        File -> "file"                     //   last arm rather than trapping (finding 9's mechanism)
+        Dir -> "dir")
+
+It compiles with no diagnostic: a struct holding an enum, a `bool` and a counted reference — none of
+which may hold arbitrary bytes — is "viewed" over a disk block, at offset 1, misaligned for every field.
+A filesystem reading a corrupt disk has exactly these bytes. keel avoids it by care: `keel.ondisk`'s
+structs are integers and integer arrays only, `Inode.kind` is a `u16` with constants rather than an
+enum, and every offset is a multiple of the struct's size. Nothing in the types says any of that, and
+nothing says the struct's byte order is the format's (both readers are little-endian; a struct cannot
+state it — the milestone-7 note on wire structs).
+
+Rust has the same shape as a library contract (`zerocopy`'s `FromBytes`/`AsBytes`, derived only for a
+struct whose fields all accept any bit pattern and which has no padding); C has none and relies on care.
+
+Workaround (used): integer-only structs, `@assert`ed sizes and offsets, the raw-cast helper above.
+
+Clean form: a marker (a trait the compiler derives, or an attribute) for a plain-data struct — every
+field an integer, an array of them or another such struct, no padding — and two checked library
+operations over it: a view of `[]u8` as `*T` (or a copy into a `T`) that checks length and alignment,
+and a `[]const u8` of a `*T`. Optionally a byte order on the struct or the field
+(`@byte_order(little)`), honoured by those operations.
+
+## 40. `sysl.fs` is bound to C's stdio and libc; a target with system calls and no libc has nothing to supply, and nothing says so until the link
+
+Milestone 8, looking ahead to milestone 9 (a `cp` written with `sysl.fs`, running on keel). What the
+module calls, from `library/sysl/fs/` (sysl-keel-pre2):
+
+- **buffered stdio**: `fopen` (with C mode strings — the file's header explains the choice: `O_CREAT`
+  and friends differ between platforms, mode strings do not), `fread`, `fwrite`, `fflush`, `fseek`,
+  `ftell`, `ferror`, `feof`, `fclose`;
+- **POSIX by path**: `access`, `unlink`, `rmdir`, `rename`, `mkdir`, `chmod`, `truncate`, `getcwd`,
+  `chdir`, `symlink`, `link`, `readlink`; `opendir`/`closedir`;
+- **C shims in `__posix__/`** (`stat.c`, `dirent.c`, `dirs.c`, `meta.c`, `errtext.c`): `fstat` +
+  `fileno` for a file's size, `ftruncate`, a `stat` that copies a few fields out of `struct stat`, a
+  `readdir` that hands back the name, `realpath`, a temporary directory;
+- **errno** through `__error` (BSD) or else `__errno_location` (glibc), and `arc4random_buf`/
+  `getentropy` for `publish`'s temporary names.
+
+So a port has two shapes: give keel a small libc (stdio over `read`/`write`/`lseek`, a `struct stat`,
+`opendir`/`readdir` over `getdents`, an errno) for `sysl.fs` to bind unchanged, or give `sysl.fs` a
+platform layer below the stdio choice that a target can supply in sysl. Neither exists, and the module
+does not say which is meant. A user program importing it, built for keel's target:
+
+    import sysl.fs
+    val text = fs.read_text("/hello.txt") match ...
+
+    $ sysl build --target aarch64-freestanding -o probe.elf user/probe
+    ld.lld: error: undefined symbol: __errno_location   >>> referenced by sysl.fs$why
+    ld.lld: error: undefined symbol: fopen              >>> referenced by sysl.fs$opened
+    ld.lld: error: undefined symbol: fclose ...
+
+The module's header is `@requires(os)`, and the freestanding target is not refused at compile time —
+the program compiles and fails at the link, naming glibc's errno accessor on a target that is not
+Linux. (`reference/packages.md`: a capability the manifest does not mention is provided; keel's
+programs mention none, so `os` counts as provided. That is the documented rule, and it is what lets a
+freestanding image link `sysl.fs` far enough to fail there.)
+
+What keel's calls give a port, as designed here: a path is a pointer and a length (a sysl `string`
+crosses as it is, no NUL needed); `open` takes Linux's `O_*` values and errors are Linux's numbers, so
+a libc's tables read them unchanged; `fstat`/`stat` fill a fixed 24-byte `Stat` (ino, kind, mode,
+links, size — no times yet); `getdents` returns fixed 32-byte records. Missing for `sysl.fs` as it
+stands: `access` (stat answers it), `chmod`, `truncate`/`ftruncate`, a current directory
+(`getcwd`/`chdir`), links, timestamps (`Meta.modified`), and a source of randomness.
+
+Workaround: none needed in this milestone; this is milestone 9's design input.
+
+Clean form: a seam in `sysl.fs` at the level of a file descriptor (open/read/write/seek/close/stat/
+directory listing/errno), written once over libc for hosted targets and suppliable by a target that
+has system calls and no libc — a per-target directory like `__posix__`, or a trait the target's
+runtime implements; and `@requires(os)` taken to mean "needs that seam", refused at compile time on a
+target that does not declare it.
+
+## 41. An integer that is not one of an enum's values traps on conversion, and there is no conversion that answers instead
+
+Milestone 8, the system-call boundary. The kernel's errors are `abi.Errno`, an `enum Errno: i64` with
+Linux's numbers (`ENOENT = 2`, …); the kernel answers `-i64(e)` and that direction is clean. The user
+runtime turns the answer back:
+
+    private answer(r: i64) -> Result[u64, Errno] = if r < 0 then Err(Errno(-r)) else Ok(u64(r))
+
+`Errno(n)` is the checked conversion (`reference/types.md`: an integer that is not a value of the enum
+traps). A kernel newer than the program — one more error number — makes every call that returns it a
+crash in the program rather than an error it can report:
+
+    enum Errno: i64
+        ENOENT = 2
+        EIO = 5
+    val n: i64 = 99
+    print(i64(Errno(n)))                   // exit 133, nothing printed
+
+Nothing answers "is this a value of the enum?": no `Errno.from(n) -> Option[Errno]`, no
+`TryFrom`. A program can only write the reverse table by hand (`n match 2 -> Some(ENOENT) ...`), which
+is the enum written twice. The same holds for any enum read from outside the program: a device
+register, a disk (finding 39), a network packet.
+
+Workaround (used): none — keel's kernel and runtime are built together, so every number the kernel
+answers is a variant. A program built against an older `abi` would trap.
+
+Clean form: a total conversion beside the checked one, compiler-supplied for every simple enum
+(`Errno.of(n) -> Option[Errno]`, or `n as? Errno`), and optionally a way to declare an enum open
+(`@open enum Errno: i64` keeping an `Other(i64)`-like reading for unknown values).
+
+## 42. A function in a program's entry file may not be generic once anything around it captures (minor)
+
+Milestone 8, `user/files`. A program's entry file is a body (`reference/modules.md § The entry file
+is a body`), so its functions are nested functions of it. A helper that checks any call's error:
+
+    var failures = 0
+
+    failed[T](r: Result[T, int])
+        if !r.is_ok() then failures += 1
+
+    val r: Result[string, int] = Err(1)
+    failed(r)
+
+    error: 'failed' is declared inside a function body and cannot be generic — the type arguments
+    would have nowhere to come from, since nothing outside the body calls it
+    error: undefined name 'failures'
+
+The reason given is not so: the body calls it, with a concrete type. The same function without the
+capture (no `failures`) compiles and runs generic. The second diagnostic is a cascade (`failures` is
+declared, above). Workaround (used): the helper takes `r.err()`, an `Option[Errno]`, instead of the
+`Result`. Clean form: a nested function may be generic, instantiated at the calls in its body; or the
+message names the capture as the reason.
+
+## What worked in milestone 8
+
+- **One source, two targets, one workspace.** `ondisk/` is a workspace member with no target of its
+  own; the kernel (`aarch64-freestanding`, strict-align, no FP) and `tools/mkfs` (the host) both depend
+  on it with `{ workspace = true }`, and `sysl build tools/mkfs` and the kernel build each compile it for
+  their own machine. `@assert(sizeof/offsetof)` pins the layout once for both.
+- **`Result[T, Errno]` with `?` through the whole filesystem**, and one conversion to the register at
+  the dispatch (`Err(e) -> u64(-i64(e))`). A simple enum with explicit values is exactly an errno
+  table; matching on one variant (`Err(ENOENT) ->` to create a missing file) reads as intended.
+- **`defer unlock()` with early `return`s and `?`s** in every call that takes the filesystem lock.
+- **The whole filesystem state inside a `Mutex[State]` in a zero-initialised module `var`**: no
+  initializer, no `@main` entry (finding 31 checked with `emit-llvm`), and the only way to the state is
+  through the lock.
+- **Paths as `[]const u8`** in the kernel: no allocation, no UTF-8 question, and the user side passes a
+  `string`'s bytes and length as they are. `string` and `s"..."` on the kernel heap were used only for
+  messages.
+- **The hosted tool was ordinary sysl**: `sysl.fs.entries`/`read_bytes`/`write_bytes`, `Buf`, `split`.
+- **A user program's `[0; 1000]` local needs `memset`**: the user runtime now carries keel.rt's four
+  functions too (finding 18's workaround, a second copy).
+- Controls: `WRITE_BACK = false` in `keel/fs/cache.sysl` (sync writes nothing) passes boot 1 and fsck,
+  and boot 2 prints `user: first boot, no /out.txt yet` instead of `user: persisted across reboot`;
+  `keel: fs synced at shutdown, 0 blocks written`. A bitmap bit cleared under an owned block gives
+  `host: fsck: block 7 is owned by inode 1 and marked free`; one set for a free block gives `host: fsck:
+  block 500 is marked used and nothing owns it`; both exit 1.
+
 ## What worked in milestone 7
 
 - **`volatile` struct fields for a ring the device writes.** `Desc`, `Avail`, `Used` and `UsedElem` are

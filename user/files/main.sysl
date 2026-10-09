@@ -19,7 +19,7 @@ check(ok: bool, what: string)
     if !ok then fail(what)
 
 // Whether a call failed with exactly `want`; it is handed the call's `.err()`. (Taking the `Result`
-// itself would make this generic, and a function in a program's entry file may not be — FINDINGS.md 43.)
+// itself would make this generic, and a function in a program's entry file may not be — FINDINGS.md 42.)
 refused(r: Option[Errno], want: Errno, what: string)
     r match
         None -> fail(s"$what succeeded")

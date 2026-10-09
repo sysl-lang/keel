@@ -25,6 +25,6 @@ the language rather than worked around here.
 | 5 | Multi-core: secondary cores via PSCI `CPU_ON`, per-core data, SMP scheduler | threads run on all cores ✅ |
 | 6 | User mode: EL0, system calls, per-process address spaces, ELF loading | a user program prints through a system call and exits ✅ |
 | 7 | virtio-blk driver | sectors read and written from a disk image ✅ |
-| 8 | A simple filesystem; `open`/`read`/`write`/`close`, directories | files survive a reboot |
+| 8 | A simple filesystem; `open`/`read`/`write`/`close`, directories | files survive a reboot ✅ |
 | 9 | **sysl targets keel**: a target whose standard library reaches keel's system calls | `cp` written in sysl with `sysl.fs` copies a file |
 | 10 | Processes and a shell: `fork`/`exec`/`wait` (or `spawn`), a serial shell, `ls`/`cat`/`cp` | a session at the shell |
