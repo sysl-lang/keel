@@ -91,12 +91,17 @@ private disk_smp()
     val good = r.good.load(Ordering.Acquire)
     val bad = r.bad.load(Ordering.Acquire)
     val cores = popcount(r.cores.load(Ordering.Acquire))
-    print("keel: disk", done - done_before, "requests,", irqs - irqs_before, "interrupts, at most", most,
-          "in flight, on", cores, "cores")
-    if good == DISK_READERS * DISK_READS && bad == 0 && cores >= 2
+    val requests = done - done_before
+    val interrupts = irqs - irqs_before
+    print("keel: disk", requests, "requests,", interrupts, "interrupts, at most", most, "in flight, on", cores,
+          "cores")
+    // Every interrupt the device raises follows at least one completion; more interrupts than requests
+    // means one was taken again and again — the device was never told it had been seen.
+    val storm = interrupts > requests
+    if good == DISK_READERS * DISK_READS && bad == 0 && cores >= 2 && !storm
         print("keel: disk smp ok")
     else
-        print("keel: disk smp wrong: good", good, "bad", bad, "cores", cores)
+        print("keel: disk smp wrong: good", good, "bad", bad, "cores", cores, "interrupt storm", storm)
 
 private read_many(r: &sync Readers)
     var b: [SECTOR]u8 = [0; SECTOR]
