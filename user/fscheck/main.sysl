@@ -16,11 +16,11 @@ fail(what: string)
 check(ok: bool, what: string)
     if !ok then fail(what)
 
-// Whether a call failed with exactly `want`; it is handed the call's `.err()` (FINDINGS.md 42).
-refused(r: Option[IoError], want: IoError, what: string)
+// Whether a call failed with exactly `want`.
+refused[T](r: Result[T, IoError], want: IoError, what: string)
     r match
-        None -> fail(s"$what succeeded")
-        Some(e) -> check(e == want, s"$what answered '$e', not '$want'")
+        Ok(_) -> fail(s"$what succeeded")
+        Err(e) -> check(e == want, s"$what answered '$e', not '$want'")
 
 text(path: string) -> string = fs.read_text(path) match
     Ok(t) -> t
@@ -42,8 +42,8 @@ check(cwd() == "/dir", s"after set_current_dir(dir) it is '${cwd()}'")
 check(text("inner.txt") == "inside a directory\n", "a relative path from /dir")
 check(fs.set_current_dir("./../dir/..").is_ok(), "set_current_dir(./../dir/..)")
 check(cwd() == "/", s"after ./../dir/.. it is '${cwd()}'")
-refused(fs.set_current_dir("/hello.txt").err(), IoError.NotADirectory, "set_current_dir(/hello.txt)")
-refused(fs.set_current_dir("/nowhere").err(), IoError.NotFound, "set_current_dir(/nowhere)")
+refused(fs.set_current_dir("/hello.txt"), IoError.NotADirectory, "set_current_dir(/hello.txt)")
+refused(fs.set_current_dir("/nowhere"), IoError.NotFound, "set_current_dir(/nowhere)")
 
 // What is there, asked through `access` and `opendir`.
 check(fs.exists("/hello.txt") && fs.exists("hello.txt") && !fs.exists("/nowhere"), "exists")
@@ -70,16 +70,16 @@ fs.open_update("/t.txt") match
         check(file.close().is_ok(), "close")
     Err(e) -> fail(s"open_update(/t.txt): $e")
 check(text("/t.txt") == "01", "after File.truncate")
-refused(fs.truncate("/nowhere", 1).err(), IoError.NotFound, "truncate(/nowhere)")
-refused(fs.truncate("/dir", 1).err(), IoError.IsADirectory, "truncate(/dir)")
+refused(fs.truncate("/nowhere", 1), IoError.NotFound, "truncate(/nowhere)")
+refused(fs.truncate("/dir", 1), IoError.IsADirectory, "truncate(/dir)")
 check(fs.remove_file("/t.txt").is_ok() && !fs.exists("/t.txt"), "remove_file(/t.txt)")
 
 // keel's errors, as `IoError`s.
-refused(fs.read_bytes("/nowhere").err(), IoError.NotFound, "read_bytes(/nowhere)")
-refused(fs.read_bytes("/dir").err(), IoError.IsADirectory, "read_bytes(/dir)")
-refused(fs.make_dir("/dir").err(), IoError.AlreadyExists, "make_dir(/dir)")
-refused(fs.entries("/hello.txt").err(), IoError.NotADirectory, "entries(/hello.txt)")
-refused(fs.remove_dir("/dir").err(), IoError.DirectoryNotEmpty, "remove_dir(/dir)")
+refused(fs.read_bytes("/nowhere"), IoError.NotFound, "read_bytes(/nowhere)")
+refused(fs.read_bytes("/dir"), IoError.IsADirectory, "read_bytes(/dir)")
+refused(fs.make_dir("/dir"), IoError.AlreadyExists, "make_dir(/dir)")
+refused(fs.entries("/hello.txt"), IoError.NotADirectory, "entries(/hello.txt)")
+refused(fs.remove_dir("/dir"), IoError.DirectoryNotEmpty, "remove_dir(/dir)")
 fs.entries("/dir") match
     Ok(names) -> check(names.len() == 1 && names.view()[0] == "inner.txt", "entries(/dir)")
     Err(e) -> fail(s"entries(/dir): $e")
@@ -88,7 +88,7 @@ fs.entries("/dir") match
 fs.symlink("/hello.txt", "/link") match
     Ok(_) -> fail("symlink succeeded")
     Err(e) -> check(e.code() == UNSUPPORTED && s"$e" == "not supported on this target", s"symlink answered '$e'")
-refused(fs.hard_link("/hello.txt", "/link").err(), IoError.Other(UNSUPPORTED), "hard_link")
-refused(fs.read_link("/hello.txt").err(), IoError.Other(UNSUPPORTED), "read_link")
+refused(fs.hard_link("/hello.txt", "/link"), IoError.Other(UNSUPPORTED), "hard_link")
+refused(fs.read_link("/hello.txt"), IoError.Other(UNSUPPORTED), "read_link")
 
 if failures == 0 then print("user: sysl.fs ok") else exit(1)

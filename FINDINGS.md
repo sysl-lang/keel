@@ -1497,6 +1497,11 @@ Clean form: a total conversion beside the checked one, compiler-supplied for eve
 
 ## 42. A function in a program's entry file may not be generic once anything around it captures (minor)
 
+**FIXED in sysl census-35 7e2a32d3 (`generic-nested-fns`; prerelease `7e2a32d396`):** a nested
+function may be generic and capture, instantiated at the calls in its body. `files`' and `fscheck`'s
+`refused[T]` take the call's `Result` again, and the `.err()` at every call is gone. Control: a wrong
+`want` in `fscheck` prints `FAILED: set_current_dir(/hello.txt) answered 'not a directory', …`.
+
 Milestone 8, `user/files`. A program's entry file is a body (`reference/modules.md § The entry file
 is a body`), so its functions are nested functions of it. A helper that checks any call's error:
 

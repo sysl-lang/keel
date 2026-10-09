@@ -18,12 +18,11 @@ fail(what: string)
 check(ok: bool, what: string)
     if !ok then fail(what)
 
-// Whether a call failed with exactly `want`; it is handed the call's `.err()`. (Taking the `Result`
-// itself would make this generic, and a function in a program's entry file may not be — FINDINGS.md 42.)
-refused(r: Option[Errno], want: Errno, what: string)
+// Whether a call failed with exactly `want`.
+refused[T](r: Result[T, Errno], want: Errno, what: string)
     r match
-        None -> fail(s"$what succeeded")
-        Some(e) -> check(e == want, s"$what answered errno ${i64(e)}, not ${i64(want)}")
+        Ok(_) -> fail(s"$what succeeded")
+        Err(e) -> check(e == want, s"$what answered errno ${i64(e)}, not ${i64(want)}")
 
 // A file's whole contents.
 read_all(path: string) -> Result[Buf[u8], Errno]
@@ -181,7 +180,7 @@ dirs() -> Result[unit, Errno]
 
     // A file renamed into a subdirectory, then the subdirectory moved to the root.
     user.rename("/d1/a", "/d1/sub/b")?
-    refused(user.stat("/d1/a").err(), ENOENT, "stat of the old name")
+    refused(user.stat("/d1/a"),ENOENT, "stat of the old name")
     check(user.stat("/d1/sub/b")?.size == 1, "the renamed file lost its byte")
     user.rename("/d1/sub", "/d2")?
     check(user.stat("/d2/..")?.ino == root.ino, "/d2/.. is not the root after the move")
@@ -189,15 +188,15 @@ dirs() -> Result[unit, Errno]
     check(has(names("/"), "d2"), "/ does not list d2")
 
     // The errors.
-    refused(user.mkdir("/d2").err(), EEXIST, "mkdir of an existing name")
-    refused(user.rmdir("/d2").err(), ENOTEMPTY, "rmdir of a directory with a file in it")
-    refused(user.unlink("/d2").err(), EISDIR, "unlink of a directory")
-    refused(user.rmdir("/d2/b").err(), ENOTDIR, "rmdir of a file")
-    refused(user.open("/nope", O_RDONLY).err(), ENOENT, "open of a missing file")
-    refused(user.open("/hello.txt/x", O_RDONLY).err(), ENOTDIR, "open through a file")
-    refused(user.open("/d2", O_WRONLY).err(), EISDIR, "open of a directory for writing")
-    refused(user.rename("/d1", "/d1/inside").err(), EINVAL, "rename of a directory into itself")
-    refused(user.open("/hello.txt", O_WRONLY | O_CREAT | O_EXCL).err(), EEXIST, "an exclusive create of an existing file")
+    refused(user.mkdir("/d2"),EEXIST, "mkdir of an existing name")
+    refused(user.rmdir("/d2"),ENOTEMPTY, "rmdir of a directory with a file in it")
+    refused(user.unlink("/d2"),EISDIR, "unlink of a directory")
+    refused(user.rmdir("/d2/b"),ENOTDIR, "rmdir of a file")
+    refused(user.open("/nope", O_RDONLY),ENOENT, "open of a missing file")
+    refused(user.open("/hello.txt/x", O_RDONLY),ENOTDIR, "open through a file")
+    refused(user.open("/d2", O_WRONLY),EISDIR, "open of a directory for writing")
+    refused(user.rename("/d1", "/d1/inside"),EINVAL, "rename of a directory into itself")
+    refused(user.open("/hello.txt", O_WRONLY | O_CREAT | O_EXCL),EEXIST, "an exclusive create of an existing file")
 
     // And everything made here removed, so the next boot starts from the same names.
     user.unlink("/d2/b")?
