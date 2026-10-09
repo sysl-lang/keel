@@ -24,7 +24,9 @@ import sysl.sync.{Atomic, Ordering}
 // and restores everything from the frame — including `ELR_EL1` and `SPSR_EL1`, so a handler that
 // changes `frame.elr` changes where `eret` returns to.
 //
-// The offsets written here (272, 240, 248, 256) are `Frame`'s layout, which the `@assert`s below pin.
+// The frame's size and where the tail saves x30, ELR, SPSR and SP_EL0 are `Frame`'s own, written in
+// as `{FRAME}`, `{X30}` and `{SPSR}`; each `stp` stores a pair, which the `@assert`s below hold
+// adjacent. x0-x29 go at their index times eight, `Frame.x` starting the frame.
 @align(2048)
 @section(".text.vectors")
 asm
@@ -33,7 +35,7 @@ asm
         "keel_vectors:"
         ".irp slot, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
         ".balign 128"
-        "sub sp, sp, #272"
+        "sub sp, sp, #{FRAME}"
         "stp x0, x1, [sp, #0]"
         "mov x1, #\\slot"
         "b keel_trap_entry"
@@ -57,12 +59,12 @@ asm
         "mrs x2, elr_el1"
         "mrs x3, spsr_el1"
         "mrs x4, sp_el0"
-        "stp x30, x2, [sp, #240]"
-        "stp x3, x4, [sp, #256]"
+        "stp x30, x2, [sp, #{X30}]"
+        "stp x3, x4, [sp, #{SPSR}]"
         "mov x0, sp"
         "bl keel_trap"
-        "ldp x3, x4, [sp, #256]"
-        "ldp x30, x2, [sp, #240]"
+        "ldp x3, x4, [sp, #{SPSR}]"
+        "ldp x30, x2, [sp, #{X30}]"
         "msr elr_el1, x2"
         "msr spsr_el1, x3"
         "msr sp_el0, x4"
@@ -81,7 +83,7 @@ asm
         "ldp x24, x25, [sp, #192]"
         "ldp x26, x27, [sp, #208]"
         "ldp x28, x29, [sp, #224]"
-        "add sp, sp, #272"
+        "add sp, sp, #{FRAME}"
         "eret"
     [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
 
@@ -98,11 +100,14 @@ struct Frame
     spsr: u64
     sp_el0: u64
 
-@assert(sizeof(Frame) == 272, "the vector code reserves 272 bytes for a Frame")
-@assert(offsetof(Frame, x) == 0, "the vector code saves x0 at the frame's base")
-@assert(offsetof(Frame, elr) == 248, "the vector code saves ELR_EL1 at 248")
-@assert(offsetof(Frame, spsr) == 256, "the vector code saves SPSR_EL1 at 256")
-@assert(offsetof(Frame, sp_el0) == 264, "the vector code saves SP_EL0 at 264")
+private const FRAME: usize = sizeof(Frame)
+private const X30: usize = offsetof(Frame, x) + 30 * 8
+private const SPSR: usize = offsetof(Frame, spsr)
+
+@assert(FRAME % 16 == 0, "the stack pointer stays 16-byte aligned with a Frame on it")
+@assert(offsetof(Frame, x) == 0, "the vector code saves x0-x29 from the frame's base")
+@assert(offsetof(Frame, elr) == X30 + 8, "one stp saves x30 and ELR_EL1")
+@assert(offsetof(Frame, sp_el0) == SPSR + 8, "one stp saves SPSR_EL1 and SP_EL0")
 
 // The slots keel takes an exception in: its own code runs at EL1 on SP_EL1, the second group of four;
 // a user program at EL0 in AArch64, the third.

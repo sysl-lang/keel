@@ -173,6 +173,12 @@ Clean form: `volatile` accepted on a module `var` (it is storage), or an orderin
 
 ## 7. Assembly at the top of a file cannot name a constant, so a frame layout is written twice
 
+**FIXED in sysl census-35 8619de66 (`asm-const-operand`; prerelease `8619de6609`):** a top-of-file
+block writes an integer `const` in as `{NAME}`. keel.trap's vector code takes `{FRAME}` =
+`sizeof(Frame)`, `{X30}` and `{SPSR}` from `offsetof` (branch `lsrm`); the `@assert`s now pin only
+what the `stp` pairs need (adjacent fields, a 16-byte multiple). The disassembly reads `#0xf0` and
+`#0x100` as before. The symbol half (`bl keel_trap` as a name the assembler resolves) is still text.
+
 Milestone 1, the vector table. The entry code reserves a `Frame` and saves registers at its
 offsets, so the asm needs `sizeof(Frame)` and `offsetof(Frame, elr)`:
 
