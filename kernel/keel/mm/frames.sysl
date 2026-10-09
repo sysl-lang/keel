@@ -1,0 +1,138 @@
+module keel.mm
+
+import keel.cpu
+import sysl.sync.SpinLock
+
+// The physical frame allocator: every 4 KiB frame of RAM, one bit each, set while the frame is in use.
+//
+// The bitmap lives in RAM itself, in the first frames after the kernel image, so its size follows the
+// RAM the device tree reports rather than a constant. A bitmap rather than a free list because it can
+// answer a run of contiguous frames (the heap's large blocks now, DMA buffers later), notices a frame
+// freed twice, and never has to write into a free frame to keep track of it.
+//
+// It is reached from more than one place at once, so every operation takes `lock` with IRQs masked on
+// this core: masked so that an interrupt handler that allocates cannot spin on a lock its own core
+// already holds, and locked so that a second core (milestone 5) waits its turn.
+
+private var lock: SpinLock = SpinLock(0)
+
+// The bitmap, as a kernel virtual address once `init_frames` has run.
+private var bitmap: *u64 = null
+
+// The frame number of the first frame covered, how many are covered, how many are free, and the
+// bitmap word a search starts from.
+private var first_frame: u64 = 0
+private var frame_count: u64 = 0
+private var free_count: u64 = 0
+private var hint: u64 = 0
+
+private const PAGE: u64 = 4096
+
+// Take over `size` bytes of RAM at `base`: everything is free except the `reserved` ranges of physical
+// addresses, which are page-rounded outward, and the frames the bitmap itself is put in.
+init_frames(base: PhysAddr, size: u64, reserved: []const (PhysAddr, u64))
+    first_frame = u64(base) / PAGE
+    frame_count = size / PAGE
+    val words = (frame_count + 63) / 64
+    val bitmap_pages = (words * 8 + PAGE - 1) / PAGE
+
+    // The bitmap goes in the first run of frames after every reserved range that does not overlap one.
+    var at = u64(base)
+    for r in reserved
+        val (start, len) = r
+        val end = round_up(u64(start) + len)
+        if end > at then at = end
+    bitmap = ptr_cast(usize(u64(to_virt(PhysAddr(at)))))
+
+    for i in 0..<words
+        bitmap[i] = 0
+    // The bits past the last frame are never free.
+    for i in frame_count..<words * 64
+        set(i)
+
+    for r in reserved
+        val (start, len) = r
+        mark_used(u64(start), len)
+    mark_used(at, bitmap_pages * PAGE)
+
+    var n: u64 = 0
+    for i in 0..<frame_count
+        if !is_set(i) then n += 1
+    free_count = n
+
+private round_up(a: u64) -> u64 = (a + PAGE - 1) & ~(PAGE - 1)
+
+private mark_used(start: u64, len: u64)
+    var f = start / PAGE
+    val end = round_up(start + len) / PAGE
+    while f < end
+        if f >= first_frame && f - first_frame < frame_count then set(f - first_frame)
+        f += 1
+
+private is_set(i: u64) -> bool = (bitmap[usize(i / 64)] >> (i % 64)) & 1 == 1
+private set(i: u64) = bitmap[usize(i / 64)] |= u64(1) << (i % 64)
+private clear(i: u64) = bitmap[usize(i / 64)] &= ~(u64(1) << (i % 64))
+
+// One free frame, or None when RAM is exhausted.
+alloc_frame() -> Option[Frame] = alloc_frames(1)
+
+// `n` free frames in a row, the first of which is answered; None when no run that long is free.
+alloc_frames(n: u64) -> Option[Frame]
+    val flags = cpu.irq_save()
+    lock.lock()
+    val found = take(n)
+    lock.unlock()
+    cpu.irq_restore(flags)
+    found
+
+// Give one frame back.
+free_frame(f: Frame) = free_frames(f, 1)
+
+// Give back `n` frames starting at `f`. A frame that is not in use, or not RAM this allocator covers,
+// is a bug in the caller, and stops the kernel rather than corrupting the bitmap.
+free_frames(f: Frame, n: u64)
+    val flags = cpu.irq_save()
+    lock.lock()
+    val i = u64(f) - first_frame
+    if u64(f) < first_frame || i + n > frame_count then
+        panic("keel: free_frames: frame outside RAM")
+    for k in i..<i + n
+        if !is_set(k) then panic("keel: free_frames: frame freed twice")
+        clear(k)
+    free_count += n
+    if i / 64 < hint then hint = i / 64
+    lock.unlock()
+    cpu.irq_restore(flags)
+
+// How many frames are free right now.
+frames_free() -> u64
+    val flags = cpu.irq_save()
+    lock.lock()
+    val n = free_count
+    lock.unlock()
+    cpu.irq_restore(flags)
+    n
+
+// First fit, starting at the hint for a single frame and at the beginning for a run. Called with the
+// lock held.
+private take(n: u64) -> Option[Frame]
+    if n == 0 || n > free_count then return None
+    var i = if n == 1 then hint * 64 else 0
+    var run: u64 = 0
+    while i < frame_count
+        if i % 64 == 0 && run == 0 && bitmap[usize(i / 64)] == ~u64(0)
+            i += 64
+        else if is_set(i)
+            run = 0
+            i += 1
+        else
+            run += 1
+            i += 1
+            if run == n
+                val start = i - n
+                for k in start..<i
+                    set(k)
+                free_count -= n
+                if n == 1 then hint = i / 64
+                return Some(Frame(u36(first_frame + start)))
+    None

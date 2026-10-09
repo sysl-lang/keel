@@ -33,7 +33,16 @@ expected=(
     "keel: tick 3"          # three timer interrupts arrived through the GIC, counted by an Atomic
     "keel: trap translation fault level 0"   # the low half is unmapped once the identity map is gone
     "keel: recovered from the fault"         # ...and the handler stepped over the faulting load
+    "keel: frames "         # the frame allocator took RAM's size from the device tree (checked below)
+    "keel: buf ok"          # a Buf[u64] grew to 10,000 elements on the kernel heap and summed right
+    "keel: hello from the heap"              # a string built by interpolation
+    "keel: closure ok"      # a closure capturing a boxed value
+    "keel: heap reclaimed"  # every frame came back once those were dropped, and no block is live
 )
+
+# 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
+frames_min=65000
+frames_max=65536
 
 elf=$out/keel.elf
 log=$out/boot.log
@@ -82,6 +91,11 @@ for line in $expected; do
     text=$rest
     seen="$seen '$line'"
 done
+frames=${${(M)${(f)"$(<$log)"}:#keel: frames *}#keel: frames }
+if [[ $frames != <-> ]] || (( frames < frames_min || frames > frames_max )); then
+    print -r -- "FAIL: 'keel: frames $frames' is not a free count between $frames_min and $frames_max"
+    return 1
+fi
 if (( qemu_exit != 0 )); then
     print -r -- "FAIL: QEMU exited with status $qemu_exit"
     return 1

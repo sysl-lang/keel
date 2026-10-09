@@ -19,3 +19,10 @@ system_off() -> never
         asm
             [aarch64] "wfi"
             [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// The standard library's `exit`, which `panic` and a failed `unwrap` end in after printing their
+// message. A kernel has nothing to return to, so it says so and powers the machine off.
+@export("exit")
+kernel_exit(code: int) -> never
+    print("keel: stopped, exit code", code)
+    system_off()

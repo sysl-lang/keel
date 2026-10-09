@@ -186,6 +186,26 @@ enable_irqs()
         [aarch64] "msr daifclr, #2"
         [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
 
+// Mask IRQs on this core and answer what DAIF held before, for `irq_restore`. What a lock an interrupt
+// handler may also take is held under.
+irq_save() -> u64
+    var v: u64 = 0
+    asm
+        [aarch64]
+            "mrs {v}, daif"
+            "msr daifset, #2"
+            out v : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    v
+
+// Put DAIF back as `irq_save` found it.
+irq_restore(daif: u64)
+    asm
+        [aarch64]
+            "msr daif, {daif}"
+            in daif : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
 // Sleep until an interrupt is pending. The block clobbers memory, so whatever the loop around it
 // reads is read again after it.
 wait_for_interrupt()

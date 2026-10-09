@@ -8,6 +8,12 @@ extern __image_start: u8
 extern __text_end: u8
 extern __rodata_end: u8
 extern __stack_guard: u8
+extern __image_end: u8
+
+// The physical range the whole image occupies, boot stack and the table pool in `.bss` included.
+image_range() -> (PhysAddr, u64)
+    val start = phys_of(usize(&__image_start))
+    (start, u64(phys_of(usize(&__image_end))) - u64(start))
 
 // TCR_EL1 (Arm ARM D19.2.139). The `0` halves (T0SZ, EPD0, ...) are the low half, TTBR0's; the `1`
 // halves are the kernel's, TTBR1's.
@@ -104,15 +110,15 @@ build_boot_maps() -> BootMaps
     val text_end = phys_of(usize(&__text_end))
     val rodata_end = phys_of(usize(&__rodata_end))
     val guard = phys_of(usize(&__stack_guard))
-    val two_mib = ram + u64(2 << 20)
+    val paged_end = ram + IMAGE_REGION_END
 
     map_kernel(root, PhysAddr(0), RAM_BASE, device())
     map_kernel(root, ram, u64(start) - u64(ram), ram_rw())
     map_kernel(root, start, u64(text_end) - u64(start), text())
     map_kernel(root, text_end, u64(rodata_end) - u64(text_end), ram_ro())
     map_kernel(root, rodata_end, u64(guard) - u64(rodata_end), ram_rw())
-    map_kernel(root, guard + u64(4096), u64(two_mib) - u64(guard) - 4096, ram_rw())
-    map_kernel(root, two_mib, RAM_SIZE - (2 << 20), ram_rw())
+    map_kernel(root, guard + u64(4096), u64(paged_end) - u64(guard) - 4096, ram_rw())
+    map_kernel(root, paged_end, RAM_SIZE - IMAGE_REGION_END, ram_rw())
 
     BootMaps(id_pa, root_pa)
 

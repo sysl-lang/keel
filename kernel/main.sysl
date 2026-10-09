@@ -1,14 +1,18 @@
 // keel — a research kernel for aarch64 on QEMU's `virt` machine.
 
 import keel.cpu.{current_el, enable_irqs, wait_for_interrupt}
+import keel.dtb
 import keel.gic
+import keel.heap
 import keel.irq
 import keel.mm
 import keel.pl011
 import keel.pl011.{put_hex, put_str}
 import keel.psci.system_off
+import keel.rt
 import keel.timer
 import keel.trap
+import sysl.buf.{Buf, buf}
 import sysl.sync.Ordering
 
 // The first instruction the machine runs. QEMU loads the ELF image at its physical addresses and
@@ -30,20 +34,23 @@ asm
     [aarch64]
         ".globl _start"
         "_start:"
+        "mov x19, x0"
         "adrp x0, __stack_top"
         "add x0, x0, :lo12:__stack_top"
         "mov sp, x0"
         "bl keel_boot"
         "add sp, sp, x0"
+        "mov x0, x19"
         "ldr x1, =kmain"
         "br x1"
         ".ltorg"
     [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel boots on aarch64 only"
 
 @export("kmain")
-kmain() -> never
+kmain(dtb_pa: u64) -> never
     mm.drop_identity()
     print("keel: hello")
+    init_memory(dtb_pa)
 
     if current_el() != 1
         print("keel: expected EL1, running at EL", current_el())
@@ -80,11 +87,78 @@ kmain() -> never
 
     // The low half has no translation table any more, so reading the kernel's own physical address
     // there is a translation fault at level 0. The trap handler reports it and steps over the load.
-    if trap.probe(mm.VirtAddr(mm.RAM_BASE + 0x8_0000))
+    if trap.probe(mm.VirtAddr(mm.RAM_BASE + 0x20_0000))
         print("keel: the identity map is still there")
     else
         print("keel: recovered from the fault")
+
+    heap_tests()
     system_off()
+
+// Give the frame allocator every frame of RAM that the image and the device tree do not occupy. RAM's
+// size comes from the device tree's `/memory` node; the boot maps cover `mm.RAM_SIZE`, so a machine
+// with more than that uses only that much until the kernel maps the rest.
+//
+// Where the tree is: a kernel booted by Linux's arm64 protocol is handed its address in x0, and
+// `_start` passes x0 through as `x0_at_entry`. QEMU does that only for a Linux `Image`; for an ELF
+// image it leaves x0 zero (seen under HVF and TCG) and puts the tree at the start of RAM, which QEMU's
+// `virt` documentation promises for a bare-metal guest. So zero means the start of RAM.
+private init_memory(x0_at_entry: u64)
+    val dtb_pa = if x0_at_entry != 0 then x0_at_entry else mm.RAM_BASE
+    val blob: *u8 = ptr_cast(usize(u64(mm.to_virt(mm.PhysAddr(dtb_pa)))))
+    val tree_size = dtb.total_size(blob) match
+        Some(n) -> n
+        None -> panic("keel: no device tree where the boot protocol says one is")
+    val ram = dtb.ram(blob) match
+        Some(r) -> r
+        None -> panic("keel: the device tree has no /memory node")
+    val size = if ram.size > mm.RAM_SIZE then mm.RAM_SIZE else ram.size
+    val reserved: [2](mm.PhysAddr, u64) = [(mm.PhysAddr(dtb_pa), tree_size), mm.image_range()]
+    mm.init_frames(mm.PhysAddr(ram.base), size, reserved[0..<2])
+
+private struct Cell
+    value: u64
+
+// What milestone 3 is for: `Buf`, `string`, `&T` and closures in the kernel, all on keel.heap, and
+// every frame they took given back once they are gone.
+private heap_tests()
+    val before = mm.frames_free()
+    print("keel: frames", before)
+
+    val (sum, during) = grow_buf(10_000)
+    if sum == 10_000 * 9_999 / 2 && during < before
+        print("keel: buf ok")
+    else
+        print("keel: buf wrong: sum", sum, "frames free while it lived", during)
+
+    print(greeting("the heap"))
+
+    if closure_result() == 42 then print("keel: closure ok") else print("keel: closure wrong")
+
+    val after = mm.frames_free()
+    if after == before && heap.live() == 0
+        print("keel: heap reclaimed")
+    else
+        print("keel: heap leaked: frames free", after, "of", before, "blocks live", heap.live())
+
+// A `Buf[u64]` of `n` elements and their sum, and the frames free while it is alive. The `Buf` is
+// dropped when this returns.
+private grow_buf(n: u64) -> (u64, u64)
+    var b: Buf[u64] = buf()
+    for i in 0..<n
+        b.push(i)
+    var sum: u64 = 0
+    for x in b
+        sum += x
+    (sum, mm.frames_free())
+
+private greeting(place: string) -> string = s"keel: hello from $place"
+
+// A closure that captures a boxed value, called.
+private closure_result() -> u64
+    val c: &Cell = Cell(41)
+    val add_one = () -> c.value + 1
+    add_one()
 
 // Stop at a `brk`, which the trap handler reports and steps over.
 breakpoint()

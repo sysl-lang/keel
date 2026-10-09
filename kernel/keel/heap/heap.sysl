@@ -1,0 +1,154 @@
+module keel.heap
+
+// The kernel heap: the allocator every `&T` box, `Buf`, `string` and closure in the kernel comes from.
+// `kernel/package.hocon` names `keel_alloc` and `keel_free` as the program's allocating pair, so the
+// compiler calls these wherever it would call `malloc` and `free`.
+//
+// Two kinds of block, both carved from frames and both starting with a `Page` header in their first
+// frame, so `free` finds what a pointer belongs to by rounding it down to its page:
+//
+//   small   eight size classes, 16 to 2048 bytes. A slab is one frame holding objects of one class
+//           after its header, with its own free list. The slabs of a class that have a free object are
+//           on a doubly-linked list; a slab whose last object comes back returns its frame.
+//   large   anything bigger: a run of whole frames, the object after the header, the run's length in
+//           the header. Freed straight back to the frame allocator.
+//
+// Every pointer handed out is 16-byte aligned, as malloc's are on AArch64. Running out is a panic that
+// says so: the language has no way for an allocation to fail.
+
+import keel.cpu
+import keel.mm
+import keel.mm.{Frame, PhysAddr}
+import sysl.sync.SpinLock
+
+private const PAGE: u64 = 4096
+private const HEADER: u64 = 64
+private const CLASSES: usize = 8
+private const MIN_SHIFT: u64 = 4                 // the smallest class is 16 bytes
+private const LARGE: u32 = 0xffff_ffff
+private const MAGIC: u32 = 0x6b65_6c68           // "kelh"
+
+// The first 64 bytes of every frame (or run of frames) the heap owns.
+private struct Page
+    magic: u32
+    class: u32                  // a size class, or LARGE
+    used: u64                   // objects handed out (small), frames in the run (large)
+    free: *u8                   // the first free object; each free object holds the next
+    next: *Page                 // the class's list of slabs with a free object
+    prev: *Page
+
+@assert(sizeof(Page) <= 64, "a page header fits in HEADER bytes")
+
+private var lock: SpinLock = SpinLock(0)
+
+// Per class, the first slab with a free object.
+private var partial: [CLASSES]*Page
+
+private var allocated: u64 = 0
+
+@export("keel_alloc")
+keel_alloc(n: usize) -> *u8
+    val flags = cpu.irq_save()
+    lock.lock()
+    val p = if u64(n) <= class_size(CLASSES - 1) then small(class_of(u64(n))) else large(u64(n))
+    allocated += 1
+    lock.unlock()
+    cpu.irq_restore(flags)
+    p
+
+@export("keel_free")
+keel_free(p: *u8)
+    if p == null then return
+    val flags = cpu.irq_save()
+    lock.lock()
+    val page: *Page = ptr_cast(usize(u64(usize(p)) & ~(PAGE - 1)))
+    if page.magic != MAGIC then panic("keel: free of a pointer the heap did not hand out")
+    if page.class == LARGE
+        mm.free_frames(frame_of_page(page), page.used)
+    else
+        give_back(page, p)
+    allocated -= 1
+    lock.unlock()
+    cpu.irq_restore(flags)
+
+// How many blocks are handed out and not yet freed.
+live() -> u64 = allocated
+
+private class_size(c: usize) -> u64 = u64(1) << (MIN_SHIFT + u64(c))
+
+private class_of(n: u64) -> usize
+    var c: usize = 0
+    while class_size(c) < n
+        c += 1
+    c
+
+// An object of class `c`, from the first slab that has one, or from a new slab.
+private small(c: usize) -> *u8
+    if partial[c] == null then partial[c] = new_slab(c)
+    val page = partial[c]
+    val obj = page.free
+    val link: **u8 = ptr_cast(obj)
+    page.free = *link
+    page.used += 1
+    if page.free == null then unlink(page, c)
+    obj
+
+// A frame cut into objects of class `c`, each free one pointing at the next.
+private new_slab(c: usize) -> *Page
+    val page = page_of_frame(frame_or_panic(1))
+    val size = class_size(c)
+    val count = (PAGE - HEADER) / size
+    val base = u64(usize(page)) + HEADER
+    for i in 0..<count
+        val link: **u8 = ptr_cast(usize(base + i * size))
+        *link = if i + 1 == count then null else ptr_cast(usize(base + (i + 1) * size))
+    page.magic = MAGIC
+    page.class = u32(c)
+    page.used = 0
+    page.free = ptr_cast(usize(base))
+    page.next = null
+    page.prev = null
+    page
+
+private give_back(page: *Page, p: *u8)
+    val c = usize(page.class)
+    val was_full = page.free == null
+    val link: **u8 = ptr_cast(p)
+    *link = page.free
+    page.free = p
+    page.used -= 1
+    if page.used == 0
+        if !was_full then unlink(page, c)
+        page.magic = 0
+        mm.free_frame(frame_of_page(page))
+    else if was_full
+        page.prev = null
+        page.next = partial[c]
+        if partial[c] != null then partial[c].prev = page
+        partial[c] = page
+
+private unlink(page: *Page, c: usize)
+    if page.prev != null then page.prev.next = page.next else partial[c] = page.next
+    if page.next != null then page.next.prev = page.prev
+    page.next = null
+    page.prev = null
+
+// A run of whole frames with the object after the header.
+private large(n: u64) -> *u8
+    val frames = (n + HEADER + PAGE - 1) / PAGE
+    val page = page_of_frame(frame_or_panic(frames))
+    page.magic = MAGIC
+    page.class = LARGE
+    page.used = frames
+    page.free = null
+    page.next = null
+    page.prev = null
+    ptr_cast(usize(u64(usize(page)) + HEADER))
+
+private frame_or_panic(n: u64) -> Frame = mm.alloc_frames(n) match
+    Some(f) -> f
+    None -> panic("keel: out of memory: the kernel heap asked for more frames than are free")
+
+private page_of_frame(f: Frame) -> *Page = ptr_cast(usize(u64(mm.to_virt(mm.frame_addr(f)))))
+
+private frame_of_page(p: *Page) -> Frame = mm.frame_of(mm.to_phys(mm.VirtAddr(u64(usize(p)))))

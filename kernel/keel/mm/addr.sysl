@@ -7,12 +7,13 @@ module keel.mm
 //     0xFFFF_0000_0000_0000 .. 0xFFFF_0000_3FFF_FFFF   PA 0 .. 1 GiB: QEMU virt's devices (GIC at
 //                                                     0x0800_0000, PL011 at 0x0900_0000, ...), as
 //                                                     Device-nGnRE, never executable; one 1 GiB block
-//     0xFFFF_0000_4000_0000 .. + RAM_SIZE              RAM, Normal write-back. The first 2 MiB, which
-//                                                     holds the image, is mapped page by page so text
-//                                                     is read-only and executable, read-only data is
-//                                                     read-only, everything else is never executable,
-//                                                     and the page below the boot stack is a guard.
-//                                                     The rest of RAM is 2 MiB blocks.
+//     0xFFFF_0000_4000_0000 .. + RAM_SIZE              RAM, Normal write-back. The first 2 MiB holds
+//                                                     the device tree and is one block. The second,
+//                                                     which holds the image, is mapped page by page
+//                                                     so text is read-only and executable, read-only
+//                                                     data is read-only, everything else is never
+//                                                     executable, and the page below the boot stack
+//                                                     is a guard. The rest of RAM is 2 MiB blocks.
 //     anything else                                    unmapped: a translation fault
 //
 //   TTBR0 (the low half) holds an identity map of RAM only while the MMU is switched on, so the
@@ -29,10 +30,14 @@ const KERNEL_BASE: u64 = 0xFFFF_0000_0000_0000
 // The physical bits of an address: a 48-bit output address.
 private const PA_MASK: u64 = 0x0000_FFFF_FFFF_FFFF
 
-// RAM on QEMU virt starts at 1 GiB. `scripts/boot-test.sh` gives the machine 256 MiB, and keel does not
-// read the device tree yet, so the size is this constant.
+// RAM on QEMU virt starts at 1 GiB. The boot maps cover RAM_SIZE of it, built before anything can read
+// the device tree; the frame allocator takes the size the tree reports, up to this much.
 const RAM_BASE: u64 = 0x4000_0000
 const RAM_SIZE: u64 = 256 << 20
+
+// The image is loaded 2 MiB into RAM (link.ld), after the device tree QEMU puts at RAM's start, and must
+// end before this offset: the stretch from 2 MiB to here is what the boot maps map page by page.
+const IMAGE_REGION_END: u64 = 4 << 20
 
 // The two kinds of address. They are distinct types, so a physical address cannot be dereferenced
 // or handed to something that wants a virtual one without a written conversion.

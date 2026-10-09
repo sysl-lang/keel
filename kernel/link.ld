@@ -1,5 +1,6 @@
 /* keel's image, for QEMU `virt`: RAM begins at 0x4000_0000 and QEMU puts the device tree at its
-   start, so the image is loaded half a megabyte in.
+   start, so the image is loaded 2 MiB in. The tree QEMU builds is 1 MiB, and QEMU loads it only if it
+   fits below the image: with the image half a megabyte in, it silently loaded no tree at all.
 
    It is LINKED in the high half, at KERNEL_BASE plus that physical address (keel.mm has the map), and
    LOADED at the physical address: each section's AT() is its address minus KERNEL_BASE. QEMU loads
@@ -12,8 +13,13 @@
 
 ENTRY(_start)
 
+/* The allocating pair package.hocon names, as aliases of keel.heap's exported functions
+   (FINDINGS.md 18). */
+keel_heap_alloc = keel_alloc;
+keel_heap_free  = keel_free;
+
 KERNEL_BASE = 0xFFFF000000000000;   /* keel.mm.KERNEL_BASE */
-LOAD_ADDR   = 0x40080000;
+LOAD_ADDR   = 0x40200000;
 
 SECTIONS
 {
@@ -69,5 +75,5 @@ SECTIONS
     }
 }
 
-ASSERT(__image_end <= KERNEL_BASE + 0x40200000,
-       "keel's image has to end inside the first 2 MiB of RAM, which keel.mm maps page by page")
+ASSERT(__image_end <= KERNEL_BASE + 0x40400000,
+       "keel's image has to end inside the second 2 MiB of RAM, which keel.mm maps page by page")
