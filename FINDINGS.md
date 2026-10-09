@@ -1107,7 +1107,10 @@ the build does not know the kernel depends on the file — it happens to recompi
 `hello.elf` did reach the next kernel build's `.rodata`), so nothing goes stale today, but nothing
 says it will not.
 
-Workaround (used): the `.incbin` block above, one pair of labels per program, built from the root.
+Workaround (used until milestone 10): the `.incbin` block above, one pair of labels per program,
+built from the root. Since milestone 10 keel reads every program from its filesystem's `/bin`, so
+the block is gone and the kernel builds from any directory; the gap itself is still open for a
+kernel that has to carry a first program (an initramfs) or any other blob.
 
 Clean form: `embed("path") -> []const u8` (Rust's `include_bytes!`, C23's `#embed`), a constant
 resolved against the file it is written in, with alignment, which the build tracks as an input.
@@ -1553,6 +1556,166 @@ target is `f"error $code"` — so removing a file another process has open (keel
 filesystem call cannot say what its own error numbers mean. Workaround: none needed (keel's `cp` never
 meets one in the tests). Clean form: `sysl_fs_strerror` becomes the twenty-sixth hook, optional —
 answered `-1` where the supplier has no words, which is today's behaviour.
+
+## Milestone 10: processes and a shell
+
+Findings 47-49 are against the prerelease `87ec6b7437`. Found while moving the user programs out of
+the kernel's image onto the disk, giving keel a process model (`spawn`, `wait`, `getppid`, a process
+table, orphans handed to init), an interrupt-driven console with a line discipline, and writing `init`,
+`sh` and five more utilities in sysl. Ranked: 47 is a check that cannot be stated at the grain a
+kernel needs, so the only way to keep it is to hide an edge from it; 48 is the standard library
+reaching C's names for reading standard input, found only at the link; 49 is why the shell does not
+use `sysl.process`. None was fixed here.
+
+## 47. `@no_alloc` is a property of a whole module, so an exception entry whose interrupt path must not allocate and whose system-call path must cannot say so
+
+`keel.trap` is `@no_alloc`: its IRQ path (`dispatch`, the timer, the scheduler's preemption, the
+drivers' interrupt handlers) runs on whatever stack the interrupt landed on, and the check through
+every call is what keeps it allocator-free. The same module's `keel_trap` also takes the synchronous
+exception from EL0 — a system call — and hands it to `keel.proc.user_sync`. Milestone 10's `spawn`
+has to allocate: the executable read into a buffer, the argument strings, the `Process` box, the
+thread's closure. The build stops at the call in the trap module:
+
+    error: this reaches 'keel.proc.lay_out_args', which makes heap storage, and this module declared
+    '@no_alloc' — an allocator-free module may only call what is allocator-free itself
+       --> kernel/keel/trap/trap.sysl:187:14
+        |
+    187 |         proc.user_sync(&frame.x[0], u64(syndrome(raw).ec), u64(syndrome(raw).iss))
+        |              ^^^^^^^^^
+
+The check is right that the call allocates, and wrong about whose promise it breaks: the system call
+runs on the process's own kernel stack with interrupts enabled, where a kernel allocates as a matter
+of course. The property belongs to the *IRQ entry*, and there is no way to put it there:
+
+    @no_alloc
+    @export("on_irq")
+    on_irq(n: u64) -> u64 = n + 1
+
+    error: this attribute belongs in the file's header, on the lines directly after 'module' and
+    before everything else — it is a property of the whole module, not of the statements below it
+
+The reference says the same (`modules.md`: "no execution that begins in this module's own code makes
+heap storage"). The other arrangements both lose something: taking `@no_alloc` off `keel.trap` stops
+checking the fault paths and the vector code's own calls; moving the dispatch of EL0's synchronous
+exceptions out of the module needs a second vector entry in assembly, since every slot shares one
+tail that calls `keel_trap`.
+
+(While finding this, `echo([LF])` — a one-element array literal passed where a `[]const u8` is
+wanted, in the console's line discipline — was reported as making heap storage too. It is the same
+check working, but a constant one-byte argument is not where a kernel author expects an allocation.)
+
+Workaround (used): `keel.trap` declares `extern "keel_user_sync" user_sync(...)` and `keel.proc`
+`@export`s the function under that symbol. The check stops at an `extern`, so the one edge it should
+not follow is hidden from it — and so would be any edge written that way, which is the cost: nothing
+distinguishes "this edge allocates on purpose" from "this edge was hidden".
+
+Clean form: `@no_alloc` on a function (an entry point), checked through every call from it, beside
+the module form; or an annotation on a call or an `extern` saying the callee is outside the promise
+(`@allocates`), so the exception is written where it is made and is visible to a reader.
+
+## 48. `sysl.io`'s standard input and `sysl.flush` reach C's `read`, `memchr` and `fflush` by name, and a target with no C library learns so at the link
+
+The shell reads its commands with `sysl.io.lines(&stdin())`. On `aarch64-freestanding` the program
+builds and the link fails:
+
+    ld.lld: error: undefined symbol: memchr
+    >>> referenced by sysl.code.o.ll
+    >>>               sysl.code.o:(sysl.io$Lines.line_end) in archive …/std.syslib
+
+The shortest input (`sysl build-c --target aarch64-freestanding`, no diagnostic, then `llvm-nm -u`):
+
+    import sysl.io.{lines, stdin}
+
+    @export("probe")
+    probe() -> usize
+        var input = stdin()
+        var n: usize = 0
+        for line in lines(&input)
+            n += line.bytes.len
+        flush()
+        n
+
+    U exit  U fflush  U free  U malloc  U memchr  U putchar  U read
+
+`malloc`/`free` are the manifest's allocating pair and `putchar`/`exit` are what `print` and `panic`
+are documented to need from a freestanding program. The other three are not documented anywhere a
+freestanding author would look: `FdReader.read` calls `sysl.sys.sysl_read` = C's `read`,
+`Lines.line_end` calls `sysl_memchr` = C's `memchr`, and `flush()` is `fflush(NULL)`. `sysl.fs` was
+given exactly the seam this lacks (finding 40): a freestanding program that reaches a filesystem
+hook without supplying it is refused at compile time, naming the hook. Reading a descriptor is the
+same operation as `sysl.fs.sys`'s `sysl_fs_read`, which keel already answers.
+
+Workaround (used): keel's user runtime defines `read` (over the `read` system call; for descriptor
+0 it first pushes out what `print` has collected, so a prompt appears before the shell waits),
+`fflush` (pushes the same line out) and `memchr` (a loop) under C's names — as it already defines
+`putchar`, `memcpy` and the rest.
+
+Clean form: on a target with no C library, `sysl.io`'s descriptor reads go through a hook (or
+`sysl_fs_read` itself) and `flush` through another, both covered by the compile-time check that
+names what is missing; and `memchr` written in sysl there, as `putbytes` already is (`#if hosted`).
+
+## 49. `sysl.process` is fork/exec over C shims, so a target with its own process calls has nothing to supply, and nothing in it can give a child a file as its output
+
+The shell is the program `sysl.process` is for — start a program with a list of arguments, wait,
+read how it ended — and it cannot use it on keel:
+
+    import rt.keel.user
+    import sysl.process
+
+    process.run("/bin/ls", ["/"]) match
+        Ok(_) -> exit(0)
+        Err(_) -> exit(1)
+
+    $ sysl build --target aarch64-freestanding … user/procprobe
+    ld.lld: error: undefined symbol: sysl_proc_start
+    ld.lld: error: undefined symbol: sysl_proc_wait
+
+The module is `@requires(posix)`, and a manifest that mentions no capabilities provides them all
+(`packages.md`), so a freestanding program reaches it and fails at the link, naming C shims in
+`__posix__/spawn.c` (`fork`, `execvp`, `waitpid`) — the shape `sysl.fs` had before finding 40 was
+answered. There is no hook layer to supply, though keel's `spawn`/`wait` are each one call. And the
+surface would not carry a shell even with one: a child's output can be inherited or captured into a
+buffer (`capture`, `start(…, stderr)`), but not sent to a file or a descriptor the caller opened, so
+`>` has no spelling; and `Status` (exit code, signal, timed out) has no case for a child the kernel
+ended for a fault, which is how keel reports one.
+
+Workaround (used): the shell uses keel's runtime directly — `user.spawn(path, args, out_fd)`,
+`user.wait(pid) -> (pid, ExitStatus)` — and `user.open` for the `>` file. Everything else it does
+(the current directory, `cd`, `pwd`) is `sysl.fs`.
+
+Clean form: a `sysl.process.sys` seam like `sysl.fs.sys` — start (program, argv, directory, and a
+descriptor or "inherit" for each standard stream) and wait (pid → how it ended) — answered by
+`__posix__` on a hosted target and by the program on one without a C library, under the same
+compile-time check; a `Stdio`-like choice per stream (inherit, a file, a pipe, captured) in `run` and
+`start`; and a `Status` case for "ended by the system" that is not a signal number.
+
+## What worked in milestone 10
+
+- **Spawn, not fork, cost almost nothing new.** `spawn` is `start` with a parent: the loader, the
+  argument layout and the thread were milestone 6's, and the table is a fixed array of raw pointers
+  under one `IrqLock`, each entry keeping its own box alive through `Process.me: Option[&sync
+  Process]` exactly as a thread does. A parent's `wait` sleeps on one `WaitQueue` that every ending
+  wakes; an ending hands its children to init under the same lock. `getppid` is one field.
+- **Module storage with no initializer is zero, and zero is a valid lock, queue and table.** The
+  console's `IrqLock`, `WaitQueue`, `Mutex[Line]` and ring, and the process table, are declared with
+  no initializer; `emit-llvm` shows no `@main` (finding 31's trap was checked for, not hit).
+- **An exit status is `exit(code)`, and the compiler says so.** `main() -> int` is refused: *"'main'
+  yields nothing or a 'Result[unit, E]', so it may not result in int — a program's exit status is not
+  something a signature can say. 'exit(code)' is how a program chooses its own"*. `false` is
+  `exit(1)`; the runtime's `exit` already ends the process with the code.
+- **The shell's string handling needed nothing missing**: words collected as `Buf[u8]` and turned into
+  `string`s with `from_utf8`, quotes handled byte by byte, `==` on strings, `s"/bin/$name"`. 137
+  lines with its comments; 29.9 KiB of text.
+- **`sysl.io.lines` over the console is the whole of the shell's input loop** once the runtime answers
+  `read` (finding 48): the kernel hands out one cooked line per `read`, so the reader never holds
+  bytes of the next command.
+- **Size**: the kernel image is 245 KB, from 1.41 MB with every program embedded; the disk carries 22
+  programs in 648 of its 1,024 blocks, most of each ELF being the 64 KiB segment alignment.
+- **Timing**: per boot 1.1-1.4 s under HVF, 1.7-1.8 s at -O0, 3.4 s under TCG (the programs are read
+  from the disk now, and each boot runs a shell session).
+- Controls: `wait` answering code 0 for every child fails the transcript (`$ false` and no `sh:
+  false: exit status 1`); a console that echoes only the newline fails it at the first command (`$ `
+  then `hello`).
 
 ## What worked in milestone 9
 

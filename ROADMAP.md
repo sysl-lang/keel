@@ -27,4 +27,4 @@ the language rather than worked around here.
 | 7 | virtio-blk driver | sectors read and written from a disk image ✅ |
 | 8 | A simple filesystem; `open`/`read`/`write`/`close`, directories | files survive a reboot ✅ |
 | 9 | **sysl targets keel**: a target whose standard library reaches keel's system calls | `cp` written in sysl with `sysl.fs` copies a file ✅ |
-| 10 | Processes and a shell: `fork`/`exec`/`wait` (or `spawn`), a serial shell, `ls`/`cat`/`cp` | a session at the shell |
+| 10 | Processes and a shell: `fork`/`exec`/`wait` (or `spawn`), a serial shell, `ls`/`cat`/`cp` | a session at the shell ✅ |
