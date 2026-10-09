@@ -106,6 +106,7 @@ build_boot_maps() -> BootMaps
     map_range(id_root, VirtAddr(RAM_BASE), ram, RAM_SIZE, identity())
 
     val (root, root_pa) = new_table()
+    remember_kernel_root(root)
     val start = phys_of(usize(&__image_start))
     val text_end = phys_of(usize(&__text_end))
     val rodata_end = phys_of(usize(&__rodata_end))

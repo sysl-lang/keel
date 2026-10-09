@@ -1,0 +1,93 @@
+module keel.mm
+
+import keel.cpu
+import sysl.sync.SpinLock
+
+// Kernel thread stacks. Each lives in a window of the kernel half of its own, 32 KiB a slot: the top
+// 16 KiB are mapped, page by page, to frames from the frame allocator, and the 16 KiB below stay
+// unmapped, so a thread that runs off the bottom of its stack takes a translation fault instead of
+// writing over its neighbour. RAM's own mapping is in 2 MiB blocks, which a single guard page cannot
+// be cut out of; a window of its own needs only two more tables (one level-2, one level-3 for the
+// window's 2 MiB) and no splitting.
+//
+// The window is at 256 GiB into the kernel half: level-1 slot 256 of the kernel's root, far from the
+// devices (slot 0) and RAM (slot 1).
+
+private const WINDOW: u64 = KERNEL_BASE + 0x40_0000_0000
+private const SLOT: u64 = 32 << 10
+const STACK_SIZE: u64 = 16 << 10
+private const SLOTS: u64 = 64                       // one level-3 table: 2 MiB of window
+
+private const PAGE: u64 = 4096
+
+// Taken with IRQs masked: the tables and the slot map are shared by every core.
+private var stack_lock: SpinLock = SpinLock(0)
+
+// Bit i set while slot i holds a stack.
+private var slots_used: u64 = 0
+
+// A thread's stack: which slot, and the address just above its highest byte (where SP starts).
+struct Stack
+    slot: u64
+    top: VirtAddr
+
+// A mapped 16 KiB stack with an unmapped guard below it, or None when every slot is taken or RAM is
+// exhausted.
+alloc_stack() -> Option[Stack]
+    val flags = cpu.irq_save()
+    stack_lock.lock()
+    var found = SLOTS
+    for i in 0..<SLOTS
+        if (slots_used >> i) & 1 == 0
+            found = i
+            break
+    if found == SLOTS
+        stack_lock.unlock()
+        cpu.irq_restore(flags)
+        return None
+    slots_used |= u64(1) << found
+    val top = WINDOW + (found + 1) * SLOT
+    var mapped: u64 = 0
+    while mapped < STACK_SIZE
+        val f = alloc_frame() match
+            Some(f) -> f
+            None -> break
+        map_range(kernel_root(), VirtAddr(top - STACK_SIZE + mapped), frame_addr(f), PAGE, ram_rw())
+        mapped += PAGE
+    cpu.publish_tables()
+    val ok = mapped == STACK_SIZE
+    if !ok
+        unmap_stack(found, mapped)
+    stack_lock.unlock()
+    cpu.irq_restore(flags)
+    if ok then Some(Stack(found, VirtAddr(top))) else None
+
+// Unmap a stack, give its frames back and free its slot. Nothing may be running on it.
+free_stack(s: Stack)
+    val flags = cpu.irq_save()
+    stack_lock.lock()
+    unmap_stack(s.slot, STACK_SIZE)
+    stack_lock.unlock()
+    cpu.irq_restore(flags)
+
+// The lowest `len` bytes of slot `slot`'s stack area are unmapped, frames freed, and the slot made free.
+// Called with the lock held.
+private unmap_stack(slot: u64, len: u64)
+    val top = WINDOW + (slot + 1) * SLOT
+    var done: u64 = 0
+    while done < len
+        val va = VirtAddr(top - STACK_SIZE + done)
+        unmap_page(kernel_root(), va) match
+            Some(pa) ->
+                cpu.flush_tlb_page(u64(va))
+                free_frame(frame_of(pa))
+            None -> panic("keel: a stack page that was never mapped")
+        done += PAGE
+    slots_used &= ~(u64(1) << slot)
+
+// How many stacks are allocated right now.
+stacks_in_use() -> u64
+    var n: u64 = 0
+    for i in 0..<SLOTS
+        n += (slots_used >> i) & 1
+    n

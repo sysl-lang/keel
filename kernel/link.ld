@@ -18,6 +18,12 @@ ENTRY(_start)
 keel_heap_alloc = keel_alloc;
 keel_heap_free  = keel_free;
 
+/* The ownership runtime's per-thread drain list. The runtime carries a weak `__sysl_arc_reaper` in the
+   program's own module, so a sysl function exported under that name is a second definition clang
+   refuses (FINDINGS.md 21); keel.sched exports `keel_arc_reaper` and this assignment wins over the
+   weak one. */
+__sysl_arc_reaper = keel_arc_reaper;
+
 KERNEL_BASE = 0xFFFF000000000000;   /* keel.mm.KERNEL_BASE */
 LOAD_ADDR   = 0x40200000;
 

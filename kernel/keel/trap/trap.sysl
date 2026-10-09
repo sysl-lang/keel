@@ -11,6 +11,7 @@ import keel.irq.dispatch
 import keel.mm
 import keel.pl011.{put_byte, put_hex, put_str}
 import keel.psci.system_off
+import keel.sched.preempt
 import sysl.sync.{Atomic, Ordering}
 
 // Exception entry. The processor jumps to `VBAR_EL1` plus a fixed offset chosen by what happened and
@@ -162,6 +163,7 @@ install()
 keel_trap(frame: *Frame, slot: u64)
     if slot == IRQ_CURRENT
         dispatch()
+        preempt()
     else if slot == SYNC_CURRENT
         synchronous(frame)
     else

@@ -1,0 +1,162 @@
+module keel.sched
+
+// The scheduler: round robin over one run queue, preempted by the timer.
+//
+// One run queue for the whole machine, under one spinlock (`lock`), taken with IRQs masked. Per-core
+// queues would scale further, and need balancing between them; a global queue is right for the handful
+// of cores QEMU's `virt` has, and makes a woken thread runnable on whichever core frees up first. What
+// is per core is in `Cpu`: the running thread, the idle thread, the time slice, and the flag the timer
+// interrupt raises. A core finds its own `Cpu` through TPIDR_EL1, so nothing here asks which core it is
+// running on after `init`, and nothing assumes there is only one.
+//
+// The lock is handed over with the processor: a thread calls `switch_locked` holding it, and the thread
+// that resumes is the one that releases it — after `finish_switch`, once the previous thread is no
+// longer on its stack. That is what stops a second core from picking a thread off the run queue while
+// it is still saving its registers, and what makes an exiting thread's stack safe to free as soon as
+// it is `Dead`.
+//
+// Lock order: a wait queue's guard (an `IrqLock`), then `lock`. `sleep` holds the guard until it holds
+// `lock`, so a waker — who needs both — cannot make the sleeper runnable before it is off the core.
+
+import keel.cpu
+import sysl.sync.{Atomic, Ordering, SpinLock}
+
+const MAX_CPUS: usize = 4
+
+// Timer ticks a thread runs before the scheduler is asked to switch (keel.timer's period each).
+private const SLICE: u64 = 1
+
+// Off only to show the boot test's interleaving check failing without preemption.
+private const PREEMPTION: bool = true
+
+struct Cpu
+    id: u64
+    current: *Thread
+    idle: *Thread
+    last: *Thread               // the thread this core switched away from, for `finish_switch`
+    slice: u64                  // ticks left in `current`'s time slice
+    need_resched: bool          // the slice ran out; switch on the way out of the interrupt
+
+private var cpus: [MAX_CPUS]Cpu
+
+private[sched] var lock: SpinLock = SpinLock(0)
+private var ready: Queue = Queue(null, null)
+private var started: bool = false
+private[sched] var next_id: Atomic[u64] = Atomic(0)
+
+// The drain list for references released before there is a current thread.
+private var boot_reaper: Reaper = Reaper(null, 0)
+
+// The running core's record. Valid once `init` has run on it.
+private[sched] this_cpu() -> *Cpu = ptr_cast(usize(cpu.tpidr()))
+
+// Make the code running now — kmain, on the boot stack — the boot core's first thread, give the core an
+// idle thread, and start scheduling. Interrupts may already be on; the timer only asks for a switch
+// once `started` is set.
+init()
+    val c = &cpus[usize(cpu.core_id())]
+    c.id = cpu.core_id()
+
+    val boot: &sync Thread = Thread(Context([0; 12], 0, 0), next_id.add(1), Running, null, None, None, None,
+        empty_wait_queue(), Reaper(null, 0), 0)
+    val bp: *Thread = &*boot
+    bp.me = Some(boot)
+    c.current = bp
+
+    val idle = new_thread(Some(idle_loop))
+    c.idle = &*idle
+    c.slice = SLICE
+
+    val flags = cpu.irq_save()
+    cpu.set_tpidr(u64(usize(c)))
+    started = true
+    cpu.irq_restore(flags)
+
+// What a core runs when nothing is ready. Interrupts are on, so the timer still arrives, and a
+// thread made ready since is switched to at the end of the slice.
+private idle_loop()
+    loop
+        cpu.wait_for_interrupt()
+
+// The thread running on this core.
+current() -> *Thread = this_cpu().current
+
+// Ready to run: on the run queue. Called with `lock` held.
+private[sched] make_ready_locked(t: *Thread)
+    t.state = Ready
+    ready.push(t)
+
+// Switch this core to the next ready thread. Called with `lock` held and IRQs masked; returns, with the
+// lock held, when something switches back to the caller. A caller still `Running` goes to the back of
+// the run queue, or simply carries on when nothing else is ready; one that is `Blocked` or `Exited`
+// has already been put where it belongs.
+private[sched] switch_locked()
+    val c = this_cpu()
+    val prev = c.current
+    if prev.state == Running
+        if ready.empty() then return
+        if prev == c.idle then prev.state = Ready else make_ready_locked(prev)
+    var next = ready.pop()
+    if next == null then next = c.idle
+    if next == prev
+        prev.state = Running
+        return
+    next.state = Running
+    c.current = next
+    c.last = prev
+    c.slice = SLICE
+    c.need_resched = false
+    switch_context(&prev.ctx, &next.ctx)
+    finish_switch()
+
+// The first thing a thread does once it has the processor back, with `lock` still held: the thread it
+// took over from is now off its stack, so an exited one is dead and its joiners may run.
+private[sched] finish_switch()
+    val c = this_cpu()
+    val prev = c.last
+    c.last = null
+    if prev != null && prev.state == Exited
+        prev.state = Dead
+        loop
+            val t = prev.exit_waiters.list.pop()
+            if t == null then break
+            make_ready_locked(t)
+
+// Sleep on `q` with `lock` held: woken by `finish_switch` or a `wake_*` on the same queue.
+private[sched] sleep_locked(q: *WaitQueue)
+    val me = this_cpu().current
+    me.state = Blocked
+    q.list.push(me)
+    switch_locked()
+
+// The timer interrupt's part: count down the running thread's slice.
+tick()
+    if !started then return
+    val c = this_cpu()
+    if c.slice > 0 then c.slice -= 1
+    if c.slice == 0 then c.need_resched = true
+
+// On the way out of an interrupt, with IRQs masked and the interrupted thread's registers saved on its
+// stack: switch if its slice is over. The thread switched to resumes wherever it gave up the processor
+// — another interrupt's return path, a `yield_now`, a `sleep`, or its start — and the interrupted one
+// resumes here, later, and returns from the exception as though nothing happened.
+preempt()
+    if !started || !PREEMPTION then return
+    val c = this_cpu()
+    if !c.need_resched then return
+    c.need_resched = false
+    lock.lock()
+    if !ready.empty() && c.current != c.idle then c.current.preemptions += 1
+    switch_locked()
+    lock.unlock()
+
+// The ownership runtime asks this for the running thread's drain list whenever a release reaches zero
+// (link.ld names it `__sysl_arc_reaper`, FINDINGS.md 21). Each thread needs its own: a thread preempted
+// half way through draining would otherwise have its list taken over by the next.
+@export("keel_arc_reaper")
+arc_reaper() -> *Reaper
+    val c = cpu.tpidr()
+    if c == 0 then return &boot_reaper
+    val p: *Cpu = ptr_cast(usize(c))
+    if p.current == null then return &boot_reaper
+    &p.current.reaper

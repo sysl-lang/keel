@@ -1,0 +1,69 @@
+module keel.sched
+
+// The context switch. A thread that gives up the processor does it by calling `keel_switch`, as an
+// ordinary function, so all it has to keep is what a call preserves: x19 to x29, the link register and
+// the stack pointer. Everything else is already saved by the caller's own code, or — for a thread
+// preempted in an interrupt — by the vector code, in a `trap.Frame` on that thread's stack, below
+// the call into the scheduler. No FP/SIMD state exists to save (`codegen.general_regs_only`).
+//
+//   keel_switch(from, to)    store the callee-saved registers and SP into *from, load them from *to,
+//                            and return — into whatever `to` was doing when it last called this.
+//
+// A thread that has never run has a `Context` made by `new_thread`: SP at the top of its stack, x30 at
+// `keel_thread_start`, x19 its `Thread`. So its first switch "returns" into the start code, which calls
+// `keel_thread_entry(thread)` and never comes back.
+//
+// The offsets (0 to 96 in steps of 16, SP at 96) are `Context`'s layout, which the `@assert`s pin.
+asm
+    [aarch64]
+        ".globl keel_switch"
+        "keel_switch:"
+        "mov x9, sp"
+        "stp x19, x20, [x0, #0]"
+        "stp x21, x22, [x0, #16]"
+        "stp x23, x24, [x0, #32]"
+        "stp x25, x26, [x0, #48]"
+        "stp x27, x28, [x0, #64]"
+        "stp x29, x30, [x0, #80]"
+        "str x9, [x0, #96]"
+        "ldp x19, x20, [x1, #0]"
+        "ldp x21, x22, [x1, #16]"
+        "ldp x23, x24, [x1, #32]"
+        "ldp x25, x26, [x1, #48]"
+        "ldp x27, x28, [x1, #64]"
+        "ldp x29, x30, [x1, #80]"
+        "ldr x9, [x1, #96]"
+        "mov sp, x9"
+        "ret"
+        ".globl keel_thread_start"
+        "keel_thread_start:"
+        "mov x0, x19"
+        "bl keel_thread_entry"
+        "brk #1"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+extern "keel_switch" switch_context(from: *Context, to: *Context)
+
+// The first instruction a new thread runs. Only its address is taken.
+extern keel_thread_start: u8
+
+// What `keel_switch` keeps of a thread that is not running.
+struct Context
+    regs: [12]u64               // x19 .. x30
+    sp: u64
+    pad: u64                    // keeps the struct a multiple of 16 bytes
+
+@assert(sizeof(Context) == 112, "keel_switch saves 13 words")
+@assert(offsetof(Context, regs) == 0, "keel_switch saves x19 at the context's base")
+@assert(offsetof(Context, sp) == 96, "keel_switch saves SP at 96")
+
+// Where in `regs` the start code finds its argument (x19) and where the first switch returns to (x30).
+private const ARG_REG: usize = 0
+private const LINK_REG: usize = 11
+
+// A context whose first switch enters `keel_thread_start` on `stack_top` with `arg` in x19.
+private[sched] fresh_context(stack_top: u64, arg: u64) -> Context
+    var c = Context([0; 12], stack_top, 0)
+    c.regs[ARG_REG] = arg
+    c.regs[LINK_REG] = u64(usize(&keel_thread_start))
+    c

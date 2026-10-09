@@ -1,0 +1,112 @@
+module keel.sched
+
+// Locks and waiting.
+//
+//   IrqLock     a spinlock taken with this core's IRQs masked: for state an interrupt handler also
+//               touches, and for the short holds of the scheduler's own structures
+//   WaitQueue   threads asleep until something happens; a condition variable over an IrqLock
+//   Mutex[T]    owns a T; a waiter sleeps on a wait queue instead of spinning, and `unlock` hands the
+//               lock straight to the first waiter
+
+import keel.cpu
+import sysl.sync.SpinLock
+
+// A FIFO of threads, linked through `Thread.next`. Whatever guards the queue guards its links: a
+// thread is on at most one queue at a time.
+private[sched] struct Queue
+    head: *Thread
+    tail: *Thread
+
+    push(*self, t: *Thread)
+        t.next = null
+        if self.tail == null then self.head = t else self.tail.next = t
+        self.tail = t
+
+    // The first thread, or null when there is none.
+    pop(*self) -> *Thread
+        val t = self.head
+        if t != null
+            self.head = t.next
+            if self.head == null then self.tail = null
+            t.next = null
+        t
+
+    empty(self) -> bool = self.head == null
+end Queue
+
+struct IrqLock
+    private inner: SpinLock
+
+    // Take the lock with this core's IRQs masked; the answer is what `unlock` puts back.
+    lock(*self) -> u64
+        val flags = cpu.irq_save()
+        self.inner.lock()
+        flags
+
+    unlock(*self, flags: u64)
+        self.inner.unlock()
+        cpu.irq_restore(flags)
+end IrqLock
+
+irq_lock() -> IrqLock = IrqLock(SpinLock(0))
+
+struct WaitQueue
+    private[sched] list: Queue
+
+    // Sleep until `wake_one` or `wake_all` picks this thread. The caller holds `guard`, the lock that
+    // protects both this queue and the condition being waited for; it is released while asleep and
+    // held again when this returns. A woken caller checks its condition again unless whoever woke it
+    // promised otherwise.
+    sleep(*self, guard: *IrqLock)
+        lock.lock()
+        val me = this_cpu().current
+        me.state = Blocked
+        self.list.push(me)
+        guard.inner.unlock()
+        switch_locked()
+        lock.unlock()
+        guard.inner.lock()
+
+    // Make the first sleeper ready, and answer whether there was one. The caller holds the guard.
+    wake_one(*self) -> bool
+        val t = self.list.pop()
+        if t == null then return false
+        lock.lock()
+        make_ready_locked(t)
+        lock.unlock()
+        true
+
+    // Make every sleeper ready, and answer how many there were. The caller holds the guard.
+    wake_all(*self) -> u64
+        var n: u64 = 0
+        while self.wake_one()
+            n += 1
+        n
+end WaitQueue
+
+empty_wait_queue() -> WaitQueue = WaitQueue(Queue(null, null))
+
+// Mutual exclusion that owns what it protects. `lock` answers the address of the value; the caller
+// writes `defer m.unlock()` beside it.
+struct Mutex[T]
+    private guard: IrqLock
+    private held: bool
+    private waiters: WaitQueue
+    private value: T
+
+    lock(*self) -> *T
+        val flags = self.guard.lock()
+        if self.held
+            self.waiters.sleep(&self.guard)         // `unlock` hands the lock over: held stays true
+        else
+            self.held = true
+        self.guard.unlock(flags)
+        &self.value
+
+    unlock(*self)
+        val flags = self.guard.lock()
+        if !self.waiters.wake_one() then self.held = false
+        self.guard.unlock(flags)
+end Mutex
+
+mutex[T](value: T) -> Mutex[T] = Mutex(irq_lock(), false, empty_wait_queue(), value)

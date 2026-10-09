@@ -28,6 +28,34 @@ new_table() -> (*Table, PhysAddr)
     pool_used += 1
     (t, phys_of(usize(t)))
 
+// Which pool table is the kernel's root (TTBR1). An index rather than a pointer, because it is recorded
+// with the MMU off, at physical addresses, and read with it on.
+private var kernel_root_index: usize = 0
+
+remember_kernel_root(t: *Table)
+    kernel_root_index = (usize(t) - usize(&pool[0])) / 4096
+
+// The kernel's root table, at its virtual address. Valid once the MMU is on.
+kernel_root() -> *Table = &pool[kernel_root_index]
+
+// Take the page mapping at `va` away and answer the physical page it mapped, or None when nothing was
+// mapped there by a page descriptor. The caller flushes the TLB.
+unmap_page(root: *Table, va: VirtAddr) -> Option[PhysAddr]
+    var t = root
+    var l: u64 = 0
+    while l < 3
+        val word = t.entries[index(va, l)]
+        if word == 0 then return None
+        val d: TableDesc = from_word(word)
+        if d.table != 1 then return None
+        t = table_at(frame_addr(d.next))
+        l += 1
+    val slot = &t.entries[index(va, 3)]
+    if *slot == 0 then return None
+    val leaf: LeafDesc = from_word(*slot)
+    *slot = 0
+    Some(frame_addr(leaf.oa))
+
 // The pool table at a physical address. Every table keel has came from the pool, so this is how a walk
 // follows a table descriptor until there is a linear map to find any page by (milestone 3).
 private table_at(p: PhysAddr) -> *Table

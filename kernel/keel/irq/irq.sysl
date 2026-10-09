@@ -4,6 +4,7 @@ module keel.irq
 // interrupt it is, handle it, and tell the GIC it is done.
 
 import keel.gic
+import keel.sched
 import keel.timer
 import keel.pl011.{put_hex, put_str}
 import sysl.sync.{Atomic, Ordering}
@@ -20,6 +21,7 @@ dispatch()
     if id == timer.IRQ
         timer.rearm()
         ticks.add(1, Ordering.Relaxed)
+        sched.tick()
     else
         put_str("keel: unexpected interrupt ")
         put_hex(u64(id))

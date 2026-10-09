@@ -38,6 +38,10 @@ expected=(
     "keel: hello from the heap"              # a string built by interpolation
     "keel: closure ok"      # a closure capturing a boxed value
     "keel: heap reclaimed"  # every frame came back once those were dropped, and no block is live
+    "keel: interleaved ok"  # two spinning threads took turns: only the timer can have switched them
+    "keel: mutex ok"        # 4 threads x 10,000 additions under a blocking Mutex[u64] total 40,000
+    "keel: waitqueue ok"    # a producer and a consumer slept on two wait queues and passed 200 in order
+    "keel: threads reclaimed"   # every joined thread's stack frames and heap blocks came back
 )
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.

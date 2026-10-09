@@ -1,0 +1,167 @@
+module keel.selftest
+
+// What milestone 4 is for, run by kmain once the scheduler is up: threads that are preempted, a mutex
+// that blocks, a wait queue, and every thread's stack and heap blocks back once it has been joined.
+
+import keel.cpu
+import keel.heap
+import keel.irq
+import keel.mm
+import keel.sched
+import keel.sched.{IrqLock, Mutex, Thread, WaitQueue, empty_wait_queue, irq_lock, join, mutex, spawn}
+import sysl.buf.{Buf, buf}
+import sysl.sync.{Atomic, Ordering}
+
+threads()
+    val frames = mm.frames_free()
+    val blocks = heap.live()
+    val stacks = mm.stacks_in_use()
+
+    interleaving()
+    counting()
+    producer_consumer()
+
+    if mm.frames_free() == frames && heap.live() == blocks && mm.stacks_in_use() == stacks
+        print("keel: threads reclaimed")
+    else
+        print("keel: threads leaked: frames free", mm.frames_free(), "of", frames, "blocks live", heap.live(),
+            "of", blocks, "stacks", mm.stacks_in_use(), "of", stacks)
+
+// --- Preemption -----------------------------------------------------------------------------------
+//
+// Two threads take turns through a shared counter: A prints on even turns, B on odd ones, and each
+// waits for its turn by spinning — no yield, no sleep. On one core the only way the other thread gets
+// to run, and so the only way the counter moves, is the timer taking the processor away. A thread
+// that waits a whole second gives up, so without preemption the trace comes out wrong instead of
+// hanging.
+
+private const ROUNDS: u64 = 3
+private const PATIENCE: u64 = 100           // timer ticks: one second at 10 ms
+
+private struct Turns
+    turn: Atomic[u64]
+    trace: [6]u8
+    gave_up: Atomic[u64]
+
+private interleaving()
+    val t: &sync Turns = Turns(Atomic(0), [0; 6], Atomic(0))
+    val a = spawn(() -> take_turns(t, 0))
+    val b = spawn(() -> take_turns(t, 1))
+    join(a)
+    join(b)
+
+    var trace_ok = true
+    for i in 0..<2 * ROUNDS
+        if t.trace[usize(i)] != u8('A') + u8(i % 2) then trace_ok = false
+    if trace_ok && t.gave_up.load() == 0 && sched.preemptions(a) > 0 && sched.preemptions(b) > 0
+        print("keel: interleaved ok")
+    else
+        print("keel: interleaved wrong: gave up", t.gave_up.load(), "preempted", sched.preemptions(a),
+            sched.preemptions(b))
+
+private take_turns(t: &sync Turns, parity: u64)
+    val name = u8('A') + u8(parity)
+    for i in 0..<ROUNDS
+        val mine = 2 * i + parity
+        val since = irq.ticks.load(Ordering.Relaxed)
+        while t.turn.load(Ordering.Acquire) != mine
+            if irq.ticks.load(Ordering.Relaxed) - since > PATIENCE
+                t.gave_up.add(1)
+                return
+            cpu.relax()
+        t.trace[usize(mine)] = name
+        if parity == 0 then print("keel: thread A, turn", i) else print("keel: thread B, turn", i)
+        t.turn.store(mine + 1, Ordering.Release)
+
+// --- Mutex ----------------------------------------------------------------------------------------
+//
+// Four threads add one to a `Mutex[u64]` ten thousand times each. Each addition reads the value, waits
+// a while, and writes it back plus one, so a preemption almost always lands inside the critical
+// section: without the lock the total comes out short.
+
+private const WORKERS: u64 = 4
+private const ADDS: u64 = 10_000
+private const HOLD: u64 = 2_000             // spin steps between the read and the write
+
+private counting()
+    val m: &sync Mutex[u64] = mutex(0)
+    var workers: Buf[&sync Thread] = buf()
+    for _ in 0..<WORKERS
+        workers.push(spawn(() -> add_many(m)))
+    for w in workers
+        join(w)
+
+    val total = *m.lock()
+    m.unlock()
+    if total == WORKERS * ADDS
+        print("keel: mutex ok")
+    else
+        print("keel: mutex wrong: total", total)
+
+private add_many(m: &sync Mutex[u64])
+    for _ in 0..<ADDS
+        val p = m.lock()
+        defer m.unlock()
+        val v = *p
+        for _ in 0..<HOLD
+            cpu.relax()
+        *p = v + 1
+
+// --- Wait queue -----------------------------------------------------------------------------------
+//
+// A producer and a consumer pass 200 numbers through a four-slot ring. The consumer sleeps while it is
+// empty and the producer while it is full, on two wait queues under one `IrqLock`.
+
+private const SLOTS: u64 = 4
+private const ITEMS: u64 = 200
+
+private struct Ring
+    guard: IrqLock
+    not_empty: WaitQueue
+    not_full: WaitQueue
+    slots: [4]u64
+    head: u64
+    count: u64
+    sleeps: u64
+    sum: u64
+    in_order: bool
+
+private producer_consumer()
+    val r: &sync Ring = Ring(irq_lock(), empty_wait_queue(), empty_wait_queue(), [0; 4], 0, 0, 0, 0, true)
+    val consumer = spawn(() -> consume(r))
+    val producer = spawn(() -> produce(r))
+    join(consumer)
+    join(producer)
+
+    if r.sum == ITEMS * (ITEMS + 1) / 2 && r.in_order && r.sleeps > 0
+        print("keel: waitqueue ok")
+    else
+        print("keel: waitqueue wrong: sum", r.sum, "in order", r.in_order, "sleeps", r.sleeps)
+
+private produce(r: &sync Ring)
+    for v in 1..ITEMS
+        val flags = r.guard.lock()
+        while r.count == SLOTS
+            r.sleeps += 1
+            r.not_full.sleep(&r.guard)
+        r.slots[usize((r.head + r.count) % SLOTS)] = v
+        r.count += 1
+        r.not_empty.wake_one()
+        r.guard.unlock(flags)
+
+private consume(r: &sync Ring)
+    var expected: u64 = 1
+    while expected <= ITEMS
+        val flags = r.guard.lock()
+        while r.count == 0
+            r.sleeps += 1
+            r.not_empty.sleep(&r.guard)
+        val v = r.slots[usize(r.head)]
+        r.head = (r.head + 1) % SLOTS
+        r.count -= 1
+        r.not_full.wake_one()
+        r.guard.unlock(flags)
+
+        if v != expected then r.in_order = false
+        r.sum += v
+        expected += 1

@@ -1,0 +1,122 @@
+module keel.sched
+
+// Kernel threads: a stack, a saved context, a state, and the closure the thread runs.
+//
+// A `Thread` lives in a `&sync` box, because more than one thread (and, from milestone 5, more than one
+// core) holds a reference to it: whoever spawned it may `join` it while it runs. The scheduler itself
+// never counts: its queues link threads through a raw `next` pointer, and a thread keeps its own box
+// alive through `me` until it has been joined and its stack given back (`reap`).
+
+import keel.cpu
+import keel.mm
+
+enum State
+    Ready                       // on the run queue
+    Running                     // some core's `current`
+    Blocked                     // on a wait queue
+    Exited                      // called `exit`, still on its own stack until the next switch
+    Dead                        // off its stack for good: it may be reaped
+
+// The ownership runtime's drain list for references released on this thread (reference/memory.md
+// § "On a freestanding target the worklist is asked for"). Layout fixed by the runtime:
+// `{ void *head; unsigned char draining; }`.
+struct Reaper
+    head: *u8
+    draining: u8
+
+struct Thread
+    ctx: Context
+    id: u64
+    state: State
+    next: *Thread                               // the queue this thread is on: run queue or a wait queue
+    stack: Option[mm.Stack]                     // None for the boot thread, which keeps the boot stack
+    entry: Option[&sync Fn() -> unit]
+    me: Option[&sync Thread]                    // the box keeping itself alive while the scheduler knows it
+    exit_waiters: WaitQueue                     // joiners; guarded by the scheduler's lock
+    reaper: Reaper
+    preemptions: u64                            // times the timer took the processor away
+
+// A new thread running `f`, which starts as soon as a core is free for it. Everything `f` captured
+// is reached from another thread, so `f` is a `&sync Fn`: the compiler refuses a closure capturing
+// anything whose count is not atomic.
+@crossing(f)
+spawn(f: &sync Fn() -> unit) -> &sync Thread
+    val t = new_thread(Some(f))
+    val flags = cpu.irq_save()
+    lock.lock()
+    make_ready_locked(&*t)
+    lock.unlock()
+    cpu.irq_restore(flags)
+    t
+
+// A thread with a stack of its own, not yet on any queue.
+private[sched] new_thread(entry: Option[&sync Fn() -> unit]) -> &sync Thread
+    val s = mm.alloc_stack() match
+        Some(s) -> s
+        None -> panic("keel: no stack for a new thread")
+    val t: &sync Thread = Thread(Context([0; 12], 0, 0), next_id.add(1), Ready, null, Some(s), entry, None,
+        empty_wait_queue(), Reaper(null, 0), 0)
+    val p: *Thread = &*t
+    p.ctx = fresh_context(u64(s.top), u64(usize(p)))
+    p.me = Some(t)
+    t
+
+// Where every new thread begins, called by `keel_thread_start` on the thread's own stack. The thread
+// that switched here still holds the scheduler's lock (it is handed over with the processor, see
+// `switch_locked`), and interrupts are masked.
+@export("keel_thread_entry")
+thread_entry(t: *Thread) -> never
+    finish_switch()
+    lock.unlock()
+    cpu.enable_irqs()
+    run(t)
+    exit()
+
+// The thread's closure, called in a frame of its own: whatever the call holds is released when this
+// returns, which `exit` never does.
+private run(t: *Thread)
+    t.entry match
+        Some(f) -> f()
+        None -> ()
+
+// End the calling thread. Its stack stays mapped until it has switched away; whoever joins it frees it.
+exit() -> never
+    val _ = cpu.irq_save()
+    lock.lock()
+    this_cpu().current.state = Exited
+    switch_locked()
+    panic("keel: an exited thread was run again")
+
+// Give the processor to the next ready thread, if there is one. The caller stays ready.
+yield_now()
+    val flags = cpu.irq_save()
+    lock.lock()
+    switch_locked()
+    lock.unlock()
+    cpu.irq_restore(flags)
+
+// Wait for `t` to end, then give its stack back. Joining a thread twice is harmless.
+join(t: &sync Thread)
+    val p: *Thread = &*t
+    val flags = cpu.irq_save()
+    lock.lock()
+    while p.state != Dead
+        sleep_locked(&p.exit_waiters)
+    lock.unlock()
+    cpu.irq_restore(flags)
+    reap(p)
+
+// A dead thread's stack goes back, its closure and its self-reference are dropped; the box itself
+// goes when the last handle does.
+private reap(p: *Thread)
+    p.stack match
+        Some(s) ->
+            p.stack = None
+            mm.free_stack(s)
+        None -> ()
+    p.entry = None
+    p.me = None
+
+// The thread's number, and how many times the timer preempted it.
+id(t: &sync Thread) -> u64 = t.id
+preemptions(t: &sync Thread) -> u64 = t.preemptions

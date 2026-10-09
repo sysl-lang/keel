@@ -172,6 +172,63 @@ flush_tlb()
             "isb"
         [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
 
+// Forget every core's cached translation of the page at kernel address `va`, for every address space,
+// and wait until every core has. Inner shareable, so it is already right once there is a second core.
+flush_tlb_page(va: u64)
+    val page = va >> 12
+    asm
+        [aarch64]
+            "dsb ishst"
+            "tlbi vaae1is, {page}"
+            "dsb ish"
+            "isb"
+            in page : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// Make translation table writes visible to the walker before the next instruction uses them.
+publish_tables()
+    asm
+        [aarch64]
+            "dsb ishst"
+            "isb"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// TPIDR_EL1, a register the architecture leaves to the kernel: keel keeps the running core's `Cpu`
+// record there (keel.sched), so each core finds its own without asking which core it is.
+tpidr() -> u64
+    var v: u64 = 0
+    asm
+        [aarch64]
+            "mrs {v}, tpidr_el1"
+            out v : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    v
+
+set_tpidr(v: u64)
+    asm
+        [aarch64]
+            "msr tpidr_el1, {v}"
+            in v : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// MPIDR_EL1's affinity level 0: which core of its cluster this is. QEMU's `virt` numbers its cores
+// 0, 1, 2, ... there.
+core_id() -> u64
+    var v: u64 = 0
+    asm
+        [aarch64]
+            "mrs {v}, mpidr_el1"
+            out v : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    v & 0xff
+
+// One busy-wait step: an instruction the optimizer cannot remove, and a hint to the core that this is
+// a spin.
+relax()
+    asm
+        [aarch64] "yield"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
 // Discard the data cache line holding `addr`, so the next cacheable read goes to memory.
 invalidate_dcache_line(addr: u64)
     asm
