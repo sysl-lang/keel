@@ -42,10 +42,9 @@ private const PREEMPTION: bool = true
 // written with `lock` held, so another core holding it may read which cores are idle.
 //
 // Each record is one 64-byte cache line, so one core's writes never take a line another core's record
-// is in. That is done by hand: the fields happen to add up to 64 bytes, the `@assert` holds them to it,
-// and the binding below is aligned. `@align(64)` on the struct would say it directly and is wrong today:
-// `sizeof` answers 64 while the code lays elements at their unpadded size apart (FINDINGS.md 29). A field added here
-// has to come with padding to the next 64.
+// is in: `@align(64)` pads the struct to its line and strides the array by it, and the `@assert` says a
+// record still fits in one.
+@align(64)
 struct Cpu
     id: u64
     current: *Thread

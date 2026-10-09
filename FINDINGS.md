@@ -902,6 +902,10 @@ that `SpinLock` uses.
 
 ## 29. `@align(n)` on a struct changes `sizeof` and `offsetof` but not the generated layout
 
+**FIXED in sysl census-35 8619de66 (prerelease `8619de6609`):** the probe below now prints stride 64
+everywhere (module, local, `Pair`). keel's `Cpu` carries `@align(64)` itself (branch `lsrm`); the
+binding keeps its own `@align(64)` and the `@assert` stays.
+
 Milestone 5, the per-core records. Each core's `Cpu` should own a cache line, so the type says so:
 
     @align(64)
