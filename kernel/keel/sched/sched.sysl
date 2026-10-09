@@ -72,11 +72,20 @@ init()
     started = true
     cpu.irq_restore(flags)
 
-// What a core runs when nothing is ready. Interrupts are on, so the timer still arrives, and a
-// thread made ready since is switched to at the end of the slice.
+// What a core runs when nothing is ready. Idle itself makes threads ready — `finish_switch` wakes an
+// exited thread's joiners in whichever thread runs next, often this one — so it hands the core over
+// whenever the run queue is not empty, and sleeps only when it is. The check and the `wfi` are made
+// with IRQs masked: an interrupt arriving in between stays pending, which `wfi` wakes on, and is
+// taken when IRQs are unmasked again.
 private idle_loop()
     loop
-        cpu.wait_for_interrupt()
+        yield_now()
+        val flags = cpu.irq_save()
+        lock.lock()
+        val nothing = ready.empty()
+        lock.unlock()
+        if nothing then cpu.wait_for_interrupt()
+        cpu.irq_restore(flags)
 
 // The thread running on this core.
 current() -> *Thread = this_cpu().current

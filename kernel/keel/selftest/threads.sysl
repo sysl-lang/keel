@@ -8,6 +8,7 @@ import keel.heap
 import keel.irq
 import keel.mm
 import keel.sched
+import keel.trap
 import keel.sched.{IrqLock, Mutex, Thread, WaitQueue, empty_wait_queue, irq_lock, join, mutex, spawn}
 import sysl.buf.{Buf, buf}
 import sysl.sync.{Atomic, Ordering}
@@ -20,6 +21,7 @@ threads()
     interleaving()
     counting()
     producer_consumer()
+    stack_guard()
 
     if mm.frames_free() == frames && heap.live() == blocks && mm.stacks_in_use() == stacks
         print("keel: threads reclaimed")
@@ -77,7 +79,8 @@ private take_turns(t: &sync Turns, parity: u64)
 //
 // Four threads add one to a `Mutex[u64]` ten thousand times each. Each addition reads the value, waits
 // a while, and writes it back plus one, so a preemption almost always lands inside the critical
-// section: without the lock the total comes out short.
+// section: without the lock the total comes out short, and with it the other threads find it held and
+// sleep (counted, and required to be more than none).
 
 private const WORKERS: u64 = 4
 private const ADDS: u64 = 10_000
@@ -93,10 +96,10 @@ private counting()
 
     val total = *m.lock()
     m.unlock()
-    if total == WORKERS * ADDS
+    if total == WORKERS * ADDS && m.contentions() > 0
         print("keel: mutex ok")
     else
-        print("keel: mutex wrong: total", total)
+        print("keel: mutex wrong: total", total, "contended", m.contentions())
 
 private add_many(m: &sync Mutex[u64])
     for _ in 0..<ADDS
@@ -165,3 +168,28 @@ private consume(r: &sync Ring)
         if v != expected then r.in_order = false
         r.sum += v
         expected += 1
+
+// --- Stack guard ----------------------------------------------------------------------------------
+//
+// A thread reads the lowest word of its own stack, which is mapped, and the word below it, which is
+// the guard and must fault (the trap handler reports it and steps over the load).
+
+private struct Guard
+    bottom_readable: Atomic[u64]
+    below_faults: Atomic[u64]
+
+private stack_guard()
+    val g: &sync Guard = Guard(Atomic(0), Atomic(0))
+    join(spawn(() -> probe_own_stack(g)))
+    if g.bottom_readable.load() == 1 && g.below_faults.load() == 1
+        print("keel: stack guard faults")
+    else
+        print("keel: stack guard missing")
+
+private probe_own_stack(g: &sync Guard)
+    sched.current().stack match
+        Some(s) ->
+            val bottom = u64(s.top) - mm.STACK_SIZE
+            if trap.probe(mm.VirtAddr(bottom)) then g.bottom_readable.store(1)
+            if !trap.probe(mm.VirtAddr(bottom - 8)) then g.below_faults.store(1)
+        None -> ()

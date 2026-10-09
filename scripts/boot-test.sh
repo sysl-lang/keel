@@ -41,6 +41,7 @@ expected=(
     "keel: interleaved ok"  # two spinning threads took turns: only the timer can have switched them
     "keel: mutex ok"        # 4 threads x 10,000 additions under a blocking Mutex[u64] total 40,000
     "keel: waitqueue ok"    # a producer and a consumer slept on two wait queues and passed 200 in order
+    "keel: stack guard faults"  # the page below a thread's stack is unmapped
     "keel: threads reclaimed"   # every joined thread's stack frames and heap blocks came back
 )
 

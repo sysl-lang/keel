@@ -93,10 +93,12 @@ struct Mutex[T]
     private held: bool
     private waiters: WaitQueue
     private value: T
+    private sleeps: u64                             // how many `lock`s found it held and slept
 
     lock(*self) -> *T
         val flags = self.guard.lock()
         if self.held
+            self.sleeps += 1
             self.waiters.sleep(&self.guard)         // `unlock` hands the lock over: held stays true
         else
             self.held = true
@@ -107,6 +109,13 @@ struct Mutex[T]
         val flags = self.guard.lock()
         if !self.waiters.wake_one() then self.held = false
         self.guard.unlock(flags)
+
+    // How many times a `lock` had to sleep.
+    contentions(*self) -> u64
+        val flags = self.guard.lock()
+        val n = self.sleeps
+        self.guard.unlock(flags)
+        n
 end Mutex
 
-mutex[T](value: T) -> Mutex[T] = Mutex(irq_lock(), false, empty_wait_queue(), value)
+mutex[T](value: T) -> Mutex[T] = Mutex(irq_lock(), false, empty_wait_queue(), value, 0)
