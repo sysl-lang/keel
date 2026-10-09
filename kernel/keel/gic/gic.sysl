@@ -96,14 +96,7 @@ private redist_control() -> *RedistributorControl = mm.io(mm.PhysAddr(redist_bas
 private redist() -> *Redistributor = mm.io(mm.PhysAddr(redist_base() + SGI_FRAME))
 
 // MPIDR_EL1's Aff1.Aff0, as GICR_TYPER's low affinity bytes hold them.
-private mpidr_affinity() -> u32
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "mrs {v}, mpidr_el1"
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-    u32(v & 0xffff)
+private mpidr_affinity() -> u32 = u32(read_sysreg("mpidr_el1") & 0xffff)
 
 // Switch on the distributor, once, from the boot core; then the boot core's own interface.
 init()
@@ -127,14 +120,9 @@ init_cpu()
 // system register write is not a memory access, so no `sysl.sync` ordering puts the stores first: the
 // `dsb ishst` does (FINDINGS.md 28).
 send_sgi(id: u32, core: u64)
-    val v = (u64(id) << 24) | (u64(1) << core)
-    asm
-        [aarch64]
-            "dsb ishst"
-            "msr icc_sgi1r_el1, {v}"
-            "isb"
-            in v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    dsb(ishst)
+    write_sysreg("icc_sgi1r_el1", (u64(id) << 24) | (u64(1) << core))
+    isb()
 
 // Enable private interrupt `id` (0-31: an SGI or a PPI) in group 1 on this core's redistributor, which
 // this processor takes as an IRQ, at the middle priority.
@@ -165,54 +153,21 @@ enable_spi(id: u32, core: u64)
 
 // Take the highest-priority pending interrupt, answering its ID. Its source then waits for
 // `complete` before it can be delivered again.
-acknowledge() -> u32
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "mrs {v}, icc_iar1_el1"
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-    u32(v & 0xff_ffff)
+acknowledge() -> u32 = u32(read_sysreg("icc_iar1_el1") & 0xff_ffff)
 
 // Signal that interrupt `id` has been handled.
 complete(id: u32)
-    val v = u64(id)
-    asm
-        [aarch64]
-            "msr icc_eoir1_el1, {v}"
-            "isb"
-            in v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    write_sysreg("icc_eoir1_el1", u64(id))
+    isb()
 
 // Reach the CPU interface through system registers (ICC_SRE_EL1.SRE).
 private enable_system_registers()
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "mrs {v}, icc_sre_el1"
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-    val on = v | 1
-    asm
-        [aarch64]
-            "msr icc_sre_el1, {on}"
-            "isb"
-            in on : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    write_sysreg("icc_sre_el1", read_sysreg("icc_sre_el1") | 1)
+    isb()
 
 // Let through interrupts of a priority numerically below `mask`.
-private set_priority_mask(mask: u64)
-    asm
-        [aarch64]
-            "msr icc_pmr_el1, {mask}"
-            in mask : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+private set_priority_mask(mask: u64) = write_sysreg("icc_pmr_el1", mask)
 
 private enable_group1()
-    val on: u64 = 1
-    asm
-        [aarch64]
-            "msr icc_igrpen1_el1, {on}"
-            "isb"
-            in on : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    write_sysreg("icc_igrpen1_el1", 1)
+    isb()

@@ -280,6 +280,11 @@ underlying width has values no variant covers), and add a fallible conversion, f
 
 ## 10. System registers have no sysl surface: one asm function per register, eight lines each
 
+**FIXED (`read_sysreg`/`write_sysreg`, since prerelease `1a7aee7358`; adopted on `8619de6609`):**
+keel.cpu, keel.timer and keel.gic read and write every system register, DAIF/DAIFSet/DAIFClr
+included, through the built-ins (branch `lsrm`); each wrapper is one line. The `asm` left in them is
+the instructions finding 14 still lacks, plus `yield` and `wfi`.
+
 Milestone 1 touches 13 system registers (CurrentEL, VBAR_EL1, ESR_EL1, FAR_EL1, DAIF, CNTFRQ_EL0,
 CNTV_TVAL_EL0, CNTV_CTL_EL0, ICC_SRE_EL1, ICC_PMR_EL1, ICC_IGRPEN1_EL1, ICC_IAR1_EL1, ICC_EOIR1_EL1).
 The register is part of the instruction text, and the text is a string literal, so each access is a
@@ -405,6 +410,10 @@ inside it, and make `&extern` PC-relative), or `dso_local` on `extern` variables
 image, so that `&` always means "where it is now".
 
 ## 14. Barriers and maintenance instructions have no spelling (`dsb`, `isb`, `tlbi`, `dc`, `at`)
+
+**PARTLY FIXED:** `dsb(opt)`, `dmb(opt)` and `isb()` are built-ins, and keel uses them everywhere
+outside an `asm` sequence (branch `lsrm`, prerelease `8619de6609`). `tlbi`, `dc`, `at` and `ic` are
+not in this prerelease, so the TLB, cache and translate sequences in keel.cpu stay `asm`.
 
 Milestone 2. Turning the MMU on and changing a translation table needs `dsb` (with a domain:
 `sy`, `ish`, `nsh`, `ishst`), `isb`, `tlbi vmalle1`, `dc ivac` over the tables written with the MMU

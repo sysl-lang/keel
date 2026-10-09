@@ -11,32 +11,17 @@ const IRQ: u32 = 27
 private var period: u64 = 0
 
 // The system counter's frequency, in Hz.
-private frequency() -> u64
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "mrs {v}, cntfrq_el0"
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-    v
+private frequency() -> u64 = read_sysreg("cntfrq_el0")
 
 // Count down `ticks` from now. Writing the countdown also clears a condition already met.
 private set_countdown(ticks: u64)
-    asm
-        [aarch64]
-            "msr cntv_tval_el0, {ticks}"
-            "isb"
-            in ticks : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    write_sysreg("cntv_tval_el0", ticks)
+    isb()
 
 // Bit 0 enables the timer; bit 1 would mask its interrupt.
 private set_control(bits: u64)
-    asm
-        [aarch64]
-            "msr cntv_ctl_el0, {bits}"
-            "isb"
-            in bits : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    write_sysreg("cntv_ctl_el0", bits)
+    isb()
 
 // Raise the timer's interrupt every `ms` milliseconds. Each core has a timer of its own; the boot core
 // sets the period, and the others start theirs with `start_this_core`.
