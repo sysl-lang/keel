@@ -1751,6 +1751,11 @@ With 44 fixed, the three are each one `sysl.fs` call. One minor gap.
 
 ## 50. `copy_dir_all` sets every entry's permissions unconditionally, so a target that cannot set them cannot copy a tree (minor)
 
+**FIXED in sysl census-35 7e2a32d3 (`copy-without-perms`; prerelease `7e2a32d396`):** `copy_dir_all`
+treats a `set_permissions` that answers `UNSUPPORTED` as nothing to carry, and any other error as a
+failure. keel's `chmod` hook is back to answering `sysl.sys.UNSUPPORTED` outright, and `cp -r` passes
+with it — the control below, which used to fail, is now the shipped hook.
+
 `cp -r` is `fs.copy_dir_all(from, to)`. keel's `chmod` hook answered `-1` (finding 44's supplier
 table had it so for every target without permissions), and `copy_dir_all` ends each entry with
 `set_permissions(dst, e.meta.permissions())?` (`dirs.sysl`). So on such a target every tree copy is
