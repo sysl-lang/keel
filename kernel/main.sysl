@@ -40,6 +40,15 @@ kmain() -> never
     trap.install()
     breakpoint()
 
+    gic.init()
+    gic.enable(timer.IRQ)
+    timer.start(10)
+    enable_irqs()
+
+    while irq.ticks < 3
+        wait_for_interrupt()
+
+    print("keel: tick", irq.ticks)
     system_off()
 
 // Stop at a `brk`, which the trap handler reports and steps over.

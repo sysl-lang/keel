@@ -1,6 +1,9 @@
 #!/bin/zsh
-# keel's boot test: build the kernel, boot it under QEMU, and pass only if it says `keel: hello` and
-# QEMU exits by itself (the kernel powered the machine off through PSCI).
+# keel's boot test: build the kernel, boot it under QEMU, and pass only if it prints the `expected`
+# lines below in order and QEMU exits by itself (the kernel powered the machine off through PSCI).
+#
+# The machine is `virt` with a GICv3: HVF refuses a GICv2 ("HVF does not support GICv2 emulation"),
+# and asking for 3 explicitly gives TCG the same controller.
 #
 #   scripts/boot-test.sh            build at sysl's default level, run under HVF
 #   KEEL_OPT=-O0 scripts/boot-test.sh
@@ -22,6 +25,12 @@ opt=${KEEL_OPT:-}
 accel=${KEEL_ACCEL:-hvf}
 compiler=${KEEL_SYSL:-sysl}
 
+expected=(
+    "keel: hello"           # kmain runs
+    "keel: trap brk"        # a synchronous exception reaches the trap handler and returns
+    "keel: tick 3"          # three timer interrupts arrived through the GIC
+)
+
 elf=$out/keel.elf
 log=$out/boot.log
 
@@ -33,7 +42,7 @@ else
     machine=(-cpu cortex-a72)
 fi
 
-qemu-system-aarch64 -M virt $machine -m 256M -nographic -kernel $elf > $log 2>&1 < /dev/null &
+qemu-system-aarch64 -M virt,gic-version=3 $machine -m 256M -nographic -kernel $elf > $log 2>&1 < /dev/null &
 qpid=$!
 
 waited=0
@@ -58,12 +67,19 @@ if [[ $exited == no ]]; then
     print -r -- "FAIL: QEMU did not exit within ${limit}s; the kernel did not power off"
     return 1
 fi
-if ! grep -q "keel: hello" $log; then
-    print -r -- "FAIL: QEMU exited (status $qemu_exit) without printing 'keel: hello'"
-    return 1
-fi
+text=$(<$log)
+seen=""
+for line in $expected; do
+    rest=${text#*$line}
+    if [[ $rest == $text ]]; then
+        print -r -- "FAIL: QEMU exited (status $qemu_exit); expected '$line'${seen:+ after$seen}, and it is not there"
+        return 1
+    fi
+    text=$rest
+    seen="$seen '$line'"
+done
 if (( qemu_exit != 0 )); then
     print -r -- "FAIL: QEMU exited with status $qemu_exit"
     return 1
 fi
-print -r -- "PASS: 'keel: hello', and QEMU exited by itself (status 0) after $((waited / 10)).$((waited % 10))s"
+print -r -- "PASS:$seen in order, and QEMU exited by itself (status 0) after $((waited / 10)).$((waited % 10))s"

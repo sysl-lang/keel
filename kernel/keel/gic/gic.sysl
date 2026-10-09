@@ -1,68 +1,132 @@
 module keel.gic
 
-// The Arm Generic Interrupt Controller, version 2, that QEMU's `virt` machine provides by default: a
-// distributor at 0x0800_0000 that decides which interrupts are enabled and routed, and a CPU interface
-// at 0x0801_0000 through which this processor acknowledges and completes them.
+// The Arm Generic Interrupt Controller, version 3, as QEMU's `virt` machine provides it with
+// `gic-version=3`. Under HVF that is the only GIC there is: QEMU hands the guest the hypervisor's own
+// GICv3, and a GICv2 CPU interface at 0x0801_0000 reads as zeros.
+//
+// Three parts: the distributor at 0x0800_0000 (shared interrupts, and the global enable), this
+// processor's redistributor at 0x080A_0000 (its private interrupts: SGIs and PPIs, the timer's
+// among them), and the CPU interface, which in GICv3 is system registers rather than memory.
 
-// The distributor's registers keel uses, at the offsets the GICv2 architecture specification gives
-// them. Each bank is one bit (or one byte, for priorities) per interrupt ID.
+// The distributor's control register is the only one keel needs: shared peripheral interrupts
+// (32 and up) are not used yet.
 private struct Distributor
-    ctlr: volatile u32                  // 0x000 enable
-    typer: volatile u32                 // 0x004
-    iidr: volatile u32                  // 0x008
-    reserved0: [29]u32                  // 0x00c .. 0x07f
-    igroupr: [32]volatile u32           // 0x080 group
-    isenabler: [32]volatile u32         // 0x100 set-enable
-    icenabler: [32]volatile u32         // 0x180 clear-enable
-    ispendr: [32]volatile u32           // 0x200 set-pending
-    icpendr: [32]volatile u32           // 0x280 clear-pending
-    isactiver: [32]volatile u32         // 0x300 set-active
-    icactiver: [32]volatile u32         // 0x380 clear-active
-    ipriorityr: [255]volatile u32       // 0x400 priority, a byte per interrupt
+    ctlr: volatile u32                  // 0x000
 
-@assert(offsetof(Distributor, igroupr) == 0x080, "GICD_IGROUPR is at 0x080")
-@assert(offsetof(Distributor, isenabler) == 0x100, "GICD_ISENABLER is at 0x100")
-@assert(offsetof(Distributor, ipriorityr) == 0x400, "GICD_IPRIORITYR is at 0x400")
+private const CTLR_ENABLE_GRP1: u32 = 1 << 1
+private const CTLR_ARE: u32 = 1 << 4         // affinity routing, which GICv3 private interrupts need
 
-// The CPU interface's registers.
-private struct CpuInterface
-    ctlr: volatile u32                  // 0x000 enable
-    pmr: volatile u32                   // 0x004 priority mask
-    bpr: volatile u32                   // 0x008 binary point
-    iar: volatile u32                   // 0x00c acknowledge: reading it takes the interrupt
-    eoir: volatile u32                  // 0x010 end of interrupt
+// A redistributor is two 64 KiB frames. The first holds its power state.
+private struct RedistributorControl
+    ctlr: volatile u32                  // 0x000
+    iidr: volatile u32                  // 0x004
+    typer: [2]volatile u32              // 0x008
+    statusr: volatile u32               // 0x010
+    waker: volatile u32                 // 0x014
 
-@assert(offsetof(CpuInterface, iar) == 0x00c, "GICC_IAR is at 0x00c")
-@assert(offsetof(CpuInterface, eoir) == 0x010, "GICC_EOIR is at 0x010")
+@assert(offsetof(RedistributorControl, waker) == 0x014, "GICR_WAKER is at 0x014")
+
+private const WAKER_PROCESSOR_SLEEP: u32 = 1 << 1
+private const WAKER_CHILDREN_ASLEEP: u32 = 1 << 2
+
+// The second frame holds the private interrupts' configuration, one bit (or one priority byte) per
+// interrupt ID 0-31.
+private struct Redistributor
+    reserved0: [32]u32                  // 0x000 .. 0x07f
+    igroupr0: volatile u32              // 0x080 group
+    reserved1: [31]u32                  // 0x084 .. 0x0ff
+    isenabler0: volatile u32            // 0x100 set-enable
+    reserved2: [191]u32                // 0x104 .. 0x3ff
+    ipriorityr: [8]volatile u32         // 0x400 priority, a byte per interrupt
+
+@assert(offsetof(Redistributor, igroupr0) == 0x080, "GICR_IGROUPR0 is at 0x080")
+@assert(offsetof(Redistributor, isenabler0) == 0x100, "GICR_ISENABLER0 is at 0x100")
+@assert(offsetof(Redistributor, ipriorityr) == 0x400, "GICR_IPRIORITYR is at 0x400")
 
 private const DIST_BASE: usize = 0x0800_0000
-private const CPU_BASE: usize = 0x0801_0000
+private const REDIST_BASE: usize = 0x080A_0000
+private const SGI_FRAME: usize = 0x1_0000
 
 // What `acknowledge` answers when nothing is pending after all.
 const SPURIOUS: u32 = 1023
 
 private dist() -> *Distributor = ptr_cast(DIST_BASE)
-private cpu() -> *CpuInterface = ptr_cast(CPU_BASE)
+private redist_control() -> *RedistributorControl = ptr_cast(REDIST_BASE)
+private redist() -> *Redistributor = ptr_cast(REDIST_BASE + SGI_FRAME)
 
-// Switch on the distributor and this processor's interface, letting through every priority.
+// Switch on the distributor, wake this processor's redistributor, and open the CPU interface to
+// group 1 interrupts of every priority.
 init()
-    dist().ctlr = 1
-    cpu().pmr = 0xff
-    cpu().ctlr = 1
+    dist().ctlr = dist().ctlr | CTLR_ARE | CTLR_ENABLE_GRP1
 
-// Enable interrupt `id` at the middle priority. A private peripheral interrupt (16-31) is this
-// processor's own, so it needs no routing.
+    val w = redist_control()
+    w.waker = w.waker & ~WAKER_PROCESSOR_SLEEP
+    while (w.waker & WAKER_CHILDREN_ASLEEP) != 0 do ()
+
+    enable_system_registers()
+    set_priority_mask(0xff)
+    enable_group1()
+
+// Enable private interrupt `id` (16-31) in group 1, which this processor takes as an IRQ, at the
+// middle priority.
 enable(id: u32)
-    val d = dist()
+    val r = redist()
     val word = usize(id / 4)
     val shift = (id % 4) * 8
-    d.ipriorityr[word] = (d.ipriorityr[word] & ~(u32(0xff) << shift)) | (u32(0x80) << shift)
-    d.isenabler[usize(id / 32)] = u32(1) << (id % 32)
+    r.ipriorityr[word] = (r.ipriorityr[word] & ~(u32(0xff) << shift)) | (u32(0x80) << shift)
+    r.igroupr0 = r.igroupr0 | (u32(1) << id)
+    r.isenabler0 = u32(1) << id
 
 // Take the highest-priority pending interrupt, answering its ID. Its source then waits for
 // `complete` before it can be delivered again.
-acknowledge() -> u32 = cpu().iar & 0x3ff
+acknowledge() -> u32
+    var v: u64 = 0
+    asm
+        [aarch64]
+            "mrs {v}, icc_iar1_el1"
+            out v : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    u32(v & 0xff_ffff)
 
 // Signal that interrupt `id` has been handled.
 complete(id: u32)
-    cpu().eoir = id
+    val v = u64(id)
+    asm
+        [aarch64]
+            "msr icc_eoir1_el1, {v}"
+            "isb"
+            in v : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// Reach the CPU interface through system registers (ICC_SRE_EL1.SRE).
+private enable_system_registers()
+    var v: u64 = 0
+    asm
+        [aarch64]
+            "mrs {v}, icc_sre_el1"
+            out v : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    val on = v | 1
+    asm
+        [aarch64]
+            "msr icc_sre_el1, {on}"
+            "isb"
+            in on : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// Let through interrupts of a priority numerically below `mask`.
+private set_priority_mask(mask: u64)
+    asm
+        [aarch64]
+            "msr icc_pmr_el1, {mask}"
+            in mask : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+private enable_group1()
+    val on: u64 = 1
+    asm
+        [aarch64]
+            "msr icc_igrpen1_el1, {on}"
+            "isb"
+            in on : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
