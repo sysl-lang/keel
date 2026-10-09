@@ -1,0 +1,93 @@
+// The test of keel.fsys from the program's side: `sysl.fs`'s current directory, truncation, the
+// existence questions, its errors as keel answers them, and the calls keel has no system call for.
+// Prints "user: sysl.fs ok" and exits 0 only if every check passed.
+
+import rt.keel.user
+import sysl.fs
+import sysl.fs.IoError
+
+var failures = 0
+
+fail(what: string)
+    print(s"user: FAILED: $what")
+    failures += 1
+
+check(ok: bool, what: string)
+    if !ok then fail(what)
+
+// Whether a call failed with exactly `want`; it is handed the call's `.err()` (FINDINGS.md 42).
+refused(r: Option[IoError], want: IoError, what: string)
+    r match
+        None -> fail(s"$what succeeded")
+        Some(e) -> check(e == want, s"$what answered '$e', not '$want'")
+
+text(path: string) -> string = fs.read_text(path) match
+    Ok(t) -> t
+    Err(e) ->
+        fail(s"reading $path: $e")
+        ""
+
+cwd() -> string = fs.current_dir() match
+    Ok(d) -> d
+    Err(e) ->
+        fail(s"current_dir: $e")
+        ""
+
+// The current directory: `/` at the start, moved by a relative path and by `..`, and a path relative
+// to it reaching the file it names.
+check(cwd() == "/", s"the first current directory is '${cwd()}'")
+check(fs.set_current_dir("dir").is_ok(), "set_current_dir(dir)")
+check(cwd() == "/dir", s"after set_current_dir(dir) it is '${cwd()}'")
+check(text("inner.txt") == "inside a directory\n", "a relative path from /dir")
+check(fs.set_current_dir("./../dir/..").is_ok(), "set_current_dir(./../dir/..)")
+check(cwd() == "/", s"after ./../dir/.. it is '${cwd()}'")
+refused(fs.set_current_dir("/hello.txt").err(), IoError.NotADirectory, "set_current_dir(/hello.txt)")
+refused(fs.set_current_dir("/nowhere").err(), IoError.NotFound, "set_current_dir(/nowhere)")
+
+// What is there, asked through `access` and `opendir`.
+check(fs.exists("/hello.txt") && fs.exists("hello.txt") && !fs.exists("/nowhere"), "exists")
+check(fs.is_dir("/dir") && !fs.is_dir("/hello.txt") && fs.is_file("/hello.txt"), "is_dir and is_file")
+check(fs.size_of("/hello.txt") == Ok(19), "size_of(/hello.txt)")
+
+// Truncation by path (keel's truncate) and through an open file (ftruncate): shorter, then longer with
+// zeros, across a block boundary.
+check(fs.write_text("/t.txt", "0123456789").is_ok(), "write_text(/t.txt)")
+check(fs.truncate("/t.txt", 4).is_ok() && text("/t.txt") == "0123", "truncate to 4")
+check(fs.truncate("/t.txt", 6000).is_ok() && fs.size_of("/t.txt") == Ok(6000), "truncate to 6000")
+fs.read_bytes("/t.txt") match
+    Ok(b) ->
+        var zeros = true
+        for i in 4..<b.len
+            if b[i] != 0 then zeros = false
+        check(b.len == 6000 && b[3] == u8('3') && zeros, "the bytes truncate added are zeros")
+    Err(e) -> fail(s"read_bytes(/t.txt): $e")
+fs.open_update("/t.txt") match
+    Ok(f) ->
+        var file = f
+        check(file.truncate(2).is_ok(), "File.truncate(2)")
+        check(file.size() == Ok(2), "File.size after truncate")
+        check(file.close().is_ok(), "close")
+    Err(e) -> fail(s"open_update(/t.txt): $e")
+check(text("/t.txt") == "01", "after File.truncate")
+refused(fs.truncate("/nowhere", 1).err(), IoError.NotFound, "truncate(/nowhere)")
+refused(fs.truncate("/dir", 1).err(), IoError.IsADirectory, "truncate(/dir)")
+check(fs.remove_file("/t.txt").is_ok() && !fs.exists("/t.txt"), "remove_file(/t.txt)")
+
+// keel's errors, as `IoError`s.
+refused(fs.read_bytes("/nowhere").err(), IoError.NotFound, "read_bytes(/nowhere)")
+refused(fs.read_bytes("/dir").err(), IoError.IsADirectory, "read_bytes(/dir)")
+refused(fs.make_dir("/dir").err(), IoError.AlreadyExists, "make_dir(/dir)")
+refused(fs.entries("/hello.txt").err(), IoError.NotADirectory, "entries(/hello.txt)")
+refused(fs.remove_dir("/dir").err(), IoError.DirectoryNotEmpty, "remove_dir(/dir)")
+fs.entries("/dir") match
+    Ok(names) -> check(names.len() == 1 && names.view()[0] == "inner.txt", "entries(/dir)")
+    Err(e) -> fail(s"entries(/dir): $e")
+
+// What keel has no call for is "not supported", in sysl.fs's own words.
+fs.symlink("/hello.txt", "/link") match
+    Ok(_) -> fail("symlink succeeded")
+    Err(e) -> check(e.code() == -1 && s"$e" == "not supported on this target", s"symlink answered '$e'")
+refused(fs.hard_link("/hello.txt", "/link").err(), IoError.Other(-1), "hard_link")
+refused(fs.read_link("/hello.txt").err(), IoError.Other(-1), "read_link")
+
+if failures == 0 then print("user: sysl.fs ok") else exit(1)

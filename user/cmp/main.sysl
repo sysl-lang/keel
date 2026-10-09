@@ -1,0 +1,26 @@
+// cmp <a> <b>: silent and exit 0 when the two files hold the same bytes; otherwise says where they
+// first differ and exits 1, or exits 2 when either could not be read.
+
+import rt.keel.user
+import sysl.fs
+
+main(args: []string)
+    if args.len != 3
+        print("usage: cmp <a> <b>")
+        exit(2)
+    val a = read(args[1])
+    val b = read(args[2])
+    val n = if a.len < b.len then a.len else b.len
+    for i in 0..<n
+        if a[i] != b[i]
+            print(s"cmp: ${args[1]} ${args[2]} differ: byte ${i + 1}")
+            exit(1)
+    if a.len != b.len
+        print(s"cmp: EOF on ${if a.len < b.len then args[1] else args[2]} after byte $n")
+        exit(1)
+
+read(path: string) -> []u8 = fs.read_bytes(path) match
+    Ok(b) -> b
+    Err(e) ->
+        print(s"cmp: $path: $e")
+        exit(2)

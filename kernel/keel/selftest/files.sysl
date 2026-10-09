@@ -24,6 +24,38 @@ files()
             proc.wait(p)
             if !proc.exited(p) || proc.exit_code(p) != 0 then print("keel: files", outcome(p))
         Err(_) -> print("keel: files did not load")
+    utilities()
+
+// Milestone 9: programs written with the standard library's `sysl.fs`, which keel.fsys answers with
+// the system calls. `cp` copies a small file and a multi-block one (scripts/boot-test.sh also compares
+// the big copy with its source on the host); `cmp` checks each copy; a missing source makes `cp` say
+// sysl.fs's error and exit 1; `ls` and `cat` print what the script expects; `fscheck` goes through the
+// rest of sysl.fs.
+private utilities()
+    if copied("/hello.txt", "/m9/copy.txt") then print("keel: cp ok")
+    if copied("/m9/big.bin", "/m9/big.copy") then print("keel: cp big ok")
+    val refused = exit_of(proc.cp(), ["cp", "/missing.txt", "/m9/nowhere.txt"])
+    if refused == 1 && exit_of(proc.cmp(), ["cmp", "/missing.txt", "/m9/nowhere.txt"]) == 2
+        print("keel: cp missing ok")
+    if exit_of(proc.ls(), ["ls", "/"]) == 0 then print("keel: ls ok")
+    if exit_of(proc.cat(), ["cat", "/dir/inner.txt"]) == 0 then print("keel: cat ok")
+    val _ = exit_of(proc.fscheck(), ["fscheck"])
+
+// `cp from to`, then `cmp from to`: both exited 0.
+private copied(from: string, to: string) -> bool =
+    exit_of(proc.cp(), ["cp", from, to]) == 0 && exit_of(proc.cmp(), ["cmp", from, to]) == 0
+
+// Run a program with `args` and wait for it: its exit code, or -1 (said) if it did not exit by itself.
+private exit_of(image: []const u8, args: []const string) -> i64
+    proc.start_with(image, args) match
+        Ok(p) ->
+            proc.wait(p)
+            if proc.exited(p) then return proc.exit_code(p)
+            print(s"keel: ${args[0]}", outcome(p))
+            -1
+        Err(_) ->
+            print(s"keel: ${args[0]} did not load")
+            -1
 
 // The write-back kmain asks for before it powers off: every block still dirty in the cache goes to the
 // disk, which is all that makes what the programs wrote survive the reboot.

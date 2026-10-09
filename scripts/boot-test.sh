@@ -69,6 +69,15 @@ before_user_line=(
     "user: dirs ok"         # mkdir, getdents, rename (into and out of directories), unlink, rmdir, errors
 )
 after_user_line=(
+    "keel: cp ok"           # cp, written with sysl.fs, copied /hello.txt to /m9, and cmp found the copy the same
+    "keel: cp big ok"       # ...and the 200 KiB /m9/big.bin, through the indirect block (checked on the host too)
+    "cp: /missing.txt: no such file or directory"   # cp of a missing file says sysl.fs's error...
+    "keel: cp missing ok"   # ...and exits 1 (cmp of it exits 2)
+    $'\ndir\nhello.txt\nm9\nout.txt\n'   # ls /, sorted, one name to a line
+    "keel: ls ok"
+    "inside a directory"    # cat /dir/inner.txt
+    "keel: cat ok"
+    "user: sysl.fs ok"      # fscheck: cwd, truncate, access, errors, unsupported calls, through sysl.fs
     "keel: fs synced at shutdown"   # the dirty blocks went to the disk before the power did
     "keel: bounds check failed: index"   # the last step: a kernel bounds failure is reported...
     "keel: halted"                 # ...and stops the machine (checked below: nothing ran after it)
@@ -78,10 +87,11 @@ after_user_line=(
 # in the `files` program failed.
 not_expected=("keel: bounds failure was not fatal" "user: FAILED")
 
-user_programs=(hello fault spin worker badptr files fsload echo)
+user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck)
 
-# 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
-frames_min=65000
+# 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take several hundred —
+# the image most, carrying every user program (~100 KiB each for the ones built on sysl.fs).
+frames_min=64500
 frames_max=65536
 
 elf=$out/keel.elf
@@ -112,6 +122,8 @@ rm -rf $fsroot
 mkdir -p $fsroot/dir
 print -n "hello from the disk" > $fsroot/hello.txt
 print "inside a directory" > $fsroot/dir/inner.txt
+mkdir -p $fsroot/m9
+perl -e 'srand(9); print map { chr(int(rand(256))) } 1..204800' > $fsroot/m9/big.bin
 $mkfs build $disk 1024 $fsroot
 sector 7 3 | perl -e 'open(my $f, "+<", $ARGV[0]) or die; seek($f, 512, 0); local $/; print $f <STDIN>' $disk
 
@@ -223,4 +235,13 @@ if [[ $header != "keel was here, boot 2" ]]; then
     return 1
 fi
 print -r -- "host: /out.txt says $header"
+
+# The big file cp copied on keel, read back on the host through mkfs and compared byte for byte.
+rm -f $out/big.copy
+$mkfs get $disk /m9/big.copy $out/big.copy
+if ! cmp $fsroot/m9/big.bin $out/big.copy; then
+    print -r -- "FAIL: /m9/big.copy on the host is not /m9/big.bin"
+    return 1
+fi
+print -r -- "host: cp verified"
 print -r -- "PASS: two boots on one disk, every line in order each time, and QEMU exited by itself (status 0) after $((first / 10)).$((first % 10))s and $((second / 10)).$((second % 10))s"

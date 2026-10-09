@@ -1,0 +1,15 @@
+// cat <file>...: each file's bytes to the console, in order. Exits 1 if any could not be read.
+
+import abi.keel.abi.STDOUT
+import rt.keel.user
+import sysl.fs
+
+main(args: []string)
+    var failed = false
+    for path in args[1..]
+        fs.read_bytes(path) match
+            Ok(b) -> val _ = user.write_bytes(STDOUT, b)
+            Err(e) ->
+                print(s"cat: $path: $e")
+                failed = true
+    if failed then exit(1)

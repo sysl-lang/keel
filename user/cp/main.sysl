@@ -1,0 +1,19 @@
+// cp <from> <to>: one file copied to another path, replacing whatever was there — written with the
+// standard library's `sysl.fs`, as any sysl program would be. keel.fsys, a dependency in the manifest,
+// is what answers `sysl.fs` underneath.
+//
+// Exits 0 when the copy is whole, 1 when it failed (the reason on the console, in sysl.fs's words),
+// and 2 when it was not given two paths.
+
+import rt.keel.user
+import sysl.fs
+
+main(args: []string)
+    if args.len != 3
+        print("usage: cp <from> <to>")
+        exit(2)
+    fs.copy_file(args[1], args[2]) match
+        Ok(_) -> ()
+        Err(e) ->
+            print(s"cp: ${args[1]}: $e")
+            exit(1)

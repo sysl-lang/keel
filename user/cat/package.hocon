@@ -1,0 +1,23 @@
+// `cat`: files to the console, written with the standard library's `sysl.fs`.
+
+package {
+  name    = "cat"
+  version = "0.0.1"
+}
+
+dependencies {
+  rt { workspace = true }
+  fsys { workspace = true }
+}
+
+// keel does not save the FP/SIMD registers yet, and leaves the unit trapping at EL0 too.
+codegen {
+  general_regs_only = true
+}
+
+targets {
+  aarch64-freestanding {
+    linker_script = "../user.ld"
+    entry         = "_start"
+  }
+}

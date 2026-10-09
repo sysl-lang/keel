@@ -204,8 +204,8 @@ dirs() -> Result[unit, Errno]
     user.rmdir("/d2")?
     user.rmdir("/d1")?
     val left = names("/")
-    check(left.len() == 5 && has(left, "hello.txt") && has(left, "dir") && has(left, "out.txt"),
-        "/ does not list exactly . .. hello.txt dir out.txt")
+    check(left.len() == 6 && has(left, "hello.txt") && has(left, "dir") && has(left, "out.txt") && has(left, "m9"),
+        "/ does not list exactly . .. hello.txt dir out.txt m9")
     Ok(())
 
 val before = failures

@@ -51,6 +51,31 @@ asm
         "keel_prog_echo:"
         ".incbin \"scratch/user/echo.elf\""
         "keel_prog_echo_end:"
+        ".balign 8"
+        ".globl keel_prog_cp, keel_prog_cp_end"
+        "keel_prog_cp:"
+        ".incbin \"scratch/user/cp.elf\""
+        "keel_prog_cp_end:"
+        ".balign 8"
+        ".globl keel_prog_cmp, keel_prog_cmp_end"
+        "keel_prog_cmp:"
+        ".incbin \"scratch/user/cmp.elf\""
+        "keel_prog_cmp_end:"
+        ".balign 8"
+        ".globl keel_prog_cat, keel_prog_cat_end"
+        "keel_prog_cat:"
+        ".incbin \"scratch/user/cat.elf\""
+        "keel_prog_cat_end:"
+        ".balign 8"
+        ".globl keel_prog_ls, keel_prog_ls_end"
+        "keel_prog_ls:"
+        ".incbin \"scratch/user/ls.elf\""
+        "keel_prog_ls_end:"
+        ".balign 8"
+        ".globl keel_prog_fscheck, keel_prog_fscheck_end"
+        "keel_prog_fscheck:"
+        ".incbin \"scratch/user/fscheck.elf\""
+        "keel_prog_fscheck_end:"
     [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
 
 extern keel_prog_hello: u8
@@ -69,6 +94,16 @@ extern keel_prog_fsload: u8
 extern keel_prog_fsload_end: u8
 extern keel_prog_echo: u8
 extern keel_prog_echo_end: u8
+extern keel_prog_cp: u8
+extern keel_prog_cp_end: u8
+extern keel_prog_cmp: u8
+extern keel_prog_cmp_end: u8
+extern keel_prog_cat: u8
+extern keel_prog_cat_end: u8
+extern keel_prog_ls: u8
+extern keel_prog_ls_end: u8
+extern keel_prog_fscheck: u8
+extern keel_prog_fscheck_end: u8
 
 private image(start: *u8, end: *u8) -> []const u8 = start[0..<usize(end) - usize(start)]
 
@@ -80,3 +115,8 @@ badptr() -> []const u8 = image(&keel_prog_badptr, &keel_prog_badptr_end)
 files() -> []const u8 = image(&keel_prog_files, &keel_prog_files_end)
 fsload() -> []const u8 = image(&keel_prog_fsload, &keel_prog_fsload_end)
 echo() -> []const u8 = image(&keel_prog_echo, &keel_prog_echo_end)
+cp() -> []const u8 = image(&keel_prog_cp, &keel_prog_cp_end)
+cmp() -> []const u8 = image(&keel_prog_cmp, &keel_prog_cmp_end)
+cat() -> []const u8 = image(&keel_prog_cat, &keel_prog_cat_end)
+ls() -> []const u8 = image(&keel_prog_ls, &keel_prog_ls_end)
+fscheck() -> []const u8 = image(&keel_prog_fscheck, &keel_prog_fscheck_end)
