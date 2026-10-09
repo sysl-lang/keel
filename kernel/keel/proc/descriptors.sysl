@@ -13,11 +13,14 @@ module keel.proc
 // table; bytes cross between the ring and the program through a chunk on the kernel stack, so no user
 // memory is touched with the lock held.
 //
+// A signal wakes a reader or writer asleep in a pipe, which answers EINTR — or, for a writer, what it
+// had already put in. A write with no reader left answers EPIPE and sends the writer SIGPIPE, which ends
+// it unless it is ignored or handled.
+//
 // What is simplified: a second descriptor on a file (dup2, dup, a child's) copies the offset rather
-// than sharing it, which is the same for the shell's `>` and `>>` (a fresh file, and O_APPEND); and a
-// process asleep in a pipe is not woken by `kill` until the pipe moves.
+// than sharing it, which is the same for the shell's `>` and `>>` (a fresh file, and O_APPEND).
 
-import abi.keel.abi.{EBADF, EFAULT, EMFILE, ENFILE, EPIPE, Errno, MAX_FDS, PIPE_ROOM}
+import abi.keel.abi.{EBADF, EFAULT, EINTR, EMFILE, ENFILE, EPIPE, Errno, MAX_FDS, PIPE_ROOM, SIGPIPE}
 import keel.console
 import keel.fs
 import keel.mm
@@ -48,7 +51,9 @@ private[proc] sys_read(p: *Process, regs: *u64) -> Result[i64, Errno]
     f.holds match
         Console ->
             if !mm.user_range(&p.space, regs[1], regs[2], true) then return Err(EFAULT)
-            Ok(i64(console.read(&p.space, regs[1], regs[2])))
+            console.read(p, regs[1], regs[2]) match
+                Some(n) -> Ok(i64(n))
+                None -> Err(EINTR)
         File -> fs.sys_read(p, regs)
         PipeRead -> pipe_read(p, usize(f.ino), regs[1], regs[2])
         else Err(EBADF)
@@ -171,6 +176,10 @@ private new_pipe() -> Result[usize, Errno]
     pipe_lock.unlock(flags)
     Err(ENFILE)
 
+// Off only to show what waking a sleeper for a signal is for: with it off a read of an empty pipe
+// sleeps through every signal, and the boot test's `sigtest` hangs in its interrupted read.
+private const READ_INTERRUPTIBLE: bool = true
+
 // Up to `len` bytes from pipe `slot`, sleeping while it is empty and a writer is left; 0 once none is.
 private pipe_read(p: *Process, slot: usize, va: u64, len: u64) -> Result[i64, Errno]
     if len == 0 then return Ok(0)
@@ -179,7 +188,11 @@ private pipe_read(p: *Process, slot: usize, va: u64, len: u64) -> Result[i64, Er
     val flags = pipe_lock.lock()
     val pp = &pipes[slot]
     while pp.count == 0 && pp.writers > 0
-        pp.can_read.sleep(&pipe_lock)
+        if !READ_INTERRUPTIBLE
+            pp.can_read.sleep(&pipe_lock)
+        else if !sched.sleep_interruptibly(p, &pp.can_read, &pipe_lock)
+            pipe_lock.unlock(flags)
+            return Err(EINTR)
     var n = pp.count
     if n > CHUNK then n = CHUNK
     if u64(n) > len then n = usize(len)
@@ -192,8 +205,9 @@ private pipe_read(p: *Process, slot: usize, va: u64, len: u64) -> Result[i64, Er
     if !mm.copy_to_user(&p.space, va, chunk[0..<n]) then return Err(EFAULT)
     Ok(i64(n))
 
-// All `len` bytes into pipe `slot`, sleeping while it is full and a reader is left. EPIPE if no reader
-// is left before anything went in; what went in, if one went away part way.
+// All `len` bytes into pipe `slot`, sleeping while it is full and a reader is left. EPIPE, and SIGPIPE
+// sent to the writer, if no reader is left before anything went in; EINTR if a signal came first; what
+// went in, if a reader went away or a signal came part way.
 private pipe_write(p: *Process, slot: usize, va: u64, len: u64) -> Result[i64, Errno]
     if !mm.user_range(&p.space, va, len, false) then return Err(EFAULT)
     var chunk: [CHUNK]u8 = [0; CHUNK]
@@ -202,21 +216,31 @@ private pipe_write(p: *Process, slot: usize, va: u64, len: u64) -> Result[i64, E
         var want = usize(len - done)
         if want > CHUNK then want = CHUNK
         if !mm.copy_from_user(&p.space, va + done, chunk[0..<want]) then return Err(EFAULT)
-        val put = into_pipe(slot, chunk[0..<want])
+        val (put, interrupted) = into_pipe(p, slot, chunk[0..<want])
         done += u64(put)
+        if interrupted
+            if done == 0 then return Err(EINTR)
+            break
         if put < want
-            if done == 0 then return Err(EPIPE)
+            if done == 0
+                // The writer is running, so there is no sleep to end: the signal is delivered on the way
+                // back to user mode.
+                val _ = sched.post(p, SIGPIPE)
+                return Err(EPIPE)
             break
     Ok(i64(done))
 
-// Put `bytes` into pipe `slot`, waiting for room; answers how many went in before no reader was left.
-private into_pipe(slot: usize, bytes: []const u8) -> usize
+// Put `bytes` into pipe `slot`, waiting for room; answers how many went in before no reader was left or
+// a signal for `p` came, and whether one did.
+private into_pipe(p: *Process, slot: usize, bytes: []const u8) -> (usize, bool)
     var put: usize = 0
     val flags = pipe_lock.lock()
     val pp = &pipes[slot]
     while put < bytes.len && pp.readers > 0
         if pp.count == ROOM
-            pp.can_write.sleep(&pipe_lock)
+            if !sched.sleep_interruptibly(p, &pp.can_write, &pipe_lock)
+                pipe_lock.unlock(flags)
+                return (put, true)
             continue
         var n = bytes.len - put
         if n > ROOM - pp.count then n = ROOM - pp.count
@@ -226,7 +250,7 @@ private into_pipe(slot: usize, bytes: []const u8) -> usize
         put += n
         val _ = pp.can_read.wake_all()
     pipe_lock.unlock(flags)
-    put
+    (put, false)
 
 // The console's write: every page of the buffer is checked against the process's translation tables
 // first — mapped, and mapped for the user — so a bad pointer anywhere in it answers EFAULT and prints

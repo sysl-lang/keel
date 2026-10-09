@@ -23,7 +23,6 @@ import keel.mm
 import keel.sched
 import keel.sched.{Context, Env, Process}
 import sysl.buf.{Buf, buf}
-import sysl.sync.Atomic
 
 private const MAX_EXEC_PATH: usize = 256
 
@@ -32,8 +31,10 @@ private[proc] sys_fork(p: *Process, regs: *u64) -> Result[i64, Errno]
     val space = mm.fork_space(&p.space) match
         Some(s) -> s
         None -> return Err(ENOMEM)
-    val child: &sync Process = Process(new_pid(), space, p.heap_base, p.brk, Context([0; 12], 0, 0), Atomic(0), 0,
-        0, None, 0, sched.no_files(), p.cwd, p.cwd_len, p.pid, false, None, p.uid, p.gid, copied_env(p))
+    // The child has its parent's signal actions and blocked set, nothing pending, and its process group.
+    val child: &sync Process = Process(new_pid(), space, p.heap_base, p.brk, Context([0; 12], 0, 0),
+        sched.copied_signals(p.sig), 0, 0, None, 0, sched.no_files(), p.cwd, p.cwd_len, p.pid, false, None, p.uid,
+        p.gid, copied_env(p), p.pgid, 0, p.name)
     val raw: *Process = &*child
     for fd in 0..<sched.OPEN_FILES
         raw.files[fd] = p.files[fd]
@@ -93,6 +94,9 @@ private[proc] sys_execve(p: *Process, regs: *u64) -> Result[i64, Errno]
     p.uid = image.run_as.uid
     p.gid = image.run_as.gid
     p.env = sched.env_of(env.view())
+    p.name = name_from(args.view())
+    // A handler's address means nothing in the new program; an ignored signal stays ignored.
+    sched.reset_handlers(p.sig)
     replace_regs(regs, fresh_regs(l.entry, sp, 0))
     Ok(0)
 

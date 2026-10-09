@@ -1,0 +1,271 @@
+module keel.proc
+
+// Signals and process groups: sending (`kill`, Ctrl-C at the console, SIGCHLD, SIGPIPE), delivering on
+// the way back to user mode, and the calls that set them up. keel.sched holds each process's signal
+// state and the interruptible sleep; keel.abi says what the calls mean to a program.
+//
+// **Delivery** (`deliver`) runs on every return to EL0 — after a system call, after an interrupt, after
+// a copy-on-write fault — with the registers the process resumes with. It takes the lowest deliverable
+// signal: ignored, it is dropped; default, it ends the process (or is dropped, for the ones whose
+// default is to ignore); handled, a `SigFrame` holding every register and the blocked set is pushed on
+// the process's own stack, and the registers are changed so that the process resumes in the handler
+// with x0 = the signal, x30 = the restorer its `sigaction` named, and SP at the frame. The restorer is
+// the user runtime's `keel_sigreturn_trampoline` (Linux's `sa_restorer`), which makes `sigreturn`; that
+// reads the frame back from SP and puts every register back as it was, the flags made safe (EL0, no
+// exception masked: only NZCV is taken from the frame).
+
+import abi.keel.abi.{EFAULT, EINTR, EINVAL, ENOTTY, EPERM, ESRCH, Errno, INIT_PID, MAX_FDS, NSIG, ProcInfo,
+    SIGINT, SIGKILL, SIGSEGV, SIGSTOP, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_SETMASK, SIG_UNBLOCK, SigAction, SigFrame}
+import keel.console
+import keel.mm
+import keel.sched
+import keel.sched.{Action, Holds, Process, Wakes}
+import keel.timer
+import sysl.buf.{Buf, buf}
+import sysl.sync.Ordering
+
+// Words of the frame the registers fill: x0-x30, ELR, SPSR, SP_EL0 — `UserRegs`, and a `SigFrame`'s
+// start.
+private const REGS_WORDS: usize = 34
+private const PC: usize = 31
+private const PSTATE: usize = 32
+private const SP: usize = 33
+
+@assert(offsetof(SigFrame, pc) == PC * 8, "a SigFrame starts with the registers as UserRegs holds them")
+@assert(offsetof(SigFrame, sp) == SP * 8, "SP_EL0 is the frame's 34th word")
+
+// The only flags a program's SigFrame may set: N, Z, C, V. Everything else in SPSR — the exception
+// level, the masks — the kernel decides.
+private const NZCV: u64 = 0xf000_0000
+
+// Off only to show what restoring every register is for: with it off `sigreturn` puts back x19-x30, SP,
+// the PC and the flags but leaves x0-x18 as the handler left them, and `sigtest`'s values computed
+// across a signal come out wrong.
+private const RESTORE_CALLER_SAVED: bool = true
+
+// Deliver what is pending for `p`, the calling thread's process, as it returns to user mode with
+// `regs`. May not return: a signal whose action is to end the process ends it here.
+private[proc] deliver(p: *Process, regs: *u64)
+    loop
+        val (sig, a) = sched.take(p)
+        if sig == 0 then return
+        if a.handler == SIG_IGN then continue
+        if a.handler == SIG_DFL
+            if sched.default_ignores(sig) then continue
+            end(p, sig, 0)
+        // A process whose stack cannot take the frame cannot run the handler.
+        if !push_frame(p, regs, sig, a) then end(p, SIGSEGV, 0)
+        return
+
+// Make the process resume in `a`'s handler for `sig`, the registers it was going to resume with saved
+// below its stack pointer. False if that is not memory it may write.
+private push_frame(p: *Process, regs: *u64, sig: u64, a: Action) -> bool
+    val s = p.sig
+    var f = SigFrame([0; 31], 0, 0, 0, 0, sig)
+    val w: *u64 = ptr_cast(&f)
+    for i in 0..<REGS_WORDS
+        w[i] = regs[i]
+    val at = (regs[SP] - u64(sizeof(SigFrame))) & ~u64(15)
+    val flags = s.lock.lock()
+    f.blocked = s.blocked
+    s.blocked = (s.blocked | a.mask | sched.bit(sig)) & ~sched.UNBLOCKABLE
+    s.lock.unlock(flags)
+    val bytes: *u8 = ptr_cast(&f)
+    if !mm.copy_to_user(&p.space, at, bytes[0..<sizeof(SigFrame)]) then return false
+    regs[0] = sig
+    regs[30] = a.restorer
+    regs[PC] = a.handler
+    regs[SP] = at
+    true
+
+// sigreturn() -> the interrupted x0: every register back from the SigFrame at SP, and the blocked set.
+private[proc] sys_sigreturn(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var f = SigFrame([0; 31], 0, 0, 0, 0, 0)
+    val bytes: *u8 = ptr_cast(&f)
+    if !mm.copy_from_user(&p.space, regs[SP], bytes[0..<sizeof(SigFrame)]) then end(p, SIGSEGV, 0)
+    val w: *u64 = ptr_cast(&f)
+    val first: usize = if RESTORE_CALLER_SAVED then 0 else 19
+    for i in first..<REGS_WORDS
+        regs[i] = w[i]
+    regs[PSTATE] = f.pstate & NZCV
+    val s = p.sig
+    val flags = s.lock.lock()
+    s.blocked = f.blocked & ~sched.UNBLOCKABLE
+    s.lock.unlock(flags)
+    // The dispatcher writes the answer to x0: the one it had.
+    Ok(i64(regs[0]))
+
+// sigaction(sig, handler, mask, restorer, *SigAction old | 0) -> 0
+private[proc] sys_sigaction(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val sig = regs[0]
+    val a = Action(regs[1], regs[2], regs[3])
+    if sig == 0 || sig >= NSIG || sig == SIGKILL || sig == SIGSTOP then return Err(EINVAL)
+    if a.handler != SIG_DFL && a.handler != SIG_IGN && a.restorer == 0 then return Err(EINVAL)
+    val old_at = regs[4]
+    if old_at != 0 && !mm.user_range(&p.space, old_at, u64(sizeof(SigAction)), true) then return Err(EFAULT)
+    val s = p.sig
+    val flags = s.lock.lock()
+    val old = s.actions[usize(sig)]
+    s.actions[usize(sig)] = a
+    // A signal that is now ignored and is pending is thrown away, as it would have been when sent.
+    if sched.ignores(s, sig) then s.pending.store(s.pending.load(Ordering.Relaxed) & ~sched.bit(sig), Ordering.Release)
+    s.lock.unlock(flags)
+    if old_at != 0
+        var o = SigAction(old.handler, old.mask, old.restorer)
+        val b: *u8 = ptr_cast(&o)
+        if !mm.copy_to_user(&p.space, old_at, b[0..<sizeof(SigAction)]) then return Err(EFAULT)
+    Ok(0)
+
+// sigprocmask(how, set, *u64 old | 0) -> 0
+private[proc] sys_sigprocmask(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val how = regs[0]
+    val set = regs[1]
+    val old_at = regs[2]
+    if how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK then return Err(EINVAL)
+    if old_at != 0 && !mm.user_range(&p.space, old_at, 8, true) then return Err(EFAULT)
+    val s = p.sig
+    val flags = s.lock.lock()
+    var old = s.blocked
+    val now = if how == SIG_BLOCK then old | set else if how == SIG_UNBLOCK then old & ~set else set
+    s.blocked = now & ~sched.UNBLOCKABLE
+    s.lock.unlock(flags)
+    if old_at != 0
+        val b: *u8 = ptr_cast(&old)
+        if !mm.copy_to_user(&p.space, old_at, b[0..<8]) then return Err(EFAULT)
+    Ok(0)
+
+// Whether `from` may signal `to`: root may signal anyone, a user only their own processes.
+private may_signal(from: *Process, to: *Process) -> bool = from.uid == 0 || from.uid == to.uid
+
+// Whether process `c` is one that `kill`'s `pid` names, for a caller in group `own_group`.
+private named(c: *Process, pid: i64, own_group: u64, caller: *Process) -> bool
+    if pid > 0 then return i64(c.pid) == pid
+    if pid == 0 then return c.pgid == own_group
+    if pid == -1 then return c.pid != INIT_PID && c != caller
+    c.pgid == u64(-pid)
+
+// kill(pid | 0 | -1 | -pgid, sig) -> 0. Signal 0 only checks that there is something to signal.
+private[proc] sys_kill(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val pid = i64(regs[0])
+    val sig = regs[1]
+    if sig >= NSIG then return Err(EINVAL)
+    var found = false
+    var allowed = false
+    var wakes = sched.no_wakes()
+    val flags = family.lock()
+    for i in 0..<MAX_PROCS
+        val c = table[i]
+        if c == null || !named(c, pid, p.pgid, p) then continue
+        found = true
+        if !may_signal(p, c) then continue
+        allowed = true
+        if sig != 0 && !c.ended then wakes.add(sched.post(c, sig))
+    family.unlock(flags)
+    wakes.wake_all()
+    if !found then return Err(ESRCH)
+    if !allowed then return Err(EPERM)
+    Ok(0)
+
+// Send `sig` to every process in group `pgid`, for the kernel: no permission applies.
+private signal_group(pgid: u64, sig: u64)
+    var wakes = sched.no_wakes()
+    val flags = family.lock()
+    for i in 0..<MAX_PROCS
+        val c = table[i]
+        if c != null && c.pgid == pgid && !c.ended then wakes.add(sched.post(c, sig))
+    family.unlock(flags)
+    wakes.wake_all()
+
+// Ctrl-C at the console (keel.console, interrupt context): SIGINT to its foreground group.
+@export("keel_console_interrupt")
+console_interrupt(pgid: u64) = signal_group(pgid, SIGINT)
+
+// Whether `p` may put a process in group `pgid`: one of its own user's processes is in it (root may
+// join any). There are no sessions to bound it further.
+private[proc] group_joinable(p: *Process, pgid: u64) -> bool
+    val flags = family.lock()
+    var ok = false
+    for i in 0..<MAX_PROCS
+        val c = table[i]
+        if c != null && c.pgid == pgid && !c.ended && (p.uid == 0 || c.uid == p.uid) then ok = true
+    family.unlock(flags)
+    ok
+
+// setpgid(pid | 0, pgid | 0) -> 0: the caller, or a child of its own, into group `pgid` — its own number
+// for 0, a new group then — or an existing group of the caller's user.
+private[proc] sys_setpgid(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val pid = if regs[0] == 0 then p.pid else regs[0]
+    val pgid = if regs[1] == 0 then pid else regs[1]
+    if i64(pid) < 0 || i64(pgid) < 0 then return Err(EINVAL)
+    if pgid != pid && !group_joinable(p, pgid) then return Err(EPERM)
+    val flags = family.lock()
+    for i in 0..<MAX_PROCS
+        val c = table[i]
+        if c == null || c.pid != pid || c.ended then continue
+        if c != p && c.ppid != p.pid then break
+        c.pgid = pgid
+        family.unlock(flags)
+        return Ok(0)
+    family.unlock(flags)
+    Err(ESRCH)
+
+// getpgid(pid | 0) -> the process group
+private[proc] sys_getpgid(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[0] == 0 || regs[0] == p.pid then return Ok(i64(p.pgid))
+    val flags = family.lock()
+    for i in 0..<MAX_PROCS
+        val c = table[i]
+        if c != null && c.pid == regs[0]
+            val g = c.pgid
+            family.unlock(flags)
+            return Ok(i64(g))
+    family.unlock(flags)
+    Err(ESRCH)
+
+// Whether descriptor `fd` of `p` is the console.
+private on_console(p: *Process, fd: u64) -> bool = fd < MAX_FDS && p.files[usize(fd)].holds == Holds.Console
+
+// tcsetpgrp(fd, pgid) -> 0: the console's foreground group, which must be a group of the caller's user.
+private[proc] sys_tcsetpgrp(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if !on_console(p, regs[0]) then return Err(ENOTTY)
+    if !group_joinable(p, regs[1]) then return Err(EPERM)
+    console.set_foreground(regs[1])
+    Ok(0)
+
+// tcgetpgrp(fd) -> the console's foreground group; 0 for none.
+private[proc] sys_tcgetpgrp(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if !on_console(p, regs[0]) then return Err(ENOTTY)
+    Ok(i64(console.foreground_group()))
+
+// nanosleep(nanos, *u64 left | 0) -> 0; EINTR, with the nanoseconds that were left, if a signal ended
+// it. Rounded up to the timer's 10 ms.
+private[proc] sys_nanosleep(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val left_at = regs[1]
+    if left_at != 0 && !mm.user_range(&p.space, left_at, 8, true) then return Err(EFAULT)
+    val deadline = timer.now_ms() + (regs[0] + 999_999) / 1_000_000
+    if sched.nap_until(p, deadline) then return Ok(0)
+    if left_at != 0
+        val now = timer.now_ms()
+        var left: u64 = if now < deadline then (deadline - now) * 1_000_000 else 0
+        val b: *u8 = ptr_cast(&left)
+        if !mm.copy_to_user(&p.space, left_at, b[0..<8]) then return Err(EFAULT)
+    Err(EINTR)
+
+// procs(*ProcInfo, count) -> how many it filled: the process table, at most `count` of it.
+private[proc] sys_procs(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val room = regs[1]
+    var found: Buf[ProcInfo] = buf()
+    val flags = family.lock()
+    for i in 0..<MAX_PROCS
+        val c = table[i]
+        if c == null then continue
+        found.push(ProcInfo(c.pid, c.ppid, c.pgid, c.uid, if c.ended then 1 else 0, c.name))
+    family.unlock(flags)
+    var n: u64 = 0
+    for info in found.view()
+        if n == room then break
+        var copy = info
+        val b: *u8 = ptr_cast(&copy)
+        if !mm.copy_to_user(&p.space, regs[0] + n * u64(sizeof(ProcInfo)), b[0..<sizeof(ProcInfo)]) then return Err(EFAULT)
+        n += 1
+    Ok(i64(n))

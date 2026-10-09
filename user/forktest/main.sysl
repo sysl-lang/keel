@@ -28,10 +28,10 @@ reaped(pid: u64) -> i64
     user.wait(i64(pid)) match
         Ok((who, status)) ->
             check(who == pid, s"wait answered pid $who, not $pid")
-            if status.fault != 0
-                fail(s"child $pid was killed (fault ${status.fault})")
+            if !status.exited()
+                fail(s"child $pid was killed by signal ${status.signal()}")
                 return -1
-            status.code
+            status.code()
         Err(e) ->
             fail(s"wait for $pid: errno ${i64(e)}")
             -1

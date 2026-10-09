@@ -9,7 +9,6 @@ module keel.trap
 import keel.cpu.{core_id, esr, far, irq_restore, irq_save, set_vbar}
 import keel.irq.dispatch
 import keel.mm
-import keel.proc
 import keel.pl011.{put_byte, put_hex, put_str}
 import keel.psci.system_off
 import keel.sched.preempt
@@ -180,6 +179,10 @@ install()
 // The `extern` is where the check stops, which is the one edge it should not follow (FINDINGS.md 47).
 extern "keel_user_sync" user_sync(regs: *u64, ec: u64, iss: u64)
 
+// The way back to EL0 after an interrupt is keel.proc's too, for the same reason: delivering a signal
+// to a handler writes a frame on the process's stack, through calls the check would follow.
+extern "keel_returning_to_user" returning_to_user(regs: *u64)
+
 // The one function every vector slot calls, with the saved registers and the slot's number. What it
 // leaves in `frame` is what the interrupted code resumes with.
 @export("keel_trap")
@@ -193,7 +196,7 @@ keel_trap(frame: *Frame, slot: u64)
         user_irqs.add(1)
         dispatch()
         preempt()
-        proc.returning_to_user()
+        returning_to_user(&frame.x[0])
     else if slot == SYNC_LOWER
         val raw = esr()
         user_sync(&frame.x[0], u64(syndrome(raw).ec), u64(syndrome(raw).iss))

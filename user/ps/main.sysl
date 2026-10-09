@@ -1,0 +1,36 @@
+// ps: every process in the kernel's table — pid, parent, process group, user, and the program's name —
+// read with keel's `procs` call (there is no /proc). A process that has ended and is waiting for its
+// parent to reap it is marked `<ended>`.
+
+import rt.keel.user
+import sysl.text.from_utf8
+
+// `text` right-aligned in `width` columns. A width on a string hole is C's `snprintf` on a freestanding
+// target (FINDINGS.md 64), so the padding is written out.
+padded(text: string, width: usize) -> string
+    var out = ""
+    var n = text.bytes.len
+    while n < width
+        out = out + " "
+        n += 1
+    out + text
+
+// A record's name: its bytes up to the first NUL.
+name_of(bytes: [16]u8) -> string
+    var n: usize = 0
+    while n < 16 && bytes[n] != 0
+        n += 1
+    from_utf8(bytes[0..<n]).unwrap_or("?")
+
+main(args: []string)
+    val procs = user.procs() match
+        Ok(p) -> p
+        Err(e) ->
+            print(s"ps: ${user.describe(e)}")
+            exit(1)
+    print("  PID  PPID  PGID   UID CMD")
+    for p in procs.view()
+        val cols = padded(s"${p.pid}", 5) + " " + padded(s"${p.ppid}", 5) + " " + padded(s"${p.pgid}", 5) + " " +
+            padded(s"${p.uid}", 5)
+        val mark = if p.ended != 0 then " <ended>" else ""
+        print(s"$cols ${name_of(p.name)}$mark")

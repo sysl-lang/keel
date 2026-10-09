@@ -48,6 +48,111 @@ const SYS_DUP2: u64 = 37        // dup2(old, new) -> new: `new` closed first if 
 const SYS_DUP: u64 = 38         // dup(old) -> the lowest free descriptor, now the same as `old`
 const SYS_FORK: u64 = 39        // fork() -> the child's pid in the parent, 0 in the child
 const SYS_EXECVE: u64 = 40      // execve(path, path_len, args, args_len, env, env_len) -> never on success
+const SYS_SIGACTION: u64 = 41   // sigaction(sig, handler, mask, restorer, *SigAction old | 0) -> 0
+const SYS_SIGPROCMASK: u64 = 42 // sigprocmask(how, set, *u64 old | 0) -> 0
+const SYS_SIGRETURN: u64 = 43   // sigreturn() -> never: the registers a handler interrupted, from its frame
+const SYS_KILL: u64 = 44        // kill(pid | 0 | -1 | -pgid, sig) -> 0
+const SYS_SETPGID: u64 = 45     // setpgid(pid | 0, pgid | 0) -> 0
+const SYS_GETPGID: u64 = 46     // getpgid(pid | 0) -> the process group
+const SYS_TCSETPGRP: u64 = 47   // tcsetpgrp(fd, pgid) -> 0: the console's foreground process group
+const SYS_TCGETPGRP: u64 = 48   // tcgetpgrp(fd) -> the console's foreground process group, 0 for none
+const SYS_NANOSLEEP: u64 = 49   // nanosleep(nanos, *u64 left | 0) -> 0, or EINTR with what was left
+const SYS_PROCS: u64 = 50       // procs(*ProcInfo, count) -> the processes in the table, at most count
+
+// Signals, numbered as Linux numbers them on arm64. Every one is pending or not (a second of the same
+// kind before the first is delivered is the same one) and may be blocked; a pending signal that is not
+// blocked is delivered when the process next returns to user mode — after a system call, an interrupt
+// or a fault — and a system call asleep (a pipe, the console, `wait`, `nanosleep`) is woken to answer
+// EINTR first. Its action is `SIG_DFL`, `SIG_IGN` or a handler's address. A signal whose action is to
+// be ignored is thrown away when it is sent, and interrupts nothing.
+//
+// The default actions: CHLD, CONT, URG and WINCH are ignored; STOP, TSTP, TTIN and TTOU would stop the
+// process and **keel has no stopped state, so they are ignored too**; every other ends the process
+// (`wait`'s status says which). KILL and STOP cannot be caught, ignored or blocked.
+//
+// A handler runs on the process's own stack with `x0` = the signal and `x30` = the `restorer` its
+// `sigaction` named: a routine of the program's that makes `sigreturn` (keel.user's
+// `keel_sigreturn_trampoline`, as Linux's `sa_restorer`). Below the stack pointer the kernel has put a
+// `SigFrame` — every register as it was, and the blocked set to go back to — and `sigreturn` reads it
+// back from the stack pointer, so the handler must return with the stack as it found it. While it runs
+// the signal itself and the `mask` its `sigaction` named are blocked as well. A fault (SEGV, ILL, BUS,
+// TRAP, FPE) is not delivered to a handler: it ends the process.
+const SIGHUP: u64 = 1
+const SIGINT: u64 = 2
+const SIGQUIT: u64 = 3
+const SIGILL: u64 = 4
+const SIGTRAP: u64 = 5
+const SIGABRT: u64 = 6
+const SIGBUS: u64 = 7
+const SIGFPE: u64 = 8
+const SIGKILL: u64 = 9
+const SIGUSR1: u64 = 10
+const SIGSEGV: u64 = 11
+const SIGUSR2: u64 = 12
+const SIGPIPE: u64 = 13
+const SIGALRM: u64 = 14
+const SIGTERM: u64 = 15
+const SIGCHLD: u64 = 17
+const SIGCONT: u64 = 18
+const SIGSTOP: u64 = 19
+const SIGTSTP: u64 = 20
+const SIGTTIN: u64 = 21
+const SIGTTOU: u64 = 22
+const SIGURG: u64 = 23
+const SIGWINCH: u64 = 28
+const NSIG: u64 = 32            // signals are 1 to NSIG - 1
+
+const SIG_DFL: u64 = 0
+const SIG_IGN: u64 = 1
+
+// `sigprocmask`'s how: add `set` to the blocked signals, take it away, or make it the blocked set.
+const SIG_BLOCK: u64 = 0
+const SIG_UNBLOCK: u64 = 1
+const SIG_SETMASK: u64 = 2
+
+// A signal's bit in a set: `1 << sig`.
+sig_bit(sig: u64) -> u64 = u64(1) << sig
+
+// What `sigaction` answers about the action it replaced.
+struct SigAction
+    handler: u64                // SIG_DFL, SIG_IGN or the handler's address
+    mask: u64                   // blocked as well while the handler runs
+    restorer: u64               // where the handler returns to
+
+@assert(sizeof(SigAction) == 24, "a SigAction is 24 bytes")
+
+// What delivering a signal to a handler puts on the stack, at the stack pointer the handler starts
+// with: the registers as they were — x0 to x30, then where the program was (ELR), its flags (SPSR) and
+// its stack pointer — the blocked set to restore, and the signal.
+struct SigFrame
+    x: [31]u64
+    pc: u64
+    pstate: u64
+    sp: u64
+    blocked: u64
+    sig: u64
+
+@assert(sizeof(SigFrame) == 288, "a SigFrame is 288 bytes, a multiple of 16")
+
+// Process groups: every process is in one, numbered by the pid of the process that made it. A child
+// starts in its parent's (a process the kernel starts, in its own); `setpgid(pid, pgid)` moves the
+// caller or a child of its own into the group `pgid` — 0 for the pid's own number — which must be one of
+// the caller's own or a new one. The console has a foreground group (`tcsetpgrp`), and Ctrl-C typed at
+// it sends SIGINT to every process in that group. `kill`'s pid is a process, 0 for the caller's group,
+// -1 for every process the caller may signal but init, or -pgid for a group; a user may signal only
+// their own processes, root any. There are no sessions: any process may set the console's group.
+//
+// `procs` fills an array of `ProcInfo`, one for each process in the table, the ended ones not yet
+// reaped included; `/proc` it is not.
+struct ProcInfo
+    pid: u64
+    ppid: u64
+    pgid: u64
+    uid: u32
+    ended: u32                  // 1: it has ended and its parent has not yet waited for it
+    name: [16]u8                // the program's name, as argv[0] gave it, cut to 16 bytes; NUL-filled
+
+@assert(sizeof(ProcInfo) == 48, "a ProcInfo is 48 bytes")
 
 // Descriptors are a table of what each one is: the console, a file, or one end of a pipe. A new
 // process's 0 to 2 are the console unless its parent gave it something else (`SpawnAttr`); a child is
@@ -57,7 +162,7 @@ const SYS_EXECVE: u64 = 40      // execve(path, path_len, args, args_len, env, e
 // A pipe is a bounded buffer of PIPE_ROOM bytes in the kernel. `read` blocks while it is empty and some
 // write end is open, answers what is there (at most what was asked), and 0 once every write end is
 // closed and the buffer is drained. `write` blocks while it is full and some read end is open, and
-// answers EPIPE — with nothing written — once every read end is closed (signals come later).
+// answers EPIPE — with nothing written — once every read end is closed, and sends the writer SIGPIPE.
 const PIPE_ROOM: u64 = 4096
 // Users. A process has one user id and one group id — there is no real/effective split and there are
 // no supplementary groups — and a child starts with its parent's. Only root (uid 0) may change them.
@@ -89,33 +194,55 @@ struct SockAddr
 // most ARGS_ROOM bytes. A `SpawnAttr` (or 0 for every default) says what else the child gets: `fds[i]`
 // is the caller's descriptor that becomes the child's descriptor i, or NO_FD for the caller's own i;
 // and its environment is the caller's, unless `env_given` is non-zero, when it is the `env_len` bytes
-// at `env` instead — `NAME=value` entries, each followed by a NUL, at most ENV_ROOM bytes.
+// at `env` instead — `NAME=value` entries, each followed by a NUL, at most ENV_ROOM bytes. With
+// SPAWN_SETPGROUP in `flags` the child goes in the process group `pgid` (0: a new one, numbered by the
+// child's pid) instead of the caller's; with SPAWN_FOREGROUND as well, that group is made the console's
+// foreground group before the child runs, so a Ctrl-C typed the moment it starts reaches it. The child
+// starts with every signal's action the default and none blocked.
 //
-// `wait` blocks until a child of the caller ends — the one numbered `pid`, or any one for ANY_CHILD —
-// and fills in how it ended; ECHILD if there is no such child. A process whose parent ends first is
-// handed to init (pid 1), which waits for it instead.
+// `wait(pid, *ExitStatus, options)` blocks until a child of the caller ends — the one numbered `pid`, or
+// any one for ANY_CHILD — and fills in how it ended; ECHILD if there is no such child. With WNOHANG it
+// answers 0 instead of blocking. A process whose parent ends first is handed to init (pid 1), which
+// waits for it instead; the parent is sent SIGCHLD when a child ends.
 const NO_FD: u64 = 0xffff_ffff_ffff_ffff
 const ANY_CHILD: i64 = -1
 const ARGS_ROOM: u64 = 4096
 const INIT_PID: u64 = 1
 const ENV_ROOM: u64 = 1024
 
+const WNOHANG: u64 = 1
+const SPAWN_SETPGROUP: u64 = 1
+const SPAWN_FOREGROUND: u64 = 2
+
 struct SpawnAttr
     fds: [3]u64                 // the child's 0, 1 and 2: a descriptor of the caller's, or NO_FD
     env: u64                    // the environment's address, when `env_given`
     env_len: u64
     env_given: u64              // 0: the child's environment is the caller's
+    flags: u64                  // SPAWN_SETPGROUP, SPAWN_FOREGROUND
+    pgid: u64                   // with SPAWN_SETPGROUP: the group, 0 for a new one
 
-@assert(sizeof(SpawnAttr) == 48, "a SpawnAttr is 48 bytes")
+@assert(sizeof(SpawnAttr) == 64, "a SpawnAttr is 64 bytes")
 
-// How a child ended: `fault` is 0 when it called `exit`, whose argument is `code`; otherwise it was
-// ended by the kernel — a fault (ESR_EL1's exception class shifted left 8, with the fault status code
-// below it) or 0xffff for a `kill` — and `code` means nothing.
+// How a child ended. `status` is POSIX's wait status: the exit code (its low 8 bits) shifted left 8
+// when it called `exit`, or the number of the signal that ended it. `fault` is non-zero only when the
+// signal was a fault's: ESR_EL1's exception class shifted left 8, with the fault status code below it.
 struct ExitStatus
-    code: i64
+    status: u64
     fault: u64
 
+    // WIFEXITED, WEXITSTATUS, WIFSIGNALED, WTERMSIG.
+    exited(self) -> bool = (self.status & 0x7f) == 0
+    code(self) -> i64 = i64((self.status >> 8) & 0xff)
+    signalled(self) -> bool = (self.status & 0x7f) != 0 && (self.status & 0x7f) != 0x7f
+    signal(self) -> u64 = self.status & 0x7f
+end ExitStatus
+
 @assert(sizeof(ExitStatus) == 16, "an ExitStatus is 16 bytes")
+
+// The wait status of a process that exited with `code`, and of one a signal ended.
+exit_status(code: i64) -> u64 = (u64(code) & 0xff) << 8
+signal_status(sig: u64) -> u64 = sig & 0x7f
 
 // A path that does not begin with `/` is taken from the process's current directory, which starts at
 // `/`. A process starts with its arguments and environment on its stack, as Linux lays them out: SP
@@ -178,6 +305,8 @@ struct Dirent
 enum Errno: i64
     EPERM = 1                   // only root may: setuid, setgid, chown, chmod of someone else's file
     ENOENT = 2                  // no such file or directory
+    ESRCH = 3                   // kill, setpgid, getpgid: no such process or group
+    EINTR = 4                   // a signal arrived while the call was asleep
     EIO = 5                     // the disk failed
     E2BIG = 7                   // spawn's arguments are more than ARGS_ROOM
     ENOEXEC = 8                 // spawn's file is not an executable keel can load
@@ -194,6 +323,7 @@ enum Errno: i64
     EINVAL = 22
     ENFILE = 23                 // socket: every socket in the system is open
     EMFILE = 24                 // every descriptor is in use
+    ENOTTY = 25                 // tcsetpgrp, tcgetpgrp: the descriptor is not the console
     EFBIG = 27                  // past the largest file the filesystem holds
     ENOSPC = 28                 // no free block or inode
     ESPIPE = 29                 // lseek on a pipe or the console

@@ -4,7 +4,9 @@ import abi.keel.abi.{EINVAL, ENOSYS, EPERM, Errno, SYS_CHMOD, SYS_CHOWN, SYS_DUP
     SYS_GETUID, SYS_SETGID, SYS_SETUID, SYS_ACCESS, SYS_BRK, SYS_CHDIR, SYS_CLOSE,
     SYS_EXIT, SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR,
     SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN, SYS_STAT, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINK, SYS_WAIT,
-    SYS_WRITE, SYS_SOCKET, SYS_BIND, SYS_RECVFROM, SYS_SENDTO, SYS_SOCKCLOSE, SYS_FORK, SYS_EXECVE}
+    SYS_WRITE, SYS_SOCKET, SYS_BIND, SYS_RECVFROM, SYS_SENDTO, SYS_SOCKCLOSE, SYS_FORK, SYS_EXECVE, SYS_SIGACTION,
+    SYS_SIGPROCMASK, SYS_SIGRETURN, SYS_KILL, SYS_SETPGID, SYS_GETPGID, SYS_TCSETPGRP, SYS_TCGETPGRP, SYS_NANOSLEEP,
+    SYS_PROCS}
 import keel.fs
 import keel.mm
 import keel.sched.Process
@@ -62,6 +64,16 @@ private[proc] system_call(regs: *u64)
         SYS_DUP -> sys_dup(p, regs)
         SYS_FORK -> sys_fork(p, regs)
         SYS_EXECVE -> sys_execve(p, regs)
+        SYS_SIGACTION -> sys_sigaction(p, regs)
+        SYS_SIGPROCMASK -> sys_sigprocmask(p, regs)
+        SYS_SIGRETURN -> sys_sigreturn(p, regs)
+        SYS_KILL -> sys_kill(p, regs)
+        SYS_SETPGID -> sys_setpgid(p, regs)
+        SYS_GETPGID -> sys_getpgid(p, regs)
+        SYS_TCSETPGRP -> sys_tcsetpgrp(p, regs)
+        SYS_TCGETPGRP -> sys_tcgetpgrp(p, regs)
+        SYS_NANOSLEEP -> sys_nanosleep(p, regs)
+        SYS_PROCS -> sys_procs(p, regs)
         else Err(ENOSYS)
     regs[0] = r match
         Ok(v) -> u64(v)
@@ -69,7 +81,7 @@ private[proc] system_call(regs: *u64)
 
 private sys_exit(p: *Process, regs: *u64) -> Result[i64, Errno]
     p.exit_code = i64(regs[0])
-    end(p, 0)
+    end(p, 0, 0)
 
 private sys_getpid(p: *Process, regs: *u64) -> Result[i64, Errno] = Ok(i64(p.pid))
 

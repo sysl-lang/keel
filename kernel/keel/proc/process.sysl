@@ -1,5 +1,7 @@
 module keel.proc
 
+import abi.keel.abi.{SIGBUS, SIGFPE, SIGILL, SIGKILL, SIGSEGV, SIGTRAP}
+import keel.console
 import keel.cpu
 import keel.fs
 import keel.mm
@@ -31,7 +33,18 @@ start_with(path: string, args: []const string) -> Result[&sync Process, LoadErro
         Ok(b) -> b
         Err(e) -> return Err(Unreadable(e))
     val console = sched.no_files()
-    start_image(image.bytes.view(), args, null, [console[0], console[1], console[2]], [], image.run_as)
+    val p = start_image(image.bytes.view(), args, null, [console[0], console[1], console[2]], [], image.run_as,
+        Group(NEW_GROUP, false))?
+    // A program started with no arguments is named for its file, for `procs`.
+    if args.len == 0 then p.name = sched.name_of(base_name(path.bytes))
+    Ok(p)
+
+// The last part of a path: what follows its last `/`.
+private base_name(path: []const u8) -> []const u8
+    var start: usize = 0
+    for i in 0..<path.len
+        if path[i] == u8('/') then start = i + 1
+    path[start..]
 
 // The next process's pid.
 private[proc] new_pid() -> u64 = next_pid.add(1)
@@ -45,19 +58,32 @@ restart_pids() -> bool
 // Load `image`, an executable already in kernel memory, and start it running with `args` and the
 // environment `env` (`NAME=value` entries, each followed by a NUL). A `parent` (null: the kernel)
 // passes on its current directory. `std` are the child's descriptors 0 to 2, each already counted as
-// open (`duplicate`); they are given back if the child cannot be started. It runs as `run_as`. The
-// process is in the table before its thread can run.
+// open (`duplicate`); they are given back if the child cannot be started. It runs as `run_as`, in the
+// process group `group` says. The process is in the table before its thread can run.
 private[proc] start_image(image: []const u8, args: []const string, parent: *Process, std: [3]OpenFile,
-        env: []const u8, run_as: Cred) -> Result[&sync Process, LoadError]
-    val started = start_loaded(image, args, parent, std, env, run_as)
+        env: []const u8, run_as: Cred, group: Group) -> Result[&sync Process, LoadError]
+    val started = start_loaded(image, args, parent, std, env, run_as, group)
     if started.is_err()
         // The descriptors handed over for the child are not the child's after all.
         for f in std
             release(f)
     started
 
+// Which process group a new process goes in: `pgid` — INHERIT_GROUP for its parent's, NEW_GROUP for
+// one of its own — and whether that group becomes the console's foreground group before it runs.
+struct Group
+    pgid: u64
+    foreground: bool
+
+// Off only to show what SPAWN_FOREGROUND is for: with it off the console's foreground group stays the
+// shell's, a Ctrl-C goes to the shell (which ignores it), and the job it was meant for runs on.
+private const FOREGROUND_AT_SPAWN: bool = true
+
+private[proc] const INHERIT_GROUP: u64 = 0
+private[proc] const NEW_GROUP: u64 = 0xffff_ffff_ffff_ffff
+
 private start_loaded(image: []const u8, args: []const string, parent: *Process, std: [3]OpenFile,
-        env: []const u8, run_as: Cred) -> Result[&sync Process, LoadError]
+        env: []const u8, run_as: Cred, group: Group) -> Result[&sync Process, LoadError]
     if env.len > sched.ENV_ROOM then return Err(TooManyArgs)
     var l = load(image)?
     val sp = lay_out_args(&l.space, args, env) match
@@ -67,9 +93,10 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
             return Err(TooManyArgs)
     // The descriptors are filled in once the process is in its box: a kernel stack is 16 KiB, and every
     // copy of a Process made on the way to the box is more than a KiB of it.
-    val p: &sync Process = Process(new_pid(), l.space, l.heap_base, l.heap_base, Context([0; 12], 0, 0),
-        Atomic(0), 0, 0, None, 0, sched.no_files(), sched.root_dir(), 1, 0, false, None, run_as.uid, run_as.gid,
-        sched.env_of(env))
+    val pid = new_pid()
+    val p: &sync Process = Process(pid, l.space, l.heap_base, l.heap_base, Context([0; 12], 0, 0),
+        sched.fresh_signals(), 0, 0, None, 0, sched.no_files(), sched.root_dir(), 1, 0, false, None, run_as.uid,
+        run_as.gid, sched.env_of(env), pid, 0, name_from(args))
     val raw: *Process = &*p
     for fd in 0..<3
         raw.files[fd] = std[fd]
@@ -77,6 +104,9 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
         raw.ppid = parent.pid
         raw.cwd = parent.cwd
         raw.cwd_len = parent.cwd_len
+        if group.pgid == INHERIT_GROUP then raw.pgid = parent.pgid
+    if group.pgid != INHERIT_GROUP && group.pgid != NEW_GROUP then raw.pgid = group.pgid
+    if group.foreground && FOREGROUND_AT_SPAWN then console.set_foreground(raw.pgid)
     if !enter(p)
         // Not the child's after all: start_image gives them back.
         for fd in 0..<3
@@ -86,6 +116,10 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
     val regs = fresh_regs(l.entry, sp, 0)
     p.thread = Some(sched.spawn(() -> run(raw, regs)))
     Ok(p)
+
+// A process's name for `procs`: its argv[0].
+private[proc] name_from(args: []const string) -> [sched.NAME_ROOM]u8 =
+    if args.len == 0 then sched.name_of("".bytes) else sched.name_of(args[0].bytes)
 
 // The most a process's arguments and environment may take at the top of its stack, strings and
 // vectors together: keel.abi's ARGS_ROOM and ENV_ROOM, and room for the pointers to both.
@@ -159,10 +193,11 @@ private[proc] run(p: *Process, regs: UserRegs)
     net.close_sockets_of(p.pid)
     ended(p)
 
-// Wait for a process the kernel started to end, then give its address space back.
+// Wait for a process the kernel started to end, then give its address space back. It stays in the
+// table until it has ended, so `kill` and `procs` find it (init, above all).
 wait(p: &sync Process)
-    leave(&*p)
     reap(p)
+    leave(&*p)
 
 // Join the process's thread and free its address space: it has ended, or is about to.
 private[proc] reap(p: &sync Process)
@@ -175,27 +210,28 @@ private[proc] reap(p: &sync Process)
     val raw: *Process = &*p
     mm.free_space(&raw.space)
 
-// Ask the process to end. It does at its next return to user mode — at the latest the next timer tick.
-kill(p: &sync Process) = p.kill.store(1, Ordering.Release)
+// Ask the process to end: SIGKILL. It does at its next return to user mode — at the latest the next
+// timer tick, or at once if it is asleep in a system call.
+kill(p: &sync Process)
+    var wakes = sched.no_wakes()
+    wakes.add(sched.post(&*p, SIGKILL))
+    wakes.wake_all()
 
 // How the process ended, as the boot test prints it: "exited <code>" or "killed: <why>".
 pid(p: &sync Process) -> u64 = p.pid
-exited(p: &sync Process) -> bool = p.fault == 0
+exited(p: &sync Process) -> bool = p.term_signal == 0
 exit_code(p: &sync Process) -> i64 = p.exit_code
-was_killed_by_request(p: &sync Process) -> bool = p.fault == KILLED
+was_killed_by_request(p: &sync Process) -> bool = p.term_signal == SIGKILL && p.fault == 0
 
-why(p: &sync Process) -> string = reason(p.fault)
+why(p: &sync Process) -> string = if p.fault != 0 then reason(p.fault) else s"signal ${p.term_signal}"
 preemptions(p: &sync Process) -> u64 = p.preemptions
 
 // The process the calling thread runs, or null for a kernel thread.
 private[proc] current_process() -> *Process = sched.current().process
 
-// `fault` for a process ended by `kill`. Any other non-zero `fault` is ESR_EL1's exception class
-// shifted left eight, with the fault status code (the low six bits of the ISS) below it.
-private const KILLED: u64 = 0xffff
-
+// A non-zero `fault` is ESR_EL1's exception class shifted left eight, with the fault status code (the
+// low six bits of the ISS) below it.
 private reason(fault: u64) -> string
-    if fault == KILLED then return "killed"
     val ec = fault >> 8
     if ec == 0x20 || ec == 0x24
         return (fault & 0x3f) >> 2 match
@@ -217,23 +253,39 @@ private reason(fault: u64) -> string
 user_sync(regs: *u64, ec: u64, iss: u64)
     if ec == 0x15
         system_call(regs)
-        returning_to_user()
+        returning_to_user(regs)
     else if ec == 0x24 && is_write_permission_fault(iss) && mm.break_cow(&current_process().space, cpu.far())
         // A write to a copy-on-write page (mm's cow.sysl): the page is writable now, and the store runs
         // again.
-        returning_to_user()
+        returning_to_user(regs)
     else
-        end(current_process(), (ec << 8) | (iss & 0x3f))
+        val fault = (ec << 8) | (iss & 0x3f)
+        end(current_process(), fault_signal(ec), fault)
 
 // A data abort's ISS: a permission fault at any level (DFSC 0b0011xx) on a write (WnR, bit 6).
 private is_write_permission_fault(iss: u64) -> bool = ((iss & 0x3f) >> 2) == 3 && ((iss >> 6) & 1) == 1
 
-// Called on every way back to EL0 after the kernel had the processor: a process asked to end ends here.
-returning_to_user()
-    val p = current_process()
-    if p != null && p.kill.load(Ordering.Acquire) != 0 then end(p, KILLED)
+// The signal a POSIX kernel raises for an exception class: an instruction or data abort is SIGSEGV, a
+// PC or SP alignment fault SIGBUS, a trapped floating-point exception SIGFPE, `brk` SIGTRAP, and
+// anything else it could not run SIGILL.
+private fault_signal(ec: u64) -> u64 = ec match
+    0x20 | 0x21 | 0x24 | 0x25 -> SIGSEGV
+    0x22 | 0x26 -> SIGBUS
+    0x2c -> SIGFPE
+    0x3c -> SIGTRAP
+    else SIGILL
 
-// End `p` — the calling thread's process — with `fault` (0: it exited).
-private[proc] end(p: *Process, fault: u64) -> never
+// Called on every way back to EL0 after the kernel had the processor, with the registers the process
+// resumes with: a pending signal is delivered here (signal.sysl) — ending the process, or running its
+// handler. keel.trap's interrupt path reaches it through this symbol (FINDINGS.md 47).
+@export("keel_returning_to_user")
+returning_to_user(regs: *u64)
+    val p = current_process()
+    if p != null then deliver(p, regs)
+
+// End `p` — the calling thread's process — by the signal `sig` (0: it exited), for `fault` if a fault
+// raised it.
+private[proc] end(p: *Process, sig: u64, fault: u64) -> never
+    p.term_signal = sig
     p.fault = fault
-    leave_user(&p.kernel, fault)
+    leave_user(&p.kernel, sig)

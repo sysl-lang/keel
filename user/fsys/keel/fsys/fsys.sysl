@@ -10,7 +10,8 @@ module keel.fsys
 // calls take — and so does a descriptor. What keel has no call for (links, a temporary directory)
 // answers `sysl.sys.UNSUPPORTED`, which `sysl.fs` reports as "not supported on this target".
 
-import abi.keel.abi.{EACCES, EBADF, EEXIST, EISDIR, EMFILE, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EPERM, Errno,
+import abi.keel.abi.{EACCES, EBADF, EEXIST, EINTR, EISDIR, EMFILE, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EPERM,
+    Errno, SYS_KILL,
     ExitStatus, KIND_DIR, NO_FD, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, SYS_ACCESS, SYS_CHDIR, SYS_CHMOD,
     SYS_CLOSE,
     SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME,
@@ -47,6 +48,7 @@ private code_of(e: Errno) -> int = e match
     EBADF -> -IoError.NotOpen.code()
     EACCES -> -IoError.PermissionDenied.code()
     EPERM -> -IoError.NotPermitted.code()
+    EINTR -> -IoError.Interrupted.code()
     ENOSYS -> UNSUPPORTED
     else -IoError.Other(int(i64(e))).code()
 
@@ -260,10 +262,10 @@ io_flush(fd: int) -> int
 
 // --- sysl.process: the four hooks `sysl.process.sys` declares -------------------------------------------
 //
-// keel's spawn (22) and wait (23). The child's three standard streams and its environment go to keel's
-// spawn as they are asked for. What it cannot be told — a starting directory (the child takes the
-// caller's) — answers `UNSUPPORTED` rather than being dropped; so do a bounded wait, a signal (keel has
-// no kill) and a temporary file.
+// keel's spawn (22), wait (23) and kill (44). The child's three standard streams and its environment go
+// to keel's spawn as they are asked for; wait's POSIX status becomes an exit code or a signal. What it
+// cannot be told — a starting directory (the child takes the caller's) — answers `UNSUPPORTED` rather
+// than being dropped; so do a bounded wait and a temporary file.
 
 @export("sysl_proc_spawn")
 proc_spawn(path: *u8, path_len: usize, argv: *psys.Text, argc: usize, envp: *psys.Text, envc: usize,
@@ -287,7 +289,7 @@ proc_spawn(path: *u8, path_len: usize, argv: *psys.Text, argc: usize, envp: *psy
         append_text(&env, envp[i])
         env.push(0)
     var attr = SpawnAttr([fd_of(stdin_fd), fd_of(stdout_fd), fd_of(stderr_fd)], u64(usize(as_ptr(env.view()))),
-                         u64(env.len()), 1)
+                         u64(env.len()), 1, 0, 0)
     val r = syscall5(SYS_SPAWN, addr(path), u64(path_len), u64(usize(as_ptr(packed.view()))), u64(packed.len()),
                      u64(usize(&attr)))
     if r >= 0 then r else i64(status(r))
@@ -321,27 +323,20 @@ proc_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> in
     var s = ExitStatus(0, 0)
     val r = syscall(SYS_WAIT, u64(pid), u64(usize(&s)), 0, 0)
     if r < 0 then return status(r)
-    if s.fault != 0
-        *how = psys.ended_signalled
-        *value = signal_of(s.fault)
-    else
+    if s.exited()
         *how = psys.ended_exited
-        *value = int(s.code)
+        *value = int(s.code())
+    else
+        *how = psys.ended_signalled
+        *value = int(s.signal())
     0
 
-// The POSIX signal a host would have raised for the fault keel ended a process for: `ExitStatus.fault`
-// is ESR_EL1's exception class shifted left 8, or 0xffff for a process the kernel killed.
-private signal_of(fault: u64) -> int
-    if fault == 0xffff then return 9                   // SIGKILL
-    (fault >> 8) match
-        0x20 | 0x21 | 0x24 | 0x25 -> 11                // an instruction or data abort: SIGSEGV
-        0x22 | 0x26 -> 7                               // PC or SP alignment: SIGBUS
-        0x2c -> 8                                      // a trapped floating-point exception: SIGFPE
-        0x3c -> 5                                      // brk: SIGTRAP
-        else 4                                         // anything else it could not run: SIGILL
-
+// kill(2): keel's SYS_KILL, with POSIX's numbering.
 @export("sysl_proc_kill")
-proc_kill(pid: i64, signal: int) -> int = UNSUPPORTED
+proc_kill(pid: i64, signal: int) -> int
+    if signal < 0 then return -IoError.Other(22).code()
+    val r = syscall(SYS_KILL, u64(pid), u64(signal), 0, 0)
+    if r < 0 then status(r) else 0
 
 @export("sysl_proc_temp_path")
 proc_temp_path(into: *u8, room: usize) -> isize = isize(UNSUPPORTED)

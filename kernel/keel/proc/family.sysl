@@ -16,8 +16,9 @@ module keel.proc
 // `ended` and its children are handed to init, pid 1 — exactly then, so an orphan is never without a
 // parent to reap it. `wait` sleeps on `changed`, which every ending wakes.
 
-import abi.keel.abi.{ANY_CHILD, ARGS_ROOM, E2BIG, EAGAIN, ECHILD, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOEXEC,
-    EBADF, ENOMEM, ENV_ROOM, Errno, ExitStatus, INIT_PID, MAX_FDS, NO_FD, SpawnAttr}
+import abi.keel.abi.{ANY_CHILD, ARGS_ROOM, E2BIG, EAGAIN, ECHILD, EFAULT, EINTR, EINVAL, ENAMETOOLONG, ENOENT,
+    ENOEXEC, EBADF, ENOMEM, ENV_ROOM, EPERM, Errno, ExitStatus, INIT_PID, MAX_FDS, NO_FD, SIGCHLD, SPAWN_FOREGROUND,
+    SPAWN_SETPGROUP, SpawnAttr, WNOHANG, exit_status, signal_status}
 import keel.fs
 import keel.mm
 import keel.sched
@@ -25,11 +26,11 @@ import keel.sched.{Holds, IrqLock, OpenFile, Process, WaitQueue}
 import sysl.buf.{Buf, buf, buf_with_capacity}
 import sysl.text.from_utf8
 
-private const MAX_PROCS: usize = 64
+private[proc] const MAX_PROCS: usize = 64
 private const MAX_PATH: usize = 256
 
-private var table: [MAX_PROCS]*Process
-private var family: IrqLock
+private[proc] var table: [MAX_PROCS]*Process
+private[proc] var family: IrqLock
 private var changed: WaitQueue
 
 // Put a new process in the table; false when it is full.
@@ -53,16 +54,20 @@ private[proc] leave(p: *Process)
     family.unlock(flags)
     p.me = None
 
-// The process has ended (its thread is on its way out): its parent may reap it, and its children are
-// init's now.
+// The process has ended (its thread is on its way out): its parent may reap it and is sent SIGCHLD, and
+// its children are init's now.
 private[proc] ended(p: *Process)
+    var wakes = sched.no_wakes()
     val flags = family.lock()
     p.ended = true
     for i in 0..<MAX_PROCS
         val c = table[i]
-        if c != null && c.ppid == p.pid then c.ppid = INIT_PID
+        if c == null then continue
+        if c.ppid == p.pid then c.ppid = INIT_PID
+        if c.pid == p.ppid && !c.ended then wakes.add(sched.post(c, SIGCHLD))
     val _ = changed.wake_all()
     family.unlock(flags)
+    wakes.wake_all()
 
 // Whether every process that started has been reaped.
 all_reaped() -> bool = table_empty()
@@ -90,24 +95,33 @@ private[proc] sys_spawn(p: *Process, regs: *u64) -> Result[i64, Errno]
         packed.push(0)
     if args_len > 0 && !mm.copy_from_user(&p.space, regs[2], packed.view()) then return Err(EFAULT)
     val args = unpacked(packed.view())?
-    val (env, fds) = asked_for(p, regs[4])?
+    val (env, fds, group) = asked_for(p, regs[4])?
 
     // The file must be executable by the caller; the child runs as the caller, or as the file's owner
     // when it is set-user-ID.
     val image = fs.read_executable(p.cwd[0..<p.cwd_len], path[0..<usize(path_len)], sched.cred_of(p))?
     val std = standard_files(p, fds)?
-    start_image(image.bytes.view(), args.view(), p, std, env.view(), image.run_as) match
+    start_image(image.bytes.view(), args.view(), p, std, env.view(), image.run_as, group) match
         Ok(child) -> Ok(i64(child.pid))
         Err(e) -> Err(errno_of(e))
 
 // What a spawn's caller asked for besides the program and its arguments — the SpawnAttr at `va`, or
-// every default for 0: the child's environment, and the caller's descriptors for its 0 to 2. A function
-// of its own so that its frame is gone before the child is built (kernel stacks are 16 KiB).
-private asked_for(p: *Process, va: u64) -> Result[(Buf[u8], [3]u64), Errno]
-    var attr = SpawnAttr([NO_FD, NO_FD, NO_FD], 0, 0, 0)
+// every default for 0: the child's environment, the caller's descriptors for its 0 to 2, and its
+// process group. A function of its own so that its frame is gone before the child is built (kernel
+// stacks are 16 KiB).
+private asked_for(p: *Process, va: u64) -> Result[(Buf[u8], [3]u64, Group), Errno]
+    var attr = SpawnAttr([NO_FD, NO_FD, NO_FD], 0, 0, 0, 0, 0)
     if va != 0
         val b: *u8 = ptr_cast(&attr)
         if !mm.copy_from_user(&p.space, va, b[0..<sizeof(SpawnAttr)]) then return Err(EFAULT)
+    var group = Group(INHERIT_GROUP, (attr.flags & SPAWN_FOREGROUND) != 0)
+    if (attr.flags & SPAWN_SETPGROUP) != 0
+        if attr.pgid == 0
+            group.pgid = NEW_GROUP
+        else if group_joinable(p, attr.pgid)
+            group.pgid = attr.pgid
+        else
+            return Err(EPERM)
     var env: Buf[u8] = buf()
     if attr.env_given != 0
         if attr.env_len > ENV_ROOM then return Err(E2BIG)
@@ -118,7 +132,7 @@ private asked_for(p: *Process, va: u64) -> Result[(Buf[u8], [3]u64), Errno]
     else
         for i in 0..<p.env.len
             env.push(p.env.bytes[i])
-    Ok((env, attr.fds))
+    Ok((env, attr.fds, group))
 
 // The child's descriptors 0 to 2: for each, the caller's descriptor `fds[i]` names, or its own i for
 // NO_FD (which may be free), counted as open once more. EBADF for a named descriptor that is not open.
@@ -154,21 +168,28 @@ private[proc] errno_of(e: LoadError) -> Errno = e match
     NoRoom -> EAGAIN
     _ -> ENOEXEC
 
-// wait(pid, *ExitStatus) -> the pid of the child that ended. Sleeps until one has.
+// wait(pid, *ExitStatus, options) -> the pid of the child that ended. Sleeps until one has — or, with
+// WNOHANG, answers 0 at once if none has; EINTR if a signal comes first.
 private[proc] sys_wait(p: *Process, regs: *u64) -> Result[i64, Errno]
     val want = i64(regs[0])
     val status_at = regs[1]
+    if (regs[2] & ~WNOHANG) != 0 then return Err(EINVAL)
     if status_at != 0 && !mm.user_range(&p.space, status_at, u64(sizeof(ExitStatus)), true) then return Err(EFAULT)
-    val child = ended_child(p, want)?
+    val found = ended_child(p, want, (regs[2] & WNOHANG) != 0)?
+    val child = found match
+        Some(c) -> c
+        None -> return Ok(0)
     reap(child)
     if status_at != 0
-        var status = ExitStatus(child.exit_code, child.fault)
+        val how = if child.term_signal == 0 then exit_status(child.exit_code) else signal_status(child.term_signal)
+        var status = ExitStatus(how, child.fault)
         val b: *u8 = ptr_cast(&status)
         if !mm.copy_to_user(&p.space, status_at, b[0..<sizeof(ExitStatus)]) then return Err(EFAULT)
     Ok(i64(child.pid))
 
-// A child of `parent` that has ended — `want`, or any for ANY_CHILD — taken out of the table.
-private ended_child(parent: *Process, want: i64) -> Result[&sync Process, Errno]
+// A child of `parent` that has ended — `want`, or any for ANY_CHILD — taken out of the table; None if
+// there is a child but none has ended and `no_hang` says not to wait.
+private ended_child(parent: *Process, want: i64, no_hang: bool) -> Result[Option[&sync Process], Errno]
     val flags = family.lock()
     loop
         var any = false
@@ -183,9 +204,14 @@ private ended_child(parent: *Process, want: i64) -> Result[&sync Process, Errno]
             c.me = None
             family.unlock(flags)
             return handle match
-                Some(h) -> Ok(h)
+                Some(h) -> Ok(Some(h))
                 None -> Err(ECHILD)
         if !any
             family.unlock(flags)
             return Err(ECHILD)
-        changed.sleep(&family)
+        if no_hang
+            family.unlock(flags)
+            return Ok(None)
+        if !sched.sleep_interruptibly(parent, &changed, &family)
+            family.unlock(flags)
+            return Err(EINTR)

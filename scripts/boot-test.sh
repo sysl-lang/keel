@@ -168,6 +168,7 @@ session1=(
     'ls -l'
     'cat note'
     'whoami'
+    'kill 1'
     'exit'
     $'\x04'
 )
@@ -204,7 +205,9 @@ transcript1=(
     $'$ su\npassword: keelroot\n# chown root:root /home/alice/note\n# exit\n'
     $'$ ls -l\n-rw------- root          5 note\n'   # it is root's now...
     $'$ cat note\ncat: note: permission denied\nsh: cat: exit status 1\n'   # ...so alice cannot read it
-    $'$ whoami\nalice\n$ exit\nlogin: \n'       # the end of the input at the login prompt ends init
+    $'$ whoami\nalice\n'
+    $'$ kill 1\nkill: 1: operation not permitted\nsh: kill: exit status 1\n'   # milestone 15b: alice may not signal init, root's
+    $'$ exit\nlogin: \n'                        # the end of the input at the login prompt ends init
     "init: the console closed after 2 sessions; orphans reaped: 1"   # orphan's child was handed to init and reaped
     "keel: init exited 0"
     "keel: every process reaped"
@@ -240,6 +243,25 @@ session2=(
     'env | grep X | wc -l'
     'rm /m9/log'
     'rm /m9/env.txt'
+    'fault'
+    'echo $?'
+    'spin x'
+    '@wait spin: spinning'
+    '@intr'
+    'sigtest'
+    '@wait sigtest: waiting for Ctrl-C'
+    '@intr'
+    'sleep 100 &'
+    'jobs'
+    'ps'
+    'kill %1'
+    'sleep 100 &'
+    'fg %1'
+    $'@wait \nsleep 100\n'
+    '@intr'
+    'ls -l /bin > /m9/l'
+    'cat /m9/l /m9/l /m9/l /m9/l /m9/l /m9/l | head -n 1 | wc -l'
+    'rm /m9/l'
     'exit'
     $'\x04'
 )
@@ -262,6 +284,21 @@ transcript2=(
     $'# env > /m9/env.txt\n# grep GREETING /m9/env.txt\nGREETING=hi\n'   # ...and through sysl.process
     $'# env | grep X | wc -l\n0\n'           # X was never exported
     $'# rm /m9/log\n# rm /m9/env.txt\n'
+    # Milestone 15b: signals and job control.
+    $'# fault\nuser: reading the kernel\'s memory\nsh: fault: killed by signal 11\n# echo $?\n139\n'   # a fault is SIGSEGV
+    $'# spin x\nspin: spinning\nsh: spin: killed by signal 2\n'   # Ctrl-C ends the foreground job, not the shell
+    $'# sigtest\nsigtest: handler ok\nsigtest: mask ok\nsigtest: eintr ok\nsigtest: sigpipe ok\n'
+    $'sigtest: sigchld ok\nsigtest: waiting for Ctrl-C\nsigtest: registers intact across Ctrl-C\n'   # a handler, and back
+    $'# sleep 100 &\n[1] '                      # a background job: its number and pid
+    $'\n# jobs\n[1] running sleep 100\n'
+    $'# ps\n  PID  PPID  PGID   UID CMD\n    1     0     1     0 init\n'   # the table, init first
+    $'     0 sleep\n'                           # ...the background sleep in it
+    $'     0 ps\n'
+    $'# kill %1\n[1] killed by signal 15 sleep 100\n'   # SIGTERM to its group, reported at the next prompt
+    $'# sleep 100 &\n[1] '
+    $'\n# fg %1\nsleep 100\nsh: sleep 100: killed by signal 2\n'   # brought to the foreground, then Ctrl-C
+    $'# ls -l /bin > /m9/l\n# cat /m9/l /m9/l /m9/l /m9/l /m9/l /m9/l | head -n 1 | wc -l\n1\n'   # ~11 KiB of text
+    $'# rm /m9/l\n'                             # through a 4 KiB pipe: head ends, cat's next write is SIGPIPE, no hang
     $'# exit\nlogin: \n'
     "init: the console closed after 1 sessions; orphans reaped: 0"
     "keel: init exited 0"
@@ -275,11 +312,12 @@ shutdown=(
 
 # Printed only if something went wrong: the access after a failed bounds check went ahead, a check in
 # the `files` program failed, the shell was restarted, or a process was left behind.
-not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login ended by a fault"
+not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login ended by signal"
     "keel: processes left unreaped" "keel: processes still running before init")
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
-    init sh mkdir rm rmdir mv false ppid orphan udpecho login su id whoami chmod chown env wc grep head true forktest)
+    init sh mkdir rm rmdir mv false ppid orphan udpecho login su id whoami chmod chown env wc grep head true forktest
+    sigtest ps kill sleep)
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
 frames_min=65000
@@ -348,6 +386,42 @@ user_udp_port=$((udp_port + 1))
 nic=(-netdev user,id=n0,hostfwd=udp:127.0.0.1:$udp_port-:7,hostfwd=udp:127.0.0.1:$user_udp_port-:8007
      -device virtio-net-device,netdev=n0)
 
+# Type the session named $1 at the console: QEMU's standard input is the FIFO $3, and $2 is its output
+# so far. Each element is a line, sent with its newline, except two directives:
+#   @wait <text>   send nothing more until <text> has been printed after what the last @wait matched,
+#                  so a byte reaches the console only once the program it is meant for is running
+#   @intr          Ctrl-C, alone: the console turns it into SIGINT for its foreground process group
+# A @wait that is never satisfied gives up after the boot's time limit; the boot fails on its own then.
+feed() {
+    local item want text rest before offset=0 waited fd
+    zmodload zsh/mapfile
+    exec {fd}> $3
+    for item in "${(@P)1}"; do
+        if [[ $item == '@wait '* ]]; then
+            want=${item#@wait }
+            waited=0
+            while (( waited < limit * 10 )); do
+                # The output as it stands, trailing newlines and all (`$(<file)` would drop them); an
+                # empty file reads as unset.
+                text=${mapfile[$2]-}
+                rest=${text:$offset}
+                if [[ $rest == *$want* ]]; then
+                    before=${rest%%$want*}
+                    offset=$(( offset + ${#before} + ${#want} ))
+                    break
+                fi
+                sleep 0.1
+                waited=$((waited + 1))
+            done
+        elif [[ $item == '@intr' ]]; then
+            print -rn -- $'\x03' >&$fd
+        else
+            print -r -- "$item" >&$fd
+        fi
+    done
+    exec {fd}>&-
+}
+
 # One boot on the disk as it stands, passing only if every line of `before_user_line`, then $2, then
 # `after_user_line`, then the array named $4, then `shutdown` is printed in order and QEMU powers off
 # by itself. The array named $3 is typed at the console, a line each. $1 names the boot in the log.
@@ -357,8 +431,14 @@ boot() {
     local expected=($before_user_line "$user_line" $after_user_line "${(@P)4}" $shutdown)
 
     print -rl -- "${(@P)3}" > $input
-    qemu-system-aarch64 -M virt,gic-version=3 $machine -smp ${KEEL_SMP:-4} -m 256M -nographic $drive $nic -kernel $elf > $log 2>&1 < $input &
+    local fifo=$out/console$name.fifo
+    rm -f $fifo
+    mkfifo $fifo
+    : > $log
+    qemu-system-aarch64 -M virt,gic-version=3 $machine -smp ${KEEL_SMP:-4} -m 256M -nographic $drive $nic -kernel $elf > $log 2>&1 < $fifo &
     local qpid=$!
+    feed $3 $log $fifo &
+    local fpid=$!
     local udp_log=$out/udp$name.log
     perl $root/scripts/udp-echo-client.pl $udp_port $limit kernel > $udp_log.kernel 2>&1 &
     local kclient=$!
@@ -378,8 +458,11 @@ boot() {
     fi
     local qemu_exit=0
     wait $qpid 2> /dev/null || qemu_exit=$?
-    # A client still running once keel is gone never got its echo; it is stopped by PID.
-    kill $kclient $uclient 2> /dev/null || true
+    # A client still running once keel is gone never got its echo; it is stopped by PID, and so is a
+    # feeder still waiting for a line that never came.
+    kill $kclient $uclient $fpid 2> /dev/null || true
+    wait $fpid 2> /dev/null || true
+    rm -f $fifo
     wait $kclient 2> /dev/null || true
     wait $uclient 2> /dev/null || true
 

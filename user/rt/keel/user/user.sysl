@@ -12,7 +12,9 @@ import abi.keel.abi.{ANY_CHILD, EACCES, EINVAL, ENOENT, EPERM, Errno, ExitStatus
     SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN,
     SYS_STAT, SYS_SYNC, SYS_UNLINK, SYS_WAIT, SYS_WRITE, Stat, SYS_SOCKET, SYS_BIND, SYS_RECVFROM, SYS_SENDTO,
     SYS_SOCKCLOSE, SockAddr, SYS_GETUID, SYS_GETGID, SYS_SETUID, SYS_SETGID, SYS_CHOWN, SYS_PIPE, SYS_DUP2, SYS_DUP,
-    SpawnAttr, SYS_FORK, SYS_EXECVE}
+    SpawnAttr, SYS_FORK, SYS_EXECVE, EINTR, ESRCH, ProcInfo, SPAWN_FOREGROUND, SPAWN_SETPGROUP, SigAction,
+    SYS_GETPGID, SYS_KILL, SYS_NANOSLEEP, SYS_PROCS, SYS_SETPGID, SYS_SIGACTION, SYS_SIGPROCMASK, SYS_TCGETPGRP,
+    SYS_TCSETPGRP, WNOHANG}
 import sysl.buf.{Buf, buf}
 import sysl.slices.{as_mut_ptr, as_ptr}
 
@@ -219,15 +221,21 @@ private call5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
 // in this process's current directory. `stdin`, `stdout` and `stderr` are descriptors of this process
 // to stand as the child's 0, 1 and 2, NO_FD for this process's own. `env` is the child's whole
 // environment (`NAME=value` entries), or None for this process's. Answers the child's pid.
+//
+// `group` puts the child in a process group other than this process's: NEW_GROUP for one of its own
+// (numbered by its pid), or an existing group's number; SAME_GROUP leaves it in this one. With
+// `foreground` the child's group becomes the console's foreground group before it runs.
 spawn(path: string, args: []const string, stdin: u64 = NO_FD, stdout: u64 = NO_FD, stderr: u64 = NO_FD,
-        env: Option[[]const string] = None) -> Result[u64, Errno]
+        env: Option[[]const string] = None, group: u64 = SAME_GROUP, foreground: bool = false) -> Result[u64, Errno]
     var packed: Buf[u8] = buf()
     for a in args
         packed.extend(a.bytes)
         packed.push(0)
     val bytes = packed.view()
     var block: Buf[u8] = buf()
-    var attr = SpawnAttr([stdin, stdout, stderr], 0, 0, 0)
+    var flags: u64 = if foreground then SPAWN_FOREGROUND else 0
+    if group != SAME_GROUP then flags |= SPAWN_SETPGROUP
+    var attr = SpawnAttr([stdin, stdout, stderr], 0, 0, 0, flags, if group == NEW_GROUP then 0 else group)
     env match
         Some(entries) ->
             for e in entries
@@ -251,11 +259,22 @@ dup2(old: u64, new: u64) -> Result[u64, Errno] = answer(call(SYS_DUP2, old, new,
 // A second descriptor, the lowest free one, standing for what `old` does.
 dup(old: u64) -> Result[u64, Errno] = answer(call(SYS_DUP, old, 0, 0, 0))
 
+// The process group `spawn` puts a child in: this process's own, or a new one.
+const SAME_GROUP: u64 = 0
+const NEW_GROUP: u64 = 0xffff_ffff_ffff_ffff
+
 // Wait for a child to end — `pid`, or any one for ANY_CHILD — and answer which, and how.
 wait(pid: i64 = ANY_CHILD) -> Result[(u64, ExitStatus), Errno]
     var s = ExitStatus(0, 0)
     val child = answer(call(SYS_WAIT, u64(pid), u64(usize(&s)), 0, 0))?
     Ok((child, s))
+
+// The same without waiting: None while the child (or every child, for ANY_CHILD) is still running.
+poll(pid: i64 = ANY_CHILD) -> Result[Option[(u64, ExitStatus)], Errno]
+    var s = ExitStatus(0, 0)
+    val child = answer(call(SYS_WAIT, u64(pid), u64(usize(&s)), WNOHANG, 0))?
+    if child == 0 then return Ok(None)
+    Ok(Some((child, s)))
 
 getppid() -> u64 = u64(call(SYS_GETPPID, 0, 0, 0, 0))
 
@@ -320,6 +339,8 @@ setgid(gid: u32) -> Result[unit, Errno] = done(call(SYS_SETGID, u64(gid), 0, 0, 
 // An error number in words, for the messages a program prints about these calls.
 describe(e: Errno) -> string = e match
     EPERM -> "operation not permitted"
+    ESRCH -> "no such process"
+    EINTR -> "interrupted"
     EACCES -> "permission denied"
     ENOENT -> "no such file or directory"
     EINVAL -> "invalid argument"
@@ -328,6 +349,68 @@ describe(e: Errno) -> string = e match
 // The owner and group of what `path` names; root only.
 chown(path: string, uid: u32, gid: u32) -> Result[unit, Errno] =
     done(call(SYS_CHOWN, addr(path.bytes), len(path.bytes), u64(uid), u64(gid)))
+
+// --- Signals and process groups --------------------------------------------------------------------
+//
+// keel.abi's signal calls. The standard library has no signal surface — no handler, no mask, no process
+// group (FINDINGS.md 69) — so a program on keel calls these directly.
+//
+// The restorer every handler returns to: it makes `sigreturn`, which puts back the registers the
+// signal interrupted (keel.abi's `SigFrame`). Linux's `sa_restorer`, kept in the runtime rather than
+// the kernel, so the kernel never writes code into a process.
+asm
+    [aarch64]
+        ".globl keel_sigreturn_trampoline"
+        "keel_sigreturn_trampoline:"
+        "mov x8, #43"
+        "svc #0"
+        "brk #2"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+extern keel_sigreturn_trampoline: u8
+
+// Set `sig`'s action — SIG_DFL, SIG_IGN, or the address of a handler `(sig: u64)`, which runs with
+// `mask` blocked as well as `sig` — and answer the action it replaces.
+sigaction(sig: u64, handler: u64, mask: u64 = 0) -> Result[SigAction, Errno]
+    var old = SigAction(0, 0, 0)
+    val restorer = u64(usize(&keel_sigreturn_trampoline))
+    done(call5(SYS_SIGACTION, sig, handler, mask, restorer, u64(usize(&old))))?
+    Ok(old)
+
+// Change the blocked set (`how`: SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK) and answer what it was.
+sigprocmask(how: u64, set: u64) -> Result[u64, Errno]
+    var old: u64 = 0
+    done(call(SYS_SIGPROCMASK, how, set, u64(usize(&old)), 0))?
+    Ok(old)
+
+// Send `sig` to process `pid`, to the caller's group for 0, to group `g` for -g.
+kill(pid: i64, sig: u64) -> Result[unit, Errno] = done(call(SYS_KILL, u64(pid), sig, 0, 0))
+
+setpgid(pid: u64, pgid: u64) -> Result[unit, Errno] = done(call(SYS_SETPGID, pid, pgid, 0, 0))
+
+getpgid(pid: u64 = 0) -> Result[u64, Errno] = answer(call(SYS_GETPGID, pid, 0, 0, 0))
+
+// The console's foreground process group, which Ctrl-C signals; `fd` must be the console.
+tcsetpgrp(fd: u64, pgid: u64) -> Result[unit, Errno] = done(call(SYS_TCSETPGRP, fd, pgid, 0, 0))
+
+tcgetpgrp(fd: u64) -> Result[u64, Errno] = answer(call(SYS_TCGETPGRP, fd, 0, 0, 0))
+
+// Sleep `nanos` nanoseconds (the kernel's tick is 10 ms). Err(EINTR) and what was left if a signal
+// ended it first.
+nanosleep(nanos: u64) -> Result[unit, (Errno, u64)]
+    var left: u64 = 0
+    val r = call(SYS_NANOSLEEP, nanos, u64(usize(&left)), 0, 0)
+    if r < 0 then return Err((Errno(-r), left))
+    Ok(())
+
+// Every process in the kernel's table.
+procs() -> Result[Buf[ProcInfo], Errno]
+    var room: [64]ProcInfo = [ProcInfo(0, 0, 0, 0, 0, [0; 16]); 64]
+    val n = answer(call(SYS_PROCS, u64(usize(&room[0])), 64, 0, 0))?
+    var out: Buf[ProcInfo] = buf()
+    for i in 0..<usize(n)
+        out.push(room[i])
+    Ok(out)
 
 // --- UDP sockets -----------------------------------------------------------------------------------
 //

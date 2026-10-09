@@ -18,26 +18,38 @@
 // The prompt is `# ` when the shell runs as root and `$ ` otherwise. The shell starts with the
 // variables of the environment it was given, every one of them exported.
 //
-// A command that fails says so on the line after its output: `sh: <name>: exit status <n>`, or the
-// signal a fault ended it with (status 128 + the signal), or that it is not there (status 127). For a
-// pipeline it is the last stage that is reported.
+// A command that fails says so on the line after its output: `sh: <name>: exit status <n>`, or
+// `sh: <name>: killed by signal <n>` (status 128 + the signal), or that it is not there (status 127).
+// For a pipeline it is the last stage that is reported.
 //
-// **A single command without `<` runs through `sysl.process`; a pipeline, or a `<`, runs through
-// keel's own spawn** (`rt.keel.user.spawn`), because `sysl.process` can neither give a child a
-// standard input nor start one without waiting for it or capturing its output (FINDINGS.md 66).
+// **Jobs.** Every command line is a job, run in a process group of its own (its first stage's pid),
+// which is the console's foreground group while the shell waits for it — so Ctrl-C, which the console
+// turns into SIGINT for the foreground group, reaches the job and not the shell. The shell is in a
+// group of its own, takes the console back when the job ends, and ignores SIGINT itself.
+//
+//   cmd &          run it in the background: the shell prints `[n] <pid>` and does not wait
+//   jobs           the background jobs still running: `[n] running <line>`
+//   fg [%n]        bring job n (the newest, without one) to the foreground and wait for it
+//   kill [-SIG] %n send job n's group a signal (SIGTERM by default); without a `%`, /bin/kill
+//
+// A background job that has ended is reported before the next prompt: `[n] done <line>`, `[n] exit
+// status <n> <line>`, or `[n] killed by signal <n> <line>`. A job the shell has just signalled is given
+// up to half a second to end first, so that its report comes at the very next prompt.
+//
+// **Every command runs through keel's own spawn** (`rt.keel.user.spawn`): a job needs a process group
+// and the console, which `sysl.process` has no way to ask for (FINDINGS.md 69), and a pipeline or a `<`
+// needs a standard input and a start without a wait (FINDINGS.md 66).
 
-import abi.keel.abi.{ENOENT, ExitStatus, NO_FD, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY}
+import abi.keel.abi.{ENOENT, ExitStatus, NO_FD, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGINT, SIGTERM,
+    SIG_IGN}
 import rt.keel.user
 import sysl.buf.{Buf, buf}
 import sysl.env
 import sysl.fs
-import sysl.fs.{File, IoError}
 import sysl.io.{lines, stdin}
-import sysl.process
-import sysl.process.{Status, Stdio, Var}
 import sysl.text.from_utf8
 
-// A word of the line, or one of the operators `|`, `<`, `>`, `>>` when `op` (a quoted `|` is a word).
+// A word of the line, or one of the operators `|`, `<`, `>`, `>>`, `&` when `op` (a quoted `|` is a word).
 struct Token
     text: string
     op: bool
@@ -47,10 +59,24 @@ struct ShellVar
     value: string
     exported: bool
 
-// What the shell keeps between lines: its variables and the last command's status.
+// A background job: its number, its process group, the pids of its stages still running, the line
+// that started it, and how its last stage ended once it has.
+struct Job
+    number: u64
+    pgid: u64
+    pids: Buf[u64]
+    last_pid: u64
+    text: string
+    last: ExitStatus
+    signalled: bool             // the shell has just sent it a signal
+
+// What the shell keeps between lines: its variables, the last command's status, its process group and
+// its background jobs.
 struct Shell
     vars: Buf[ShellVar]
     status: i64
+    pgid: u64
+    jobs: Buf[Job]
 
 // One command of a pipeline, with its redirections taken out.
 struct Stage
@@ -102,7 +128,7 @@ tokens(sh: *Shell, line: string) -> Option[Buf[Token]]
             if c == quote then quote = 0 else cur.push(c)
             i += 1
             continue
-        if c == u8(' ') || c == u8('\t') || c == u8('|') || c == u8('<') || c == u8('>')
+        if c == u8(' ') || c == u8('\t') || c == u8('|') || c == u8('<') || c == u8('>') || c == u8('&')
             if in_word
                 out.push(Token(word_of(cur), false))
                 cur = buf()
@@ -200,13 +226,7 @@ stages(toks: Buf[Token]) -> Option[Buf[Stage]]
     out.push(st)
     Some(out)
 
-// The exported variables, as `sysl.process` takes them and as keel's spawn takes them.
-exported_vars(sh: *Shell) -> Buf[Var]
-    var out: Buf[Var] = buf()
-    for v in sh.vars.view()
-        if v.exported then out.push(Var(v.name, v.value))
-    out
-
+// The exported variables, as keel's spawn takes them.
 exported_entries(sh: *Shell) -> Buf[string]
     var out: Buf[string] = buf()
     for v in sh.vars.view()
@@ -218,50 +238,16 @@ reported(name: string, code: i64) -> i64
     if code != 0 then print(s"sh: $name: exit status $code")
     code
 
-// A single command, through sysl.process: `>`/`>>` hand it a file, and its environment is the shell's
-// exported variables. Answers its status: its exit code, 127 if it is not there, 128 and up if a fault
-// ended it.
-run_one(sh: *Shell, st: Stage) -> i64
-    val name = st.args.at(0)
-    // The file is opened here rather than handed over as a path, so that a file that cannot be made is
-    // told apart from a command that is not there.
-    var out = Stdio.Inherit
-    if st.output != ""
-        val opened = if st.append then fs.append(st.output) else fs.create(st.output)
-        opened match
-            Ok(f) -> out = Stdio.ToFile(f)
-            Err(e) ->
-                print(s"sh: ${st.output}: cannot open it: $e")
-                return 1
-    val ran = process.run(path_of(name), st.args.view()[1..], env = exported_vars(sh).view(), stdout = out)
-    out match
-        ToFile(f) ->
-            var g = f
-            val _ = g.close()
-        Inherit | ToPath(_) -> ()
-    ran match
-        Ok(Exited(code)) -> reported(name, i64(code))
-        Ok(s) ->
-            print(s"sh: $name: $s")
-            128 + i64(signal_of(s))
-        Err(IoError.NotFound) ->
-            print(s"sh: $name: not found")
-            127
-        Err(e) ->
-            print(s"sh: $name: cannot run it: $e")
-            126
-
-// The signal a status names, for the shell's 128-and-up answer.
-signal_of(s: Status) -> int = s match
-    Signalled(n) -> n
-    else 0
-
-// A pipeline, or a command with `<`, through keel's own calls: a pipe between each two stages, every
+// A job — one command or a pipeline — through keel's own calls: a pipe between each two stages, every
 // stage started before any is waited for, and the shell's copy of every descriptor it made closed once
-// the stage that needs it has its own — or no reader would ever see the end of its input.
-run_pipeline(sh: *Shell, all: Buf[Stage]) -> i64
+// the stage that needs it has its own — or no reader would ever see the end of its input. The first
+// stage starts a new process group and every later one joins it; in the foreground that group is made
+// the console's as the first stage starts, and the shell takes the console back once every stage has
+// ended. In the background it is remembered as a job and not waited for.
+run_pipeline(sh: *Shell, all: Buf[Stage], background: bool, text: string) -> i64
     val env = exported_entries(sh)
     var started: Buf[(u64, string)] = buf()
+    var pgid: u64 = 0
     var last: i64 = 0
     var from_prev = NO_FD
     for i in 0..<all.len()
@@ -290,8 +276,12 @@ run_pipeline(sh: *Shell, all: Buf[Stage]) -> i64
             output = opened_fd(st.output, O_WRONLY | O_CREAT | (if st.append then O_APPEND else O_TRUNC))
             if output == NO_FD then last = 1
         if last == 0
-            user.spawn(path_of(name), st.args.view(), stdin = input, stdout = output, env = Some(env.view())) match
-                Ok(pid) -> started.push((pid, name))
+            val group = if pgid == 0 then user.NEW_GROUP else pgid
+            user.spawn(path_of(name), st.args.view(), stdin = input, stdout = output, env = Some(env.view()),
+                    group = group, foreground = !background && pgid == 0) match
+                Ok(pid) ->
+                    started.push((pid, name))
+                    if pgid == 0 then pgid = pid
                 Err(ENOENT) ->
                     print(s"sh: $name: not found")
                     last = 127
@@ -305,12 +295,141 @@ run_pipeline(sh: *Shell, all: Buf[Stage]) -> i64
     if all.len() > 0 && started.len() > 0 && last == 0
         val (pid, _) = started.at(started.len() - 1)
         last_pid = pid
+    if background && started.len() > 0
+        var pids: Buf[u64] = buf()
+        for (pid, _) in started.view()
+            pids.push(pid)
+        var number: u64 = 1
+        for j in sh.jobs.view()
+            if j.number >= number then number = j.number + 1
+        sh.jobs.push(Job(number, pgid, pids, last_pid, text, ExitStatus(0, 0), false))
+        val (newest, _) = started.at(started.len() - 1)
+        print(s"[$number] $newest")
+        return 0
     for (pid, name) in started.view()
         user.wait(i64(pid)) match
             Ok((_, s)) ->
                 if pid == last_pid then last = status_of(name, s)
             Err(_) -> ()
+    take_console(sh)
     last
+
+// Make the shell's own group the console's foreground group again.
+take_console(sh: *Shell)
+    val _ = user.tcsetpgrp(0, sh.pgid)
+
+// Bring job `j` (an index into the job list) to the foreground: the console is its group's, the line
+// that started it is said, and every stage still running is waited for.
+foreground(sh: *Shell, j: usize) -> i64
+    val job = sh.jobs.at(j)
+    sh.jobs.remove(j)
+    val _ = user.tcsetpgrp(0, job.pgid)
+    print(job.text)
+    var last: i64 = 0
+    for pid in job.pids.view()
+        user.wait(i64(pid)) match
+            Ok((_, s)) ->
+                if pid == job.last_pid then last = status_of(job.text, s)
+            Err(_) -> ()
+    take_console(sh)
+    last
+
+// The job a `%n` word names, as an index into the job list; the newest for "".
+job_named(sh: *Shell, word: string) -> Option[usize]
+    if sh.jobs.len() == 0 then return None
+    if word == "" then return Some(sh.jobs.len() - 1)
+    val b = word.bytes
+    if b.len < 2 || b[0] != u8('%') then return None
+    var n: u64 = 0
+    for i in 1..<b.len
+        if b[i] < u8('0') || b[i] > u8('9') then return None
+        n = n * 10 + u64(b[i] - u8('0'))
+    for i in 0..<sh.jobs.len()
+        if sh.jobs.at(i).number == n then return Some(i)
+    None
+
+// Collect what has ended of every background job, and report each job whose stages have all ended.
+// A job the shell has just signalled is given up to half a second (50 naps of 10 ms) to end first.
+reap_jobs(sh: *Shell)
+    var i: usize = 0
+    while i < sh.jobs.len()
+        var job = sh.jobs.at(i)
+        var naps = if job.signalled then 50 else 0
+        loop
+            var left: Buf[u64] = buf()
+            for pid in job.pids.view()
+                user.poll(i64(pid)) match
+                    Ok(Some((_, s))) ->
+                        if pid == job.last_pid then job.last = s
+                    Ok(None) -> left.push(pid)
+                    Err(_) -> ()
+            job.pids = left
+            if job.pids.len() == 0 || naps == 0 then break
+            naps -= 1
+            val _ = user.nanosleep(10_000_000)
+        job.signalled = false
+        if job.pids.len() > 0
+            sh.jobs.set(i, job)
+            i += 1
+            continue
+        sh.jobs.remove(i)
+        print(s"[${job.number}] ${ending(job.last)} ${job.text}")
+
+// How a background job ended, as its report says it.
+ending(s: ExitStatus) -> string
+    if s.signalled() then return s"killed by signal ${s.signal()}"
+    if s.code() != 0 then return s"exit status ${s.code()}"
+    "done"
+
+// `kill [-SIG] %n`: the signal (SIGTERM unless named, by number or by name) to job n's group.
+kill_job(sh: *Shell, w: Buf[string]) -> i64
+    var sig = SIGTERM
+    var at: usize = 1
+    if w.len() > 2
+        sig = signal_named(w.at(1))
+        at = 2
+    if sig == 0
+        print(s"sh: kill: ${w.at(1)}: no such signal")
+        return 1
+    val j = job_named(sh, w.at(at)) match
+        Some(j) -> j
+        None ->
+            print(s"sh: kill: ${w.at(at)}: no such job")
+            return 1
+    var job = sh.jobs.at(j)
+    user.kill(-i64(job.pgid), sig) match
+        Ok(_) -> ()
+        Err(e) ->
+            print(s"sh: kill: ${w.at(at)}: ${user.describe(e)}")
+            return 1
+    job.signalled = true
+    sh.jobs.set(j, job)
+    0
+
+// `-9`, `-KILL`, `-SIGKILL` and the like as a signal's number; 0 for one it does not know.
+signal_named(word: string) -> u64
+    val b = word.bytes
+    if b.len < 2 || b[0] != u8('-') then return 0
+    var name = word_of(slice_buf(b[1..]))
+    if name.bytes.len > 3 && name.bytes[0] == u8('S') && name.bytes[1] == u8('I') && name.bytes[2] == u8('G')
+        name = word_of(slice_buf(name.bytes[3..]))
+    var n: u64 = 0
+    var digits = true
+    for c in name.bytes
+        if c < u8('0') || c > u8('9') then digits = false else n = n * 10 + u64(c - u8('0'))
+    if digits then return if n > 0 && n < 32 then n else 0
+    name match
+        "HUP" -> 1
+        "INT" -> 2
+        "QUIT" -> 3
+        "KILL" -> 9
+        "USR1" -> 10
+        "USR2" -> 12
+        "PIPE" -> 13
+        "ALRM" -> 14
+        "TERM" -> 15
+        "CHLD" -> 17
+        else 0
 
 // A file for `<`, `>` or `>>`, opened with `flags`; NO_FD (and a message) if it cannot be.
 opened_fd(file: string, flags: u64) -> u64 = user.open(file, flags) match
@@ -324,33 +443,75 @@ close_fd(fd: u64)
 
 // How the pipeline's last stage ended, said if it failed, as its status.
 status_of(name: string, s: ExitStatus) -> i64
-    if s.fault != 0
-        print(s"sh: $name: ended by a fault")
-        return 128 + 11
-    reported(name, s.code)
+    if s.signalled()
+        print(s"sh: $name: killed by signal ${s.signal()}")
+        return 128 + i64(s.signal())
+    reported(name, s.code())
 
-// A line's commands: variables set, or a command or pipeline run. Answers the status.
-run_line(sh: *Shell, toks: Buf[Token]) -> i64
+// A line's commands: variables set, or a job run, in the background if it ends in `&`. Answers the
+// status.
+run_line(sh: *Shell, toks: Buf[Token], text: string) -> i64
+    var words = toks
+    var background = false
+    if words.len() > 0 && words.at(words.len() - 1).op && words.at(words.len() - 1).text == "&"
+        background = true
+        words.pop()
+    for t in words.view()
+        if t.op && t.text == "&"
+            print("sh: & must end the line")
+            return 2
+    if words.len() == 0 then return sh.status
     var all_assignments = true
-    for t in toks.view()
+    for t in words.view()
         if assignment(t).is_none() then all_assignments = false
     if all_assignments
-        for t in toks.view()
+        for t in words.view()
             val (name, value) = assignment(t).unwrap()
             set_var(sh, name, value, false)
         return 0
-    val all = stages(toks) match
+    val all = stages(words) match
         Some(s) -> s
         None -> return 2
     if all.len() == 0 then return sh.status
-    if all.len() == 1 && all.at(0).input == ""
-        val st = all.at(0)
-        if builtin(sh, st.args) then return 0
-        return run_one(sh, st)
-    run_pipeline(sh, all)
+    if all.len() == 1 && all.at(0).input == "" && all.at(0).output == "" && !background
+        builtin(sh, all.at(0).args) match
+            Some(status) -> return status
+            None -> ()
+    run_pipeline(sh, all, background, job_text(text))
 
-// The built-ins, which act on the shell itself; false if `w` is not one of them.
-builtin(sh: *Shell, w: Buf[string]) -> bool
+// The line as a job list shows it: without a trailing `&` or the spaces around it.
+job_text(line: string) -> string
+    val b = line.bytes
+    var end = b.len
+    while end > 0 && (b[end - 1] == u8(' ') || b[end - 1] == u8('\t') || b[end - 1] == u8('&'))
+        end -= 1
+    var start: usize = 0
+    while start < end && (b[start] == u8(' ') || b[start] == u8('\t'))
+        start += 1
+    word_of(slice_buf(b[start..<end]))
+
+// The built-ins, which act on the shell itself; None if `w` is not one of them, else their status.
+builtin(sh: *Shell, w: Buf[string]) -> Option[i64]
+    val name = w.at(0)
+    if name == "jobs"
+        for j in sh.jobs.view()
+            print(s"[${j.number}] running ${j.text}")
+        return Some(0)
+    if name == "fg"
+        val word = if w.len() > 1 then w.at(1) else ""
+        return job_named(sh, word) match
+            Some(j) -> Some(foreground(sh, j))
+            None ->
+                print(s"sh: fg: no such job")
+                Some(1)
+    if name == "kill"
+        for a in w.view()
+            if a.bytes.len > 0 && a.bytes[0] == u8('%') then return Some(kill_job(sh, w))
+        return None
+    if plain_builtin(sh, w) then Some(0) else None
+
+// The built-ins that answer nothing: exit, cd, pwd, export.
+plain_builtin(sh: *Shell, w: Buf[string]) -> bool
     val name = w.at(0)
     if name == "exit"
         val code = if w.len() > 1 then parse_code(w.at(1)) else 0
@@ -385,18 +546,26 @@ parse_code(text: string) -> i64
 // The prompt says who the shell runs as: `# ` for root, `$ ` for anyone else.
 val prompt = if user.getuid() == 0 then "# " else "$ "
 
-var sh = Shell(buf(), 0)
+var sh = Shell(buf(), 0, 0, buf())
 for (name, value) in env.vars()
     set_var(&sh, name, value, true)
+
+// A group of its own, the console's while it reads a line, and Ctrl-C ignored: it is the job's to take.
+// Each of these may fail where the input is not the console, which changes nothing else.
+val _ = user.setpgid(0, 0)
+sh.pgid = user.getpgid().unwrap_or(0)
+take_console(&sh)
+val _ = user.sigaction(SIGINT, SIG_IGN)
 
 var input = stdin()
 prints(prompt)
 for line in lines(&input)
     tokens(&sh, line) match
-        Some(t) -> if t.len() > 0 then sh.status = run_line(&sh, t)
+        Some(t) -> if t.len() > 0 then sh.status = run_line(&sh, t, line)
         None ->
             print("sh: a quote is not closed")
             sh.status = 2
+    reap_jobs(&sh)
     prints(prompt)
 print("")
 exit(0)

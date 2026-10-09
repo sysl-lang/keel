@@ -5,7 +5,7 @@
 // the second boot finds the first one's file. Exits 0 only if every check passed.
 
 import abi.keel.abi.{Dirent, EBADF, EPIPE, EEXIST, EINVAL, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, Errno, KIND_DIR, KIND_FILE,
-    O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY, SEEK_SET, Stat}
+    O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY, SEEK_SET, SIGPIPE, SIG_DFL, SIG_IGN, Stat}
 import rt.keel.user
 import sysl.buf.{Buf, buf}
 import sysl.text.from_utf8
@@ -235,10 +235,13 @@ descriptors() -> Result[unit, Errno]
     user.close(d)?
     refused(user.close(d), EBADF, "closing a closed descriptor")
 
-    // With every read end closed, a write is refused.
+    // With every read end closed, a write is refused — and would end this program with SIGPIPE, unless
+    // it is ignored.
     val (r2, w2) = user.pipe()?
     user.close(r2)?
+    val _ = user.sigaction(SIGPIPE, SIG_IGN)?
     refused(user.write_file(w2, "x".bytes), EPIPE, "a write with no reader")
+    val _ = user.sigaction(SIGPIPE, SIG_DFL)?
     user.close(w2)?
     Ok(())
 

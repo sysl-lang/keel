@@ -1,0 +1,130 @@
+// sigtest: signals from a program's side, run from the shell by the boot test (milestone 15).
+//
+//   handler ok   a handler for SIGUSR1 runs when the program signals itself, and the call that sent it
+//                answers exactly 0 afterwards: the registers came back through `sigreturn`
+//   mask ok      a blocked signal waits, and is delivered the moment it is unblocked
+//   eintr ok     a read of an empty pipe is ended by a signal from a child: EINTR, the handler run
+//   sigpipe ok   a child writing to a pipe with no reader is ended by SIGPIPE (`wait` says signal 13);
+//                with SIGPIPE ignored the write answers EPIPE instead
+//   sigchld ok   a child ending sends its parent SIGCHLD
+//   then it waits for Ctrl-C at the console, its SIGINT handler counting it, while it computes; the
+//   values it was computing when the signal came must be the ones computed again afterwards.
+//
+// A failed check prints `user: FAILED: …`, which fails the boot test.
+
+import abi.keel.abi.{EINTR, EPIPE, SIGCHLD, SIGINT, SIGPIPE, SIGUSR1, SIG_BLOCK, SIG_IGN, SIG_UNBLOCK, SYS_KILL,
+    sig_bit}
+import rt.keel.user
+import sysl.sync.{Atomic, Ordering}
+
+// Module storage (`static`), so the handlers read nothing of the entry body's frame and so have
+// addresses.
+static var hits: Atomic[u64] = Atomic(0)
+static var endings: Atomic[u64] = Atomic(0)
+
+// The handlers: each counts what it was sent and nothing else.
+on_signal(sig: u64)
+    val _ = hits.add(1)
+
+on_child(sig: u64)
+    val _ = endings.add(1)
+
+stop(what: string) -> never
+    print(s"user: FAILED: $what")
+    user.exit(1)
+
+check(ok: bool, what: string)
+    if !ok then stop(what)
+
+seen() -> u64 = hits.load(Ordering.Acquire)
+
+val me = user.getpid()
+
+// A handler, run for a signal the program sends itself. `syscall` answers x0 exactly as the kernel left
+// it, so a sigreturn that lost x0 shows here.
+check(user.sigaction(SIGUSR1, u64(usize(&on_signal))).is_ok(), "sigaction for SIGUSR1")
+check(user.syscall(SYS_KILL, me, SIGUSR1, 0, 0) == 0, "kill answered something other than 0 after the handler")
+check(seen() == 1, s"the SIGUSR1 handler ran ${seen()} times, not once")
+print("sigtest: handler ok")
+
+// Blocked, it waits; unblocked, it is delivered on the way back from the unblocking call.
+check(user.sigprocmask(SIG_BLOCK, sig_bit(SIGUSR1)).is_ok(), "blocking SIGUSR1")
+check(user.kill(i64(me), SIGUSR1).is_ok(), "kill while blocked")
+check(seen() == 1, "a blocked signal was delivered")
+check(user.sigprocmask(SIG_UNBLOCK, sig_bit(SIGUSR1)).is_ok(), "unblocking SIGUSR1")
+check(seen() == 2, "unblocking did not deliver the pending signal")
+print("sigtest: mask ok")
+
+// A child signals this process while it is asleep in a read of a pipe nobody writes to.
+val (r, w) = user.pipe().unwrap()
+val waker = user.fork().unwrap()
+if waker == 0
+    val _ = user.nanosleep(50_000_000)
+    val _ = user.kill(i64(user.getppid()), SIGUSR1)
+    user.exit(0)
+var room: [8]u8 = [0; 8]
+user.read(r, room[..]) match
+    Ok(n) -> stop(s"the read answered $n bytes instead of being interrupted")
+    Err(e) -> check(e == EINTR, s"the read answered errno ${i64(e)}, not EINTR")
+check(seen() == 3, "the handler did not run for the signal that interrupted the read")
+check(user.wait(i64(waker)).is_ok(), "waiting for the waker")
+val _ = user.close(r)
+val _ = user.close(w)
+print("sigtest: eintr ok")
+
+// SIGPIPE: by default it ends the writer; ignored, the write answers EPIPE.
+val (r2, w2) = user.pipe().unwrap()
+val _ = user.close(r2)
+val writer = user.fork().unwrap()
+if writer == 0
+    val _ = user.write_file(w2, "x".bytes)
+    user.exit(0)
+user.wait(i64(writer)) match
+    Ok((_, s)) -> check(s.signalled() && s.signal() == SIGPIPE, s"the writer ended with status ${s.status}, not SIGPIPE")
+    Err(e) -> stop(s"waiting for the writer: errno ${i64(e)}")
+check(user.sigaction(SIGPIPE, SIG_IGN).is_ok(), "ignoring SIGPIPE")
+user.write_file(w2, "x".bytes) match
+    Ok(_) -> stop("a write with no reader succeeded")
+    Err(e) -> check(e == EPIPE, s"a write with no reader answered errno ${i64(e)}, not EPIPE")
+val _ = user.close(w2)
+print("sigtest: sigpipe ok")
+
+// SIGCHLD: the parent is told when a child ends. The wait may itself be interrupted by it.
+check(user.sigaction(SIGCHLD, u64(usize(&on_child))).is_ok(), "sigaction for SIGCHLD")
+val child = user.fork().unwrap()
+if child == 0 then user.exit(3)
+var code: i64 = -1
+loop
+    user.wait(i64(child)) match
+        Ok((_, s)) ->
+            code = s.code()
+            break
+        Err(e) -> check(e == EINTR, s"waiting for the child: errno ${i64(e)}")
+check(code == 3, s"the child's exit code came back as $code")
+check(endings.load(Ordering.Acquire) == 1, s"SIGCHLD was handled ${endings.load(Ordering.Acquire)} times, not once")
+print("sigtest: sigchld ok")
+
+// Ctrl-C, asynchronously: the handler runs between two instructions of this loop, wherever the timer
+// interrupt finds it, and every register the loop holds must be as it was when it resumes.
+check(user.sigaction(SIGINT, u64(usize(&on_signal))).is_ok(), "sigaction for SIGINT")
+print("sigtest: waiting for Ctrl-C")
+var a: u64 = 1
+var b: u64 = 2
+var c: u64 = 3
+var rounds: u64 = 0
+while seen() == 3
+    a = a * 6364136223846793005 + 1442695040888963407
+    b = b ^ (a >> 29)
+    c = c + (b | 1) * (rounds + 7)
+    rounds += 1
+var x: u64 = 1
+var y: u64 = 2
+var z: u64 = 3
+for i in 0..<rounds
+    x = x * 6364136223846793005 + 1442695040888963407
+    y = y ^ (x >> 29)
+    z = z + (y | 1) * (i + 7)
+check(a == x && b == y && c == z, s"after $rounds rounds the values differ from the same rounds computed again")
+check(seen() == 4, "the SIGINT handler did not run once")
+print("sigtest: registers intact across Ctrl-C")
+user.exit(0)

@@ -1,0 +1,22 @@
+// `sigtest`: signals — handlers, the mask, EINTR, SIGPIPE, SIGCHLD, Ctrl-C — checked from EL0 (milestone 15b).
+
+package {
+  name    = "sigtest"
+  version = "0.0.1"
+}
+
+dependencies {
+  rt { workspace = true }
+}
+
+// keel does not save the FP/SIMD registers yet, and leaves the unit trapping at EL0 too.
+codegen {
+  general_regs_only = true
+}
+
+targets {
+  aarch64-freestanding {
+    linker_script = "../user.ld"
+    entry         = "_start"
+  }
+}

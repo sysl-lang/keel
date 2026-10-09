@@ -28,10 +28,10 @@ loop
                     break
                 orphans += 1
             Err(_) -> break
-    if status.fault != 0
-        print("init: login ended by a fault, starting it again")
+    if !status.exited()
+        print(s"init: login ended by signal ${status.signal()}, starting it again")
         continue
-    if status.code == i64(passwd.CONSOLE_CLOSED) then break
+    if status.code() == i64(passwd.CONSOLE_CLOSED) then break
     sessions += 1
 
 // The console has closed; nothing is left behind.

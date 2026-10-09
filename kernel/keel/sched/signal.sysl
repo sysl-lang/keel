@@ -1,0 +1,174 @@
+module keel.sched
+
+// A process's signals: which are pending, which are blocked, and what each one does. keel.proc sends
+// and delivers them; what lives here is what a sleeping thread needs to be woken by one, because the
+// sleeps are in modules keel.proc imports (keel.console) as well as in keel.proc itself.
+//
+// **Sending** (`post`) sets the signal's bit in `pending` under the process's own `lock` — unless its
+// action is to ignore it, when it is thrown away — and answers where the process's thread is asleep,
+// if it is asleep in a system call that a signal ends (`sleep_interruptibly`). The sender wakes that
+// queue only after letting go of every lock it held (`Wakes.wake_all`): the queue's guard may be one
+// of them (`wait` sleeps under the process table's own lock).
+//
+// **Sleeping** where a signal should end the sleep is `sleep_interruptibly`, called with the queue's
+// guard held instead of `WaitQueue.sleep`. Under the process's lock it checks for a deliverable signal
+// and records the queue and its guard; a sender that posts after that check therefore finds them, and
+// takes the guard — which the sleeper holds until it is on the queue — before waking it. A wake with
+// nothing to wake for is harmless (every sleeper checks its condition again), so a stale record never
+// does more than that, and every queue and guard recorded is module storage that lives for ever.
+
+import sysl.sync.{Atomic, Ordering}
+
+// Signals are 1 to SIGNALS - 1 (keel.abi's NSIG).
+const SIGNALS: usize = 32
+
+const SIGKILL: u64 = 9
+const SIGSTOP: u64 = 19
+
+// What a signal does: SIG_DFL (0), SIG_IGN (1), or the address of a handler in the process, which
+// returns to `restorer`; `mask` is blocked as well while the handler runs.
+struct Action
+    handler: u64
+    mask: u64
+    restorer: u64
+
+const SIG_DFL: u64 = 0
+const SIG_IGN: u64 = 1
+
+struct Signals
+    lock: IrqLock
+    pending: Atomic[u64]        // a bit per signal; written under `lock`, read without it on the way to EL0
+    blocked: u64                // under `lock`
+    actions: [SIGNALS]Action
+    sleep_queue: *WaitQueue     // where the process's thread is asleep interruptibly, or null; under `lock`
+    sleep_guard: *IrqLock       // that queue's guard
+
+private no_action() -> Action = Action(SIG_DFL, 0, 0)
+
+// A new program's signals: every action the default, nothing blocked or pending.
+fresh_signals() -> &sync Signals = Signals(irq_lock(), Atomic(0), 0, [no_action(); SIGNALS], null, null)
+
+// A forked child's: its parent's actions and blocked set, nothing pending.
+copied_signals(from: &sync Signals) -> &sync Signals
+    val s = fresh_signals()
+    val flags = from.lock.lock()
+    s.blocked = from.blocked
+    for i in 0..<SIGNALS
+        s.actions[i] = from.actions[i]
+    from.lock.unlock(flags)
+    s
+
+// What `execve` does to them: a handler's address means nothing in the new program, so a handled
+// signal goes back to the default; an ignored one stays ignored, and the blocked set stays.
+reset_handlers(s: &sync Signals)
+    val flags = s.lock.lock()
+    for i in 0..<SIGNALS
+        if s.actions[i].handler != SIG_IGN then s.actions[i] = no_action()
+    s.lock.unlock(flags)
+
+// A signal's bit.
+bit(sig: u64) -> u64 = u64(1) << sig
+
+// The signals that cannot be blocked.
+const UNBLOCKABLE: u64 = (u64(1) << SIGKILL) | (u64(1) << SIGSTOP)
+
+// Whether the default action for `sig` is to ignore it: CHLD, URG and WINCH, and — keel having no
+// stopped state — CONT, STOP, TSTP, TTIN and TTOU. Every other signal's default ends the process.
+default_ignores(sig: u64) -> bool = sig match
+    17 | 18 | 19 | 20 | 21 | 22 | 23 | 28 -> true
+    else false
+
+// Whether `sig` would be thrown away by `s` as it stands. KILL never is.
+ignores(s: &sync Signals, sig: u64) -> bool
+    if sig == SIGKILL then return false
+    val h = s.actions[usize(sig)].handler
+    h == SIG_IGN || (h == SIG_DFL && default_ignores(sig))
+
+// The pending signals that may be delivered now.
+deliverable(s: &sync Signals) -> u64 = s.pending.load(Ordering.Acquire) & ~(s.blocked & ~UNBLOCKABLE)
+
+// Make `sig` pending for `p`, unless `p` ignores it; answer the queue `p`'s thread sleeps on, if a sleep
+// should end for it. The caller wakes it (`Wakes`) once it holds no lock.
+post(p: *Process, sig: u64) -> Sleeper
+    val s = p.sig
+    val flags = s.lock.lock()
+    if ignores(s, sig)
+        s.lock.unlock(flags)
+        return Sleeper(null, null)
+    s.pending.store(s.pending.load(Ordering.Relaxed) | bit(sig), Ordering.Release)
+    var w = Sleeper(null, null)
+    if (deliverable(s) & bit(sig)) != 0 then w = Sleeper(s.sleep_queue, s.sleep_guard)
+    s.lock.unlock(flags)
+    w
+
+// Take the lowest-numbered deliverable signal off `p`'s pending set and answer it with its action;
+// 0 when there is none.
+take(p: *Process) -> (u64, Action)
+    val s = p.sig
+    if deliverable(s) == 0 then return (0, no_action())
+    val flags = s.lock.lock()
+    val ready = deliverable(s)
+    var sig: u64 = 0
+    for i in 1..<SIGNALS
+        if (ready & bit(u64(i))) != 0
+            sig = u64(i)
+            break
+    var a = no_action()
+    if sig != 0
+        s.pending.store(s.pending.load(Ordering.Relaxed) & ~bit(sig), Ordering.Release)
+        a = s.actions[usize(sig)]
+    s.lock.unlock(flags)
+    (sig, a)
+
+// Where a sleeping process's thread is: a queue and its guard, or nulls.
+struct Sleeper
+    queue: *WaitQueue
+    guard: *IrqLock
+
+// Sleep on `q`, whose guard `guard` the caller holds, as `WaitQueue.sleep` does — unless a signal is
+// deliverable to `p` or becomes so meanwhile, which answers false (the caller answers EINTR). True after
+// an ordinary wake. Either way the guard is held again on return.
+sleep_interruptibly(p: *Process, q: *WaitQueue, guard: *IrqLock) -> bool
+    val s = p.sig
+    val flags = s.lock.lock()
+    if deliverable(s) != 0
+        s.lock.unlock(flags)
+        return false
+    s.sleep_queue = q
+    s.sleep_guard = guard
+    s.lock.unlock(flags)
+    q.sleep(guard)
+    val again = s.lock.lock()
+    s.sleep_queue = null
+    s.sleep_guard = null
+    val woken_for_signal = deliverable(s) != 0
+    s.lock.unlock(again)
+    !woken_for_signal
+
+// The sleepers a sender found, woken once it holds no lock. One entry per process the sender could
+// reach (keel.proc's table holds 64); a queue already listed is not listed twice.
+const MAX_WAKES: usize = 64
+
+struct Wakes
+    at: [MAX_WAKES]Sleeper
+    n: usize
+
+    add(*self, w: Sleeper)
+        if w.queue == null then return
+        for i in 0..<self.n
+            if self.at[i].queue == w.queue then return
+        if self.n < MAX_WAKES
+            self.at[self.n] = w
+            self.n += 1
+
+    // Wake every queue listed, each under its own guard.
+    wake_all(*self)
+        for i in 0..<self.n
+            val w = self.at[i]
+            val flags = w.guard.lock()
+            val _ = w.queue.wake_all()
+            w.guard.unlock(flags)
+        self.n = 0
+end Wakes
+
+no_wakes() -> Wakes = Wakes([Sleeper(null, null); MAX_WAKES], 0)

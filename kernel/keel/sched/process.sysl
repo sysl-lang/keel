@@ -9,16 +9,16 @@ import sysl.sync.Atomic
 // this module, and modules may not import each other in a cycle.
 //
 // One thread per process for now. A second would share `space` and `brk` (under a lock of the
-// process's own), and `kernel` and `kill` would move to the thread.
+// process's own), and `kernel` and the signal mask would move to the thread.
 struct Process
     pid: u64
     space: mm.Space
     heap_base: u64              // where the heap starts: the page after the last segment
     brk: u64                    // where it ends now; `brk` moves it, up to mm.heap_limit()
     kernel: Context             // the kernel side of entering user mode, which leaving it returns to
-    kill: Atomic[u64]           // non-zero: end the process the next time it would return to user mode
+    sig: &sync Signals          // its signals: pending, blocked, the actions (signal.sysl)
     exit_code: i64              // what it passed to `exit`
-    fault: u64                  // why it was killed (keel.proc's encoding); 0 when it exited by itself
+    fault: u64                  // the fault that ended it (keel.proc's encoding); 0 if none did
     thread: Option[&sync Thread]
     preemptions: u64            // times the timer took the processor from its thread, once it has ended
     files: [OPEN_FILES]OpenFile // indexed by descriptor: the console, a file, a pipe end, or free
@@ -30,6 +30,20 @@ struct Process
     uid: u32                    // who it runs as: 0 is root; a child starts with its parent's
     gid: u32                    // its one group; there are no supplementary groups
     env: &sync Env              // its environment, which a child is given unless its parent says otherwise
+    pgid: u64                   // its process group
+    term_signal: u64            // the signal that ended it; 0 when it called `exit`
+    name: [NAME_ROOM]u8         // argv[0], cut to NAME_ROOM bytes, for `procs`
+
+// Room for a process's name in its record (keel.abi's ProcInfo.name).
+const NAME_ROOM: usize = 16
+
+// A name as a process record holds it: the first NAME_ROOM bytes, the rest zero.
+name_of(text: []const u8) -> [NAME_ROOM]u8
+    var n: [NAME_ROOM]u8 = [0; NAME_ROOM]
+    for i in 0..<text.len
+        if i == NAME_ROOM then break
+        n[i] = text[i]
+    n
 
 // Who a process runs as, for keel.fs's permission checks.
 struct Cred
