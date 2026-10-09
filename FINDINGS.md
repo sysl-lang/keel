@@ -703,6 +703,13 @@ Clean form: the weak default goes into a separately compiled object (as `extern 
 
 ## 22. The `&sync` capture check stops at module storage: a `&T` in a module `var` reaches every thread
 
+**FIXED in sysl census-35 7e2a32d3 (`sync-module-storage`; prerelease `7e2a32d396`):** the probe below
+(with `run` a `@crossing(job)` wrapper in place of keel's spawn) is now refused at the closure: *"…
+the module storage 'lib.shared' it reaches, which 'lib.touch_shared' reads, holds a '&lib.Cell' in
+its 'Some(value)', whose count is not. Hold it as a '&sync lib.Cell'"*. keel had no workaround, and
+builds unchanged under the check — its module storage holding raw pointers, scalars and `sysl.sync`
+types is now checked rather than kept by care.
+
 Milestone 4, probing what a spawned closure may touch. The check on a `&sync Fn` is good (see "What
 worked"): capturing a `&Cell` is refused at the closure. But the same `&Cell` held in module storage
 is reached from two threads with no complaint:
