@@ -1,0 +1,33 @@
+// grep pattern [file]: the lines of a file, or of standard input with no file, that hold `pattern`.
+// The pattern is plain text matched as a substring — no regular expressions. Exits 0 if a line matched,
+// 1 if none did, 2 if the file could not be read, as POSIX's grep does.
+
+import rt.keel.user
+import sysl.fs
+import sysl.io.{Reader, lines, stdin}
+import sysl.text.Search
+
+matching(r: *Reader, pattern: string) -> bool
+    var found = false
+    for line in lines(r)
+        if line.contains(pattern)
+            print(line)
+            found = true
+    found
+
+main(args: []string)
+    if args.len < 2 || args.len > 3
+        print("usage: grep pattern [file]")
+        exit(2)
+    val pattern = args[1]
+    val found = if args.len == 2
+        var input = stdin()
+        matching(&input, pattern)
+    else
+        var f = fs.open(args[2]) match
+            Ok(f) -> f
+            Err(e) ->
+                print(s"grep: ${args[2]}: $e")
+                exit(2)
+        matching(&f, pattern)
+    if !found then exit(1)

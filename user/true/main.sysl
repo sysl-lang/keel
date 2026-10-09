@@ -1,0 +1,5 @@
+// true: does nothing, successfully — its exit status is 0.
+
+import rt.keel.user
+
+exit(0)

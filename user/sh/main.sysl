@@ -2,51 +2,159 @@
 // as its argv, waiting for it; a word with a `/` in it is a path and is run as it is.
 //
 //   'quoted words' and "quoted words" are one word each, quotes removed
-//   > file      the command's standard output goes to `file`, created or emptied first
-//   cd [dir]    the current directory (built in: it is the shell's own); `/` with no argument
-//   pwd         the current directory
-//   exit [n]    end the shell with code n (0 by default); the end of the input does the same
+//   a | b | c      a pipeline: each command's standard output is the next one's standard input; every
+//                  stage is waited for, and the status is the last one's
+//   < file         the command's standard input comes from `file`
+//   > file         its standard output goes to `file`, created or emptied first
+//   >> file        its standard output is added to the end of `file`, which is created if need be
+//   NAME=value     a shell variable, when every word on the line is one
+//   export NAME[=value]   a variable every command run afterwards finds in its environment
+//   $NAME          the variable's value (nothing if it is unset), outside single quotes; $? is the
+//                  status of the last command
+//   cd [dir]       the current directory (built in: it is the shell's own); `/` with no argument
+//   pwd            the current directory
+//   exit [n]       end the shell with code n (0 by default); the end of the input does the same
 //
-// The prompt is `# ` when the shell runs as root and `$ ` otherwise.
+// The prompt is `# ` when the shell runs as root and `$ ` otherwise. The shell starts with the
+// variables of the environment it was given, every one of them exported.
 //
 // A command that fails says so on the line after its output: `sh: <name>: exit status <n>`, or the
-// signal a fault ended it with (status 128 + the signal), or that it is not there (status 127).
+// signal a fault ended it with (status 128 + the signal), or that it is not there (status 127). For a
+// pipeline it is the last stage that is reported.
+//
+// **A single command without `<` runs through `sysl.process`; a pipeline, or a `<`, runs through
+// keel's own spawn** (`rt.keel.user.spawn`), because `sysl.process` can neither give a child a
+// standard input nor start one without waiting for it or capturing its output (FINDINGS.md 66).
 
+import abi.keel.abi.{ENOENT, ExitStatus, NO_FD, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY}
 import rt.keel.user
 import sysl.buf.{Buf, buf}
+import sysl.env
 import sysl.fs
-import sysl.fs.IoError
+import sysl.fs.{File, IoError}
 import sysl.io.{lines, stdin}
 import sysl.process
-import sysl.process.{Status, Stdio}
+import sysl.process.{Status, Stdio, Var}
 import sysl.text.from_utf8
+
+// A word of the line, or one of the operators `|`, `<`, `>`, `>>` when `op` (a quoted `|` is a word).
+struct Token
+    text: string
+    op: bool
+
+struct ShellVar
+    name: string
+    value: string
+    exported: bool
+
+// What the shell keeps between lines: its variables and the last command's status.
+struct Shell
+    vars: Buf[ShellVar]
+    status: i64
+
+// One command of a pipeline, with its redirections taken out.
+struct Stage
+    args: Buf[string]
+    input: string               // `<`'s file, or ""
+    output: string              // `>`'s or `>>`'s file, or ""
+    append: bool                // it was `>>`
 
 // One word, from the bytes collected for it.
 word_of(bytes: Buf[u8]) -> string = from_utf8(bytes.view()) match
     Ok(s) -> s
     Err(_) -> ""
 
-// The words of a line; None if a quote is left open.
-words(line: string) -> Option[Buf[string]]
-    var out: Buf[string] = buf()
+name_byte(b: u8, first: bool) -> bool =
+    (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z')) || b == u8('_') ||
+        (!first && b >= u8('0') && b <= u8('9'))
+
+// A variable's value; "" when it is unset.
+value_of(sh: *Shell, name: string) -> string
+    for v in sh.vars.view()
+        if v.name == name then return v.value
+    ""
+
+// Set a variable, keeping it exported if it was; `export` exports it too.
+set_var(sh: *Shell, name: string, value: string, export: bool)
+    for i in 0..<sh.vars.len()
+        val v = sh.vars.at(i)
+        if v.name == name
+            sh.vars.set(i, ShellVar(name, value, v.exported || export))
+            return
+    sh.vars.push(ShellVar(name, value, export))
+
+// The tokens of a line, with `$NAME` and `$?` expanded outside single quotes; None if a quote is left
+// open.
+tokens(sh: *Shell, line: string) -> Option[Buf[Token]]
+    val b = line.bytes
+    var out: Buf[Token] = buf()
     var cur: Buf[u8] = buf()
     var in_word = false
     var quote: u8 = 0
-    for b in line.bytes
-        if quote != 0
-            if b == quote then quote = 0 else cur.push(b)
+    var i: usize = 0
+    while i < b.len
+        val c = b[i]
+        if c == u8('$') && quote != u8('\'')
+            in_word = true
+            i = expand(sh, b, i + 1, &cur)
             continue
-        if b == u8(' ') || b == u8('\t')
+        if quote != 0
+            if c == quote then quote = 0 else cur.push(c)
+            i += 1
+            continue
+        if c == u8(' ') || c == u8('\t') || c == u8('|') || c == u8('<') || c == u8('>')
             if in_word
-                out.push(word_of(cur))
+                out.push(Token(word_of(cur), false))
                 cur = buf()
                 in_word = false
+            if c == u8('>') && i + 1 < b.len && b[i + 1] == u8('>')
+                out.push(Token(">>", true))
+                i += 2
+                continue
+            if c != u8(' ') && c != u8('\t') then out.push(Token(word_of(cur_of(c)), true))
+            i += 1
             continue
         in_word = true
-        if b == u8('\'') || b == u8('"') then quote = b else cur.push(b)
+        if c == u8('\'') || c == u8('"') then quote = c else cur.push(c)
+        i += 1
     if quote != 0 then return None
-    if in_word then out.push(word_of(cur))
+    if in_word then out.push(Token(word_of(cur), false))
     Some(out)
+
+cur_of(c: u8) -> Buf[u8]
+    var one: Buf[u8] = buf()
+    one.push(c)
+    one
+
+// Expand the variable named from `b[i]` on into `cur`, and answer where the line goes on. A `$`
+// followed by neither a name nor `?` is itself.
+expand(sh: *Shell, b: []const u8, i: usize, cur: *Buf[u8]) -> usize
+    if i < b.len && b[i] == u8('?')
+        cur.extend(s"${sh.status}".bytes)
+        return i + 1
+    var end = i
+    while end < b.len && name_byte(b[end], end == i)
+        end += 1
+    if end == i
+        cur.push(u8('$'))
+        return i
+    cur.extend(value_of(sh, word_of(slice_buf(b[i..<end]))).bytes)
+    end
+
+slice_buf(b: []const u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    out.extend(b)
+    out
+
+// `NAME=value` as its two halves, when `t` is a word of that shape.
+assignment(t: Token) -> Option[(string, string)]
+    if t.op then return None
+    val b = t.text.bytes
+    var n: usize = 0
+    while n < b.len && name_byte(b[n], n == 0)
+        n += 1
+    if n == 0 || n == b.len || b[n] != u8('=') then return None
+    Some((word_of(slice_buf(b[0..<n])), word_of(slice_buf(b[n + 1..]))))
 
 // Where a command is: a word with a `/` in it as it is, any other in /bin.
 path_of(name: string) -> string
@@ -54,46 +162,85 @@ path_of(name: string) -> string
         if b == u8('/') then return name
     s"/bin/$name"
 
-// Run a command's words, with a `>` and its file taken out first, and say how it failed if it did.
-// Answers its status: its exit code, 127 if it is not there, 128 and up if a fault ended it.
-run(all: Buf[string]) -> i64
-    var args: Buf[string] = buf()
-    var target = ""
+// The line's commands, split at `|`, with each one's redirections taken out; None (and a message) if a
+// redirection has no file or a stage is empty.
+stages(toks: Buf[Token]) -> Option[Buf[Stage]]
+    var out: Buf[Stage] = buf()
+    var st = Stage(buf(), "", "", false)
     var i: usize = 0
-    while i < all.len()
-        val w = all.at(i)
-        if w == ">"
-            if i + 1 == all.len()
-                print("sh: > needs a file")
-                return 2
-            target = all.at(i + 1)
-            i += 2
-        else
-            args.push(w)
+    while i < toks.len()
+        val t = toks.at(i)
+        if !t.op
+            st.args.push(t.text)
             i += 1
-    if args.len() == 0 then return 0
-    val name = args.at(0)
+            continue
+        if t.text == "|"
+            if st.args.len() == 0
+                print("sh: a | has no command before it")
+                return None
+            out.push(st)
+            st = Stage(buf(), "", "", false)
+            i += 1
+            continue
+        if i + 1 == toks.len() || toks.at(i + 1).op
+            print(s"sh: ${t.text} needs a file")
+            return None
+        val file = toks.at(i + 1).text
+        if t.text == "<"
+            st.input = file
+        else
+            st.output = file
+            st.append = t.text == ">>"
+        i += 2
+    if st.args.len() == 0
+        if out.len() > 0
+            print("sh: a | has no command after it")
+            return None
+        return Some(out)
+    out.push(st)
+    Some(out)
 
-    // The `>` file is opened here rather than handed over as a path, so that a file that cannot be made
-    // is told apart from a command that is not there.
+// The exported variables, as `sysl.process` takes them and as keel's spawn takes them.
+exported_vars(sh: *Shell) -> Buf[Var]
+    var out: Buf[Var] = buf()
+    for v in sh.vars.view()
+        if v.exported then out.push(Var(v.name, v.value))
+    out
+
+exported_entries(sh: *Shell) -> Buf[string]
+    var out: Buf[string] = buf()
+    for v in sh.vars.view()
+        if v.exported then out.push(s"${v.name}=${v.value}")
+    out
+
+// Say how a command that failed ended, and answer its status.
+reported(name: string, code: i64) -> i64
+    if code != 0 then print(s"sh: $name: exit status $code")
+    code
+
+// A single command, through sysl.process: `>`/`>>` hand it a file, and its environment is the shell's
+// exported variables. Answers its status: its exit code, 127 if it is not there, 128 and up if a fault
+// ended it.
+run_one(sh: *Shell, st: Stage) -> i64
+    val name = st.args.at(0)
+    // The file is opened here rather than handed over as a path, so that a file that cannot be made is
+    // told apart from a command that is not there.
     var out = Stdio.Inherit
-    if target != ""
-        fs.create(target) match
+    if st.output != ""
+        val opened = if st.append then fs.append(st.output) else fs.create(st.output)
+        opened match
             Ok(f) -> out = Stdio.ToFile(f)
             Err(e) ->
-                print(s"sh: $target: cannot open it: $e")
+                print(s"sh: ${st.output}: cannot open it: $e")
                 return 1
-    val ran = process.run(path_of(name), args.view()[1..], stdout = out)
+    val ran = process.run(path_of(name), st.args.view()[1..], env = exported_vars(sh).view(), stdout = out)
     out match
         ToFile(f) ->
             var g = f
             val _ = g.close()
         Inherit | ToPath(_) -> ()
     ran match
-        Ok(Exited(0)) -> 0
-        Ok(Exited(code)) ->
-            print(s"sh: $name: exit status $code")
-            i64(code)
+        Ok(Exited(code)) -> reported(name, i64(code))
         Ok(s) ->
             print(s"sh: $name: $s")
             128 + i64(signal_of(s))
@@ -109,8 +256,101 @@ signal_of(s: Status) -> int = s match
     Signalled(n) -> n
     else 0
 
+// A pipeline, or a command with `<`, through keel's own calls: a pipe between each two stages, every
+// stage started before any is waited for, and the shell's copy of every descriptor it made closed once
+// the stage that needs it has its own — or no reader would ever see the end of its input.
+run_pipeline(sh: *Shell, all: Buf[Stage]) -> i64
+    val env = exported_entries(sh)
+    var started: Buf[(u64, string)] = buf()
+    var last: i64 = 0
+    var from_prev = NO_FD
+    for i in 0..<all.len()
+        val st = all.at(i)
+        val name = st.args.at(0)
+        var input = from_prev
+        var output = NO_FD
+        from_prev = NO_FD
+        if i + 1 < all.len()
+            user.pipe() match
+                Ok((r, w)) ->
+                    output = w
+                    from_prev = r
+                Err(e) ->
+                    print(s"sh: cannot make a pipe: ${user.describe(e)}")
+                    close_fd(input)
+                    last = 1
+                    break
+        last = 0
+        if st.input != ""
+            close_fd(input)
+            input = opened_fd(st.input, O_RDONLY)
+            if input == NO_FD then last = 1
+        if st.output != ""
+            close_fd(output)
+            output = opened_fd(st.output, O_WRONLY | O_CREAT | (if st.append then O_APPEND else O_TRUNC))
+            if output == NO_FD then last = 1
+        if last == 0
+            user.spawn(path_of(name), st.args.view(), stdin = input, stdout = output, env = Some(env.view())) match
+                Ok(pid) -> started.push((pid, name))
+                Err(ENOENT) ->
+                    print(s"sh: $name: not found")
+                    last = 127
+                Err(e) ->
+                    print(s"sh: $name: cannot run it: ${user.describe(e)}")
+                    last = 126
+        close_fd(input)
+        close_fd(output)
+    // Every stage is waited for; the status is the last stage's, if it was started.
+    var last_pid: u64 = 0
+    if all.len() > 0 && started.len() > 0 && last == 0
+        val (pid, _) = started.at(started.len() - 1)
+        last_pid = pid
+    for (pid, name) in started.view()
+        user.wait(i64(pid)) match
+            Ok((_, s)) ->
+                if pid == last_pid then last = status_of(name, s)
+            Err(_) -> ()
+    last
+
+// A file for `<`, `>` or `>>`, opened with `flags`; NO_FD (and a message) if it cannot be.
+opened_fd(file: string, flags: u64) -> u64 = user.open(file, flags) match
+    Ok(fd) -> fd
+    Err(e) ->
+        print(s"sh: $file: cannot open it: ${user.describe(e)}")
+        NO_FD
+
+close_fd(fd: u64)
+    if fd != NO_FD then val _ = user.close(fd)
+
+// How the pipeline's last stage ended, said if it failed, as its status.
+status_of(name: string, s: ExitStatus) -> i64
+    if s.fault != 0
+        print(s"sh: $name: ended by a fault")
+        return 128 + 11
+    reported(name, s.code)
+
+// A line's commands: variables set, or a command or pipeline run. Answers the status.
+run_line(sh: *Shell, toks: Buf[Token]) -> i64
+    var all_assignments = true
+    for t in toks.view()
+        if assignment(t).is_none() then all_assignments = false
+    if all_assignments
+        for t in toks.view()
+            val (name, value) = assignment(t).unwrap()
+            set_var(sh, name, value, false)
+        return 0
+    val all = stages(toks) match
+        Some(s) -> s
+        None -> return 2
+    if all.len() == 0 then return sh.status
+    if all.len() == 1 && all.at(0).input == ""
+        val st = all.at(0)
+        if builtin(sh, st.args) then return 0
+        return run_one(sh, st)
+    run_pipeline(sh, all)
+
 // The built-ins, which act on the shell itself; false if `w` is not one of them.
-builtin(w: Buf[string]) -> bool
+builtin(sh: *Shell, w: Buf[string]) -> bool
     val name = w.at(0)
     if name == "exit"
         val code = if w.len() > 1 then parse_code(w.at(1)) else 0
@@ -126,6 +366,12 @@ builtin(w: Buf[string]) -> bool
             Ok(d) -> print(d)
             Err(e) -> print(s"sh: pwd: $e")
         return true
+    if name == "export"
+        for a in w.view()[1..]
+            assignment(Token(a, false)) match
+                Some((n, v)) -> set_var(sh, n, v, true)
+                None -> set_var(sh, a, value_of(sh, a), true)
+        return true
     false
 
 // `exit`'s argument: decimal digits, and anything else 2.
@@ -139,13 +385,18 @@ parse_code(text: string) -> i64
 // The prompt says who the shell runs as: `# ` for root, `$ ` for anyone else.
 val prompt = if user.getuid() == 0 then "# " else "$ "
 
+var sh = Shell(buf(), 0)
+for (name, value) in env.vars()
+    set_var(&sh, name, value, true)
+
 var input = stdin()
 prints(prompt)
 for line in lines(&input)
-    words(line) match
-        Some(w) ->
-            if w.len() > 0 && !builtin(w) then val _ = run(w)
-        None -> print("sh: a quote is not closed")
+    tokens(&sh, line) match
+        Some(t) -> if t.len() > 0 then sh.status = run_line(&sh, t)
+        None ->
+            print("sh: a quote is not closed")
+            sh.status = 2
     prints(prompt)
 print("")
 exit(0)

@@ -29,7 +29,7 @@ const SYS_CHDIR: u64 = 18       // chdir(path, path_len) -> 0
 const SYS_TRUNCATE: u64 = 19    // truncate(path, path_len, length) -> 0: cut to `length`, or grown with zeros
 const SYS_FTRUNCATE: u64 = 20   // ftruncate(fd, length) -> 0: the same, through a descriptor open for writing
 const SYS_ACCESS: u64 = 21      // access(path, path_len, how) -> 0 if the path is there and the caller may (how: r 4, w 2, x 1)
-const SYS_SPAWN: u64 = 22       // spawn(path, path_len, args, args_len, out_fd) -> the child's pid
+const SYS_SPAWN: u64 = 22       // spawn(path, path_len, args, args_len, *SpawnAttr | 0) -> the child's pid
 const SYS_WAIT: u64 = 23        // wait(pid, *ExitStatus) -> the pid of the child that ended
 const SYS_GETPPID: u64 = 24     // getppid() -> the parent's pid; 0 for a process the kernel started
 const SYS_SOCKET: u64 = 25      // socket() -> a UDP socket's number
@@ -43,7 +43,20 @@ const SYS_SETUID: u64 = 32      // setuid(uid) -> 0; EPERM unless the caller is 
 const SYS_SETGID: u64 = 33      // setgid(gid) -> 0; EPERM unless the caller is root
 const SYS_CHMOD: u64 = 34       // chmod(path, path_len, mode) -> 0; the owner or root; mode & 0o4777
 const SYS_CHOWN: u64 = 35       // chown(path, path_len, uid, gid) -> 0; root only
+const SYS_PIPE: u64 = 36        // pipe(*[2]u32) -> 0: the read end's descriptor, then the write end's
+const SYS_DUP2: u64 = 37        // dup2(old, new) -> new: `new` closed first if open, then the same as `old`
+const SYS_DUP: u64 = 38         // dup(old) -> the lowest free descriptor, now the same as `old`
 
+// Descriptors are a table of what each one is: the console, a file, or one end of a pipe. A new
+// process's 0 to 2 are the console unless its parent gave it something else (`SpawnAttr`); a child is
+// given nothing above 2. `dup2` and `dup` make a second descriptor on the same thing — a pipe end
+// counts both — and `close` gives one up.
+//
+// A pipe is a bounded buffer of PIPE_ROOM bytes in the kernel. `read` blocks while it is empty and some
+// write end is open, answers what is there (at most what was asked), and 0 once every write end is
+// closed and the buffer is drained. `write` blocks while it is full and some read end is open, and
+// answers EPIPE — with nothing written — once every read end is closed (signals come later).
+const PIPE_ROOM: u64 = 4096
 // Users. A process has one user id and one group id — there is no real/effective split and there are
 // no supplementary groups — and a child starts with its parent's. Only root (uid 0) may change them.
 // A file's mode is checked the Unix way: root passes every check; otherwise the owner's three bits
@@ -70,9 +83,11 @@ struct SockAddr
 @assert(sizeof(SockAddr) == 8, "a SockAddr is 8 bytes")
 
 // `spawn` starts the executable at `path` as a child of the caller, with the caller's current
-// directory and its standard descriptors. `args` is the child's argv, each argument followed by a NUL
-// (so `"ls\0-a\0"` is two), at most ARGS_ROOM bytes. `out_fd` is a descriptor of the caller's that
-// becomes the child's standard output, or NO_FD to share the caller's.
+// directory. `args` is the child's argv, each argument followed by a NUL (so `"ls\0-a\0"` is two), at
+// most ARGS_ROOM bytes. A `SpawnAttr` (or 0 for every default) says what else the child gets: `fds[i]`
+// is the caller's descriptor that becomes the child's descriptor i, or NO_FD for the caller's own i;
+// and its environment is the caller's, unless `env_given` is non-zero, when it is the `env_len` bytes
+// at `env` instead — `NAME=value` entries, each followed by a NUL, at most ENV_ROOM bytes.
 //
 // `wait` blocks until a child of the caller ends — the one numbered `pid`, or any one for ANY_CHILD —
 // and fills in how it ended; ECHILD if there is no such child. A process whose parent ends first is
@@ -81,6 +96,15 @@ const NO_FD: u64 = 0xffff_ffff_ffff_ffff
 const ANY_CHILD: i64 = -1
 const ARGS_ROOM: u64 = 4096
 const INIT_PID: u64 = 1
+const ENV_ROOM: u64 = 1024
+
+struct SpawnAttr
+    fds: [3]u64                 // the child's 0, 1 and 2: a descriptor of the caller's, or NO_FD
+    env: u64                    // the environment's address, when `env_given`
+    env_len: u64
+    env_given: u64              // 0: the child's environment is the caller's
+
+@assert(sizeof(SpawnAttr) == 48, "a SpawnAttr is 48 bytes")
 
 // How a child ended: `fault` is 0 when it called `exit`, whose argument is `code`; otherwise it was
 // ended by the kernel — a fault (ESR_EL1's exception class shifted left 8, with the fault status code
@@ -92,11 +116,12 @@ struct ExitStatus
 @assert(sizeof(ExitStatus) == 16, "an ExitStatus is 16 bytes")
 
 // A path that does not begin with `/` is taken from the process's current directory, which starts at
-// `/`. A process starts with its arguments on its stack, as Linux lays them out: SP points at argc (a
-// u64), then argc pointers to NUL-terminated strings, then a zero.
+// `/`. A process starts with its arguments and environment on its stack, as Linux lays them out: SP
+// points at argc (a u64), then argc pointers to NUL-terminated strings, then a zero, then a pointer to
+// each `NAME=value` of the environment, then a zero.
 
-// Descriptors 0 to 2 are the console unless the process was started with a file in their place: 1 and
-// 2 write to the UART, and 0 reads from it a line at a time — the kernel echoes what is typed and
+// The console, at whichever descriptors stand for it (0 to 2 unless the process was started with
+// something else there): a write goes to the UART, and 0 reads from it a line at a time — the kernel echoes what is typed and
 // handles backspace, and `read` answers once a whole line (with its `\n`) is there; 0 bytes is the end
 // of the input (Ctrl-D at the start of a line). A file opened gets the lowest free descriptor from 3 up.
 const STDIN: u64 = 0
@@ -169,7 +194,9 @@ enum Errno: i64
     EMFILE = 24                 // every descriptor is in use
     EFBIG = 27                  // past the largest file the filesystem holds
     ENOSPC = 28                 // no free block or inode
-    ERANGE = 34                 // a result does not fit the buffer it was asked into
+    ESPIPE = 29                 // lseek on a pipe or the console
+    EPIPE = 32                  // write to a pipe whose every read end is closed
+    ERANGE = 34                // a result does not fit the buffer it was asked into
     ENAMETOOLONG = 36
     ENOSYS = 38                 // no such system call
     ENOTEMPTY = 39

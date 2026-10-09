@@ -15,10 +15,10 @@ module keel.fs
 // mkfs's check reports.
 
 import abi.keel.abi.{EBADF, EBUSY, EEXIST, EFAULT, EINVAL, EISDIR, EMFILE, ENAMETOOLONG, ENOENT, ENOTDIR, EPERM,
-    ENOTEMPTY, ERANGE, Errno, FIRST_FILE_FD, MAX_FDS, O_ACCMODE, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY,
+    ENOTEMPTY, ERANGE, ESPIPE, Errno, FIRST_FILE_FD, MAX_FDS, O_ACCMODE, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY,
     SEEK_CUR, SEEK_END, SEEK_SET, Stat}
 import keel.mm
-import keel.sched.{Cred, OPEN_FILES, OpenFile, Process, cred_of}
+import keel.sched.{Cred, Holds, OpenFile, Process, cred_of}
 import ondisk.keel.ondisk
 import ondisk.keel.ondisk.{DIRENT_SIZE, Dirent, Inode, KIND_DIR, KIND_FILE, PERMISSION_BITS, ROOT_INO, S_IFMT}
 
@@ -33,7 +33,7 @@ sys_open(p: *Process, regs: *u64) -> Result[i64, Errno]
     val access = flags & O_ACCMODE
     if access == O_ACCMODE then return Err(EINVAL)
     var fd = FIRST_FILE_FD
-    while fd < MAX_FDS && p.files[usize(fd)].ino != 0
+    while fd < MAX_FDS && p.files[usize(fd)].holds != Holds.Free
         fd += 1
     if fd == MAX_FDS then return Err(EMFILE)
 
@@ -56,7 +56,7 @@ sys_open(p: *Process, regs: *u64) -> Result[i64, Errno]
         truncate(st, &i)?
         write_inode(st, ino, i)?
     st.opens[usize(ino)] += 1
-    p.files[usize(fd)] = OpenFile(ino, u32(flags), 0)
+    p.files[usize(fd)] = OpenFile(Holds.File, ino, u32(flags), 0)
     Ok(i64(fd))
 
 // read(fd, buf, len) -> bytes read, from a descriptor that is a file (keel.proc has the console's).
@@ -115,44 +115,25 @@ sys_write(p: *Process, regs: *u64) -> Result[i64, Errno]
         None -> ()
     Ok(i64(done))
 
-// close(fd) -> 0
-sys_close(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val f = file_of(p, regs[0])?
+// A second descriptor now stands for inode `ino` (keel.proc's dup2, dup and spawn): it stays open until
+// both are closed.
+opened_again(ino: u32)
     val st = lock()
     defer unlock()
-    st.opens[usize(f.ino)] -= 1
-    *f = OpenFile(0, 0, 0)
-    Ok(0)
+    st.opens[usize(ino)] += 1
 
-// Close every descriptor a process still has: it has ended.
-close_all(p: *Process)
+// A descriptor that stood for inode `ino` has been closed (keel.proc's close, and a process's end).
+closed(ino: u32)
     val st = lock()
     defer unlock()
-    for fd in 0..<OPEN_FILES
-        val f = &p.files[fd]
-        if f.ino == 0 then continue
-        st.opens[usize(f.ino)] -= 1
-        *f = OpenFile(0, 0, 0)
-
-// A second descriptor on the file `p`'s descriptor `fd` names, for a child to be given (keel.proc's
-// `spawn`): the same file, flags and offset, counted as open until `close_file` or the child's end.
-inherit(p: *Process, fd: u64) -> Result[OpenFile, Errno]
-    val f = file_of(p, fd)?
-    val st = lock()
-    defer unlock()
-    st.opens[usize(f.ino)] += 1
-    Ok(*f)
-
-// Give back a descriptor `inherit` made that nobody took.
-close_file(f: OpenFile)
-    if f.ino == 0 then return
-    val st = lock()
-    defer unlock()
-    st.opens[usize(f.ino)] -= 1
+    st.opens[usize(ino)] -= 1
 
 // lseek(fd, offset, whence) -> the new offset. Past the end is allowed: a write there fills the gap
-// with zeros.
+// with zeros. A pipe or the console has no offset.
 sys_lseek(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[0] < MAX_FDS
+        val h = p.files[usize(regs[0])].holds
+        if h != Holds.Free && h != Holds.File then return Err(ESPIPE)
     val f = file_of(p, regs[0])?
     val base = regs[2] match
         SEEK_SET -> 0
@@ -501,12 +482,11 @@ private normalized(path: []const u8, out: []u8) -> usize
         n = 1
     n
 
-// The open file a descriptor names: one from FIRST_FILE_FD up, or 0 to 2 where a file stands in for
-// the console.
+// The open file a descriptor names; EBADF if it holds anything else.
 private file_of(p: *Process, fd: u64) -> Result[*OpenFile, Errno]
     if fd >= MAX_FDS then return Err(EBADF)
     val f = &p.files[usize(fd)]
-    if f.ino == 0 then return Err(EBADF)
+    if f.holds != Holds.File then return Err(EBADF)
     Ok(f)
 
 private stat_of(ino: u32, i: Inode) -> Stat =

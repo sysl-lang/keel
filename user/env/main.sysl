@@ -1,0 +1,7 @@
+// env: the environment this program was started with, one `NAME=value` per line, in its order.
+
+import rt.keel.user
+import sysl.env
+
+for (name, value) in env.vars()
+    print(s"$name=$value")

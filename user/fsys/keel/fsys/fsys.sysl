@@ -14,8 +14,8 @@ import abi.keel.abi.{EACCES, EBADF, EEXIST, EISDIR, EMFILE, ENOENT, ENOSPC, ENOS
     ExitStatus, KIND_DIR, NO_FD, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, SYS_ACCESS, SYS_CHDIR, SYS_CHMOD,
     SYS_CLOSE,
     SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME,
-    SYS_RMDIR, SYS_SPAWN, SYS_STAT, SYS_TRUNCATE, SYS_UNLINK, SYS_WAIT, SYS_WRITE}
-import rt.keel.user.{flush, syscall, syscall5}
+    SYS_RMDIR, SYS_SPAWN, SYS_STAT, SYS_TRUNCATE, SYS_UNLINK, SYS_WAIT, SYS_WRITE, SpawnAttr}
+import rt.keel.user.{environment, flush, syscall, syscall5}
 import sysl.buf.{Buf, buf}
 import sysl.fs.IoError
 import sysl.fs.sys as fsys
@@ -260,28 +260,60 @@ io_flush(fd: int) -> int
 
 // --- sysl.process: the four hooks `sysl.process.sys` declares -------------------------------------------
 //
-// keel's spawn (22) and wait (23). What keel's spawn cannot be told — an environment (keel has none), a
-// starting directory (the child takes the caller's), a standard input or error of its own — answers
-// `UNSUPPORTED` rather than being dropped; so do a bounded wait, a signal (keel has no kill) and a
-// temporary file.
+// keel's spawn (22) and wait (23). The child's three standard streams and its environment go to keel's
+// spawn as they are asked for. What it cannot be told — a starting directory (the child takes the
+// caller's) — answers `UNSUPPORTED` rather than being dropped; so do a bounded wait, a signal (keel has
+// no kill) and a temporary file.
 
 @export("sysl_proc_spawn")
 proc_spawn(path: *u8, path_len: usize, argv: *psys.Text, argc: usize, envp: *psys.Text, envc: usize,
            inherit_env: int, dir: *u8, dir_len: usize, stdin_fd: int, stdout_fd: int, stderr_fd: int,
            started: *i64) -> i64
     *started = 0
-    if envc != 0 || dir_len != 0 || stdin_fd != -1 || stderr_fd != -1 then return i64(UNSUPPORTED)
-    // keel takes the argument vector as each argument followed by a NUL.
+    if dir_len != 0 then return i64(UNSUPPORTED)
+    // keel takes the argument vector as each argument followed by a NUL, and the environment the same
+    // way: this program's own entries first when it is inherited, less any `envp` names again.
     var packed: Buf[u8] = buf()
     for i in 0..<argc
-        val t = argv[i]
-        for j in 0..<t.len
-            packed.push(t.ptr[j])
+        append_text(&packed, argv[i])
         packed.push(0)
-    val out = if stdout_fd < 0 then NO_FD else u64(stdout_fd)
+    var env: Buf[u8] = buf()
+    if inherit_env != 0
+        for e in environment()
+            if !named_in(e, envp, envc)
+                env.extend(e)
+                env.push(0)
+    for i in 0..<envc
+        append_text(&env, envp[i])
+        env.push(0)
+    var attr = SpawnAttr([fd_of(stdin_fd), fd_of(stdout_fd), fd_of(stderr_fd)], u64(usize(as_ptr(env.view()))),
+                         u64(env.len()), 1)
     val r = syscall5(SYS_SPAWN, addr(path), u64(path_len), u64(usize(as_ptr(packed.view()))), u64(packed.len()),
-                     out)
+                     u64(usize(&attr)))
     if r >= 0 then r else i64(status(r))
+
+// A hook's descriptor as keel's spawn takes it: -1, "this program's own", is NO_FD.
+private fd_of(fd: int) -> u64 = if fd < 0 then NO_FD else u64(fd)
+
+private append_text(b: *Buf[u8], t: psys.Text)
+    for j in 0..<t.len
+        b.push(t.ptr[j])
+
+// Whether entry `e` (`NAME=value`) names a variable one of the `envc` entries at `envp` sets again.
+private named_in(e: []const u8, envp: *psys.Text, envc: usize) -> bool
+    var n: usize = 0
+    while n < e.len && e[n] != u8('=')
+        n += 1
+    for i in 0..<envc
+        val t = envp[i]
+        if t.len > n && t.ptr[n] == u8('=')
+            var same = true
+            for j in 0..<n
+                if t.ptr[j] != e[j]
+                    same = false
+                    break
+            if same then return true
+    false
 
 @export("sysl_proc_wait")
 proc_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int

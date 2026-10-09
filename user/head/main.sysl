@@ -1,0 +1,40 @@
+// head [-n N] [file]: the first N lines (10 by default) of a file, or of standard input with no file.
+
+import rt.keel.user
+import sysl.fs
+import sysl.io.{Reader, lines, stdin}
+import sysl.text.parse_int
+
+first(r: *Reader, n: int)
+    if n <= 0 then return
+    var shown = 0
+    for line in lines(r)
+        print(line)
+        shown += 1
+        if shown == n then return
+
+main(args: []string)
+    var n = 10
+    var path = ""
+    var i: usize = 1
+    while i < args.len
+        if args[i] == "-n" && i + 1 < args.len
+            n = parse_int(args[i + 1]) match
+                Ok(v) -> v
+                Err(_) ->
+                    print(s"head: ${args[i + 1]}: not a number")
+                    exit(2)
+            i += 2
+        else
+            path = args[i]
+            i += 1
+    if path == ""
+        var input = stdin()
+        first(&input, n)
+    else
+        var f = fs.open(path) match
+            Ok(f) -> f
+            Err(e) ->
+                print(s"head: $path: $e")
+                exit(1)
+        first(&f, n)

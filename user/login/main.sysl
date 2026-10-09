@@ -27,7 +27,9 @@ session(u: User) -> never
         Err(e) ->
             print(s"login: ${u.home}: $e; starting in /")
             val _ = fs.set_current_dir("/")
-    val shell = user.spawn(u.shell, ["sh"]) match
+    // The session's environment says whose it is.
+    val env = [s"HOME=${u.home}", s"USER=${u.name}"]
+    val shell = user.spawn(u.shell, ["sh"], env = Some(env[..])) match
         Ok(pid) -> pid
         Err(e) ->
             print(s"login: cannot start ${u.shell}: ${user.describe(e)}")

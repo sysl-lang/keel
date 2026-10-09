@@ -11,7 +11,8 @@ module keel.user
 import abi.keel.abi.{ANY_CHILD, EACCES, EINVAL, ENOENT, EPERM, Errno, ExitStatus, NO_FD, STDOUT, SYS_BRK, SYS_CLOSE, SYS_EXIT, SYS_FSTAT,
     SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN,
     SYS_STAT, SYS_SYNC, SYS_UNLINK, SYS_WAIT, SYS_WRITE, Stat, SYS_SOCKET, SYS_BIND, SYS_RECVFROM, SYS_SENDTO,
-    SYS_SOCKCLOSE, SockAddr, SYS_GETUID, SYS_GETGID, SYS_SETUID, SYS_SETGID, SYS_CHOWN}
+    SYS_SOCKCLOSE, SockAddr, SYS_GETUID, SYS_GETGID, SYS_SETUID, SYS_SETGID, SYS_CHOWN, SYS_PIPE, SYS_DUP2, SYS_DUP,
+    SpawnAttr}
 import sysl.buf.{Buf, buf}
 import sysl.slices.{as_mut_ptr, as_ptr}
 
@@ -30,9 +31,56 @@ asm
 // an ordinary symbol this runtime calls.
 extern "main" program_main(argc: int, argv: **u8) -> int
 
-// Where `_start` goes with the arguments: the program runs, and what it answered ends the process.
+// Where `_start` goes with the arguments: the environment's vector follows argv's zero, so `environ`
+// is set to it; then the program runs, and what it answered ends the process.
 @export("keel_user_start")
-start(argc: int, argv: **u8) -> never = exit(program_main(argc, argv))
+start(argc: int, argv: **u8) -> never
+    environ = ptr_cast(usize(argv) + (usize(argc) + 1) * 8)
+    exit(program_main(argc, argv))
+
+// The environment, as C keeps it and as `sysl.env` reads it: a zero-ended vector of `NAME=value`
+// strings — the one the kernel laid on the stack. `sysl.env` names `environ` and `getenv` as externs
+// and has no hook layer for a target with no C library, and a sysl `var` cannot be `@export`ed, so the
+// variable is defined here in assembly (FINDINGS.md 65).
+@section(".data")
+asm
+    [aarch64]
+        ".globl environ"
+        ".p2align 3"
+        "environ:"
+        ".quad 0"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+extern environ: **u8
+
+// C's `getenv`, over `environ`: the value of the first entry whose name is `name`, or null.
+@export("getenv")
+getenv(name: *u8) -> *u8
+    var n: usize = 0
+    while name[n] != 0
+        n += 1
+    var i: usize = 0
+    loop
+        val e = environ[i]
+        if e == null then return null
+        var k: usize = 0
+        while k < n && e[k] == name[k]
+            k += 1
+        if k == n && e[n] == u8('=') then return ptr_cast(usize(e) + n + 1)
+        i += 1
+
+// This process's environment entries, `NAME=value` each, as bytes (keel.fsys builds a child's from it).
+environment() -> Buf[[]const u8]
+    var out: Buf[[]const u8] = buf()
+    var i: usize = 0
+    loop
+        val e = environ[i]
+        if e == null then return out
+        var n: usize = 0
+        while e[n] != 0
+            n += 1
+        out.push(e[0..<n])
+        i += 1
 
 // The system calls, one `svc` each. The kernel preserves every register but x0.
 
@@ -168,15 +216,40 @@ private call5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
     r
 
 // Start the executable at `path` as a child, with `args` as its argv (its name first, by convention),
-// in this process's current directory. `out` is a descriptor to stand as the child's standard output,
-// NO_FD for this process's own. Answers the child's pid.
-spawn(path: string, args: []const string, out: u64 = NO_FD) -> Result[u64, Errno]
+// in this process's current directory. `stdin`, `stdout` and `stderr` are descriptors of this process
+// to stand as the child's 0, 1 and 2, NO_FD for this process's own. `env` is the child's whole
+// environment (`NAME=value` entries), or None for this process's. Answers the child's pid.
+spawn(path: string, args: []const string, stdin: u64 = NO_FD, stdout: u64 = NO_FD, stderr: u64 = NO_FD,
+        env: Option[[]const string] = None) -> Result[u64, Errno]
     var packed: Buf[u8] = buf()
     for a in args
         packed.extend(a.bytes)
         packed.push(0)
     val bytes = packed.view()
-    answer(call5(SYS_SPAWN, addr(path.bytes), len(path.bytes), addr(bytes), len(bytes), out))
+    var block: Buf[u8] = buf()
+    var attr = SpawnAttr([stdin, stdout, stderr], 0, 0, 0)
+    env match
+        Some(entries) ->
+            for e in entries
+                block.extend(e.bytes)
+                block.push(0)
+            attr.env = addr(block.view())
+            attr.env_len = u64(block.len())
+            attr.env_given = 1
+        None -> ()
+    answer(call5(SYS_SPAWN, addr(path.bytes), len(path.bytes), addr(bytes), len(bytes), u64(usize(&attr))))
+
+// A pipe: its read end's descriptor, then its write end's.
+pipe() -> Result[(u64, u64), Errno]
+    var fds: [2]u32 = [0, 0]
+    done(call(SYS_PIPE, u64(usize(&fds[0])), 0, 0, 0))?
+    Ok((u64(fds[0]), u64(fds[1])))
+
+// Make descriptor `new` stand for what `old` does, closing what `new` held first.
+dup2(old: u64, new: u64) -> Result[u64, Errno] = answer(call(SYS_DUP2, old, new, 0, 0))
+
+// A second descriptor, the lowest free one, standing for what `old` does.
+dup(old: u64) -> Result[u64, Errno] = answer(call(SYS_DUP, old, 0, 0, 0))
 
 // Wait for a child to end — `pid`, or any one for ANY_CHILD — and answer which, and how.
 wait(pid: i64 = ANY_CHILD) -> Result[(u64, ExitStatus), Errno]

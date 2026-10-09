@@ -21,7 +21,7 @@ struct Process
     fault: u64                  // why it was killed (keel.proc's encoding); 0 when it exited by itself
     thread: Option[&sync Thread]
     preemptions: u64            // times the timer took the processor from its thread, once it has ended
-    files: [OPEN_FILES]OpenFile // indexed by descriptor; 0 to 2 are the console unless a file stands there
+    files: [OPEN_FILES]OpenFile // indexed by descriptor: the console, a file, a pipe end, or free
     cwd: [CWD_ROOM]u8           // the current directory: an absolute path with no `.`, `..` or `//`
     cwd_len: usize
     ppid: u64                   // the parent's pid; 0 for a process the kernel started and waits for
@@ -29,6 +29,8 @@ struct Process
     me: Option[&sync Process]   // the box keeping itself alive while it is in keel.proc's table
     uid: u32                    // who it runs as: 0 is root; a child starts with its parent's
     gid: u32                    // its one group; there are no supplementary groups
+    env: [ENV_ROOM]u8           // its environment, which a child is given unless its parent says otherwise
+    env_len: usize
 
 // Who a process runs as, for keel.fs's permission checks.
 struct Cred
@@ -52,13 +54,32 @@ root_dir() -> [CWD_ROOM]u8
 // How many descriptors a process has, the console's three included (keel.abi's MAX_FDS).
 const OPEN_FILES: usize = 16
 
-// A descriptor's file: an inode of the filesystem (keel.fs), the flags it was opened with, and where
-// the next read or write starts. `ino` 0 is a free descriptor — or, for 0 to 2, the console. Plain
-// numbers, so a process can name its
-// files without this module importing the filesystem, which imports this one.
+// What a descriptor stands for. `Free` is first, so a zeroed descriptor is a free one.
+enum Holds
+    Free
+    Console
+    File            // `ino`, an inode of the filesystem (keel.fs)
+    PipeRead        // `ino` is the pipe's slot (keel.proc's pipe table)
+    PipeWrite
+
+// A descriptor: what it holds, and for a file the flags it was opened with and where the next read or
+// write starts. Plain numbers, so a process can name its files and pipes without this module importing
+// the filesystem or the pipes, which import this one.
 struct OpenFile
+    holds: Holds
     ino: u32
     flags: u32
     offset: u64
 
-no_files() -> [OPEN_FILES]OpenFile = [OpenFile(0, 0, 0); OPEN_FILES]
+// A descriptor that holds nothing.
+free_file() -> OpenFile = OpenFile(Holds.Free, 0, 0, 0)
+
+// A new process's descriptors: the console at 0 to 2, the rest free.
+no_files() -> [OPEN_FILES]OpenFile
+    var f: [OPEN_FILES]OpenFile = [free_file(); OPEN_FILES]
+    for fd in 0..<3
+        f[fd] = OpenFile(Holds.Console, 0, 0, 0)
+    f
+
+// Room for a process's environment: `NAME=value` entries, each followed by a NUL (keel.abi's ENV_ROOM).
+const ENV_ROOM: usize = 1024

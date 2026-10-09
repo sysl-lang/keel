@@ -210,6 +210,28 @@ session2=(
     'rm /m9/kept'
     'ls /m9'
     $'echo tyxz\x7f\x7fpo'
+    'ls -l / | grep bin | wc -l'
+    'ls / | grep o | head -n 2'
+    'wc -l < /etc/group'
+    'cat /m9/big.bin | wc -c'
+    'cat /m9/big.bin | head -n 0'
+    'echo one >> /m9/log'
+    'echo two >> /m9/log'
+    'cat /m9/log'
+    'X=hello'
+    'echo $X world'
+    'false'
+    'echo $?'
+    'true'
+    'echo $?'
+    'echo $HOME $USER'
+    'export GREETING=hi'
+    'env | grep GREETING'
+    'env > /m9/env.txt'
+    'grep GREETING /m9/env.txt'
+    'env | grep X | wc -l'
+    'rm /m9/log'
+    'rm /m9/env.txt'
     'exit'
     $'\x04'
 )
@@ -218,6 +240,20 @@ transcript2=(
     $'# cat /m9/kept\ndata\n'                   # the file the first boot's shell wrote, read back
     $'# rm /m9/kept\n# ls /m9\nbig.bin\nbig.copy\ncopy.txt\n'
     $'# echo tyxz\b \b\b \bpo\ntypo\n'          # the line the shell got is the edited one
+    $'# ls -l / | grep bin | wc -l\n1\n'       # milestone 13: the done-when line, a pipeline of three
+    $'# ls / | grep o | head -n 2\nhello.txt\nhome\n'   # another three stages; head stops at two
+    $'# wc -l < /etc/group\n2\n'              # standard input from a file
+    $'# cat /m9/big.bin | wc -c\n204800\n'    # 200 KiB through a 4 KiB pipe: the writer blocks and resumes
+    $'# cat /m9/big.bin | head -n 0\n# echo one >> /m9/log\n'   # head ends at once: cat's write gets EPIPE, no hang
+    $'# echo two >> /m9/log\n# cat /m9/log\none\ntwo\n'   # >> appends, twice
+    $'# X=hello\n# echo $X world\nhello world\n'   # a shell variable, set and expanded
+    $'# false\nsh: false: exit status 1\n# echo $?\n1\n'   # $? after a failure...
+    $'# true\n# echo $?\n0\n'                 # ...and after a success
+    $'# echo $HOME $USER\n/ root\n'           # login gave the shell its environment
+    $'# export GREETING=hi\n# env | grep GREETING\nGREETING=hi\n'   # export reaches a child (keel spawn)
+    $'# env > /m9/env.txt\n# grep GREETING /m9/env.txt\nGREETING=hi\n'   # ...and through sysl.process
+    $'# env | grep X | wc -l\n0\n'           # X was never exported
+    $'# rm /m9/log\n# rm /m9/env.txt\n'
     $'# exit\nlogin: \n'
     "init: the console closed after 1 sessions; orphans reaped: 0"
     "keel: init exited 0"
@@ -235,7 +271,7 @@ not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login e
     "keel: processes left unreaped" "keel: processes still running before init")
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
-    init sh mkdir rm rmdir mv false ppid orphan udpecho login su id whoami chmod chown)
+    init sh mkdir rm rmdir mv false ppid orphan udpecho login su id whoami chmod chown env wc grep head true)
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
 frames_min=65000

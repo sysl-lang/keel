@@ -1,14 +1,12 @@
 module keel.proc
 
-import abi.keel.abi.{EFAULT, EINVAL, ENOSYS, EPERM, Errno, STDERR, STDIN, STDOUT, SYS_CHMOD, SYS_CHOWN, SYS_GETGID,
+import abi.keel.abi.{EINVAL, ENOSYS, EPERM, Errno, SYS_CHMOD, SYS_CHOWN, SYS_DUP, SYS_DUP2, SYS_GETGID, SYS_PIPE,
     SYS_GETUID, SYS_SETGID, SYS_SETUID, SYS_ACCESS, SYS_BRK, SYS_CHDIR, SYS_CLOSE,
     SYS_EXIT, SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR,
     SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN, SYS_STAT, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINK, SYS_WAIT,
     SYS_WRITE, SYS_SOCKET, SYS_BIND, SYS_RECVFROM, SYS_SENDTO, SYS_SOCKCLOSE}
-import keel.console
 import keel.fs
 import keel.mm
-import keel.pl011.put_byte
 import keel.sched.Process
 
 // System calls (user/abi has the numbers): `svc #0` from EL0 arrives here with the saved registers, the
@@ -29,7 +27,7 @@ private[proc] system_call(regs: *u64)
         SYS_BRK -> sys_brk(p, regs)
         SYS_OPEN -> fs.sys_open(p, regs)
         SYS_READ -> sys_read(p, regs)
-        SYS_CLOSE -> fs.sys_close(p, regs)
+        SYS_CLOSE -> sys_close(p, regs)
         SYS_LSEEK -> fs.sys_lseek(p, regs)
         SYS_FSTAT -> fs.sys_fstat(p, regs)
         SYS_STAT -> fs.sys_stat(p, regs)
@@ -58,6 +56,9 @@ private[proc] system_call(regs: *u64)
         SYS_SETGID -> sys_setgid(p, regs)
         SYS_CHMOD -> fs.sys_chmod(p, regs)
         SYS_CHOWN -> fs.sys_chown(p, regs)
+        SYS_PIPE -> sys_pipe(p, regs)
+        SYS_DUP2 -> sys_dup2(p, regs)
+        SYS_DUP -> sys_dup(p, regs)
         else Err(ENOSYS)
     regs[0] = r match
         Ok(v) -> u64(v)
@@ -75,49 +76,9 @@ private sys_getpid(p: *Process, regs: *u64) -> Result[i64, Errno] = Ok(i64(p.pid
 // as a distinct type (FINDINGS.md 32).
 type UserAddr = new u64
 
-// Off only to show what the check is for: with it off, `write` reads through whatever address the
-// program passed, and a bad one is a fault in the kernel.
-private const VALIDATE_USER_POINTERS: bool = true
-
-// write(fd, buf, len): to a file (keel.fs), or for descriptors 1 and 2 to the console. Every page of the
-// buffer is checked against the process's translation tables first — mapped, and mapped for the user —
-// so a bad pointer anywhere in it answers EFAULT and prints nothing, rather than faulting in the kernel
-// or printing kernel memory.
-private sys_write(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val fd = regs[0]
-    val buf = UserAddr(regs[1])
-    val len = regs[2]
-    if (fd != STDOUT && fd != STDERR) || p.files[usize(fd)].ino != 0 then return fs.sys_write(p, regs)
-    if len == 0 then return Ok(0)
-
-    if !VALIDATE_USER_POINTERS
-        for i in 0..<len
-            val b: *u8 = ptr_cast(usize(u64(buf) + i))
-            put_byte(*b)
-        return Ok(i64(len))
-
-    if !user_readable(&p.space, buf, len) then return Err(EFAULT)
-    console.hold()
-    var done: u64 = 0
-    while done < len
-        val va = u64(buf) + done
-        val chunk = min(len - done, mm.PAGE_SIZE - (va & (mm.PAGE_SIZE - 1)))
-        val (pa, _) = mm.user_translate(&p.space, va) match
-            Some(t) -> t
-            None -> (mm.PhysAddr(0), false)
-        val src: *u8 = ptr_cast(usize(u64(mm.to_virt(pa))))
-        for i in 0..<chunk
-            put_byte(src[usize(i)])
-        done += chunk
-    console.release()
-    Ok(i64(len))
-
-// read(fd, buf, len): from a file (keel.fs), or for descriptor 0 from the console, a line at a time
-// (keel.console), sleeping until a whole line has been typed.
-private sys_read(p: *Process, regs: *u64) -> Result[i64, Errno]
-    if regs[0] != STDIN || p.files[0].ino != 0 then return fs.sys_read(p, regs)
-    if !mm.user_range(&p.space, regs[1], regs[2], true) then return Err(EFAULT)
-    Ok(i64(console.read(&p.space, regs[1], regs[2])))
+// Off only to show what the check is for: with it off, a console `write` reads through whatever address
+// the program passed (descriptors.sysl), and a bad one is a fault in the kernel.
+private[proc] const VALIDATE_USER_POINTERS: bool = true
 
 private sys_getppid(p: *Process, regs: *u64) -> Result[i64, Errno] = Ok(i64(p.ppid))
 
@@ -140,9 +101,8 @@ private may_change_ids(p: *Process) -> bool = p.uid == 0
 
 // Whether all of `len` bytes from `addr` are user memory of this space: inside the user range with no
 // wrap around, and every page they touch mapped.
-private user_readable(s: *mm.Space, addr: UserAddr, len: u64) -> bool = mm.user_range(s, u64(addr), len, false)
-
-private min(a: u64, b: u64) -> u64 = if a < b then a else b
+private[proc] user_readable(s: *mm.Space, addr: UserAddr, len: u64) -> bool =
+    mm.user_range(s, u64(addr), len, false)
 
 // brk(addr): move the end of the heap to `addr`, mapping fresh zeroed pages or giving pages back, and
 // answer the end as it now is — unchanged when `addr` is outside [heap start, heap limit] or memory ran

@@ -1,0 +1,55 @@
+// wc [-l | -c] [file]: the lines, words and bytes of a file, or of standard input with no file; with -l
+// the lines alone, with -c the bytes alone. A line is counted by its newline, as POSIX counts them.
+
+import rt.keel.user
+import sysl.fs
+import sysl.io.{Reader, stdin}
+
+struct Counts
+    lines: u64
+    words: u64
+    bytes: u64
+
+counted[R: Reader](r: *R) -> Counts
+    var c = Counts(0, 0, 0)
+    var in_word = false
+    var room: [512]u8 = [0; 512]
+    loop
+        val got = r.read(room[..])
+        if got.len == 0 then break
+        c.bytes += u64(got.len)
+        for b in got
+            if b == u8('\n') then c.lines += 1
+            val space = b == u8(' ') || b == u8('\n') || b == u8('\t')
+            if !space && !in_word then c.words += 1
+            in_word = !space
+    c
+
+main(args: []string)
+    var lines_only = false
+    var bytes_only = false
+    var path = ""
+    for a in args[1..]
+        if a == "-l"
+            lines_only = true
+        elif a == "-c"
+            bytes_only = true
+        else
+            path = a
+    val c = if path == ""
+        var input = stdin()
+        counted(&input)
+    else
+        var f = fs.open(path) match
+            Ok(f) -> f
+            Err(e) ->
+                print(s"wc: $path: $e")
+                exit(1)
+        counted(&f)
+    val name = if path == "" then "" else s" $path"
+    if lines_only
+        print(s"${c.lines}$name")
+    elif bytes_only
+        print(s"${c.bytes}$name")
+    else
+        print(s"${c.lines} ${c.words} ${c.bytes}$name")

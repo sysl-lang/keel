@@ -2,9 +2,10 @@ module keel.proc
 
 // Parents and children: the process table, and the `spawn`, `wait` and `getppid` system calls.
 //
-// **The model is spawn, not fork.** `spawn(path, args, out_fd)` makes a new address space from an
+// **The model is spawn, not fork.** `spawn(path, args, attr)` makes a new address space from an
 // executable on the disk — exactly what `start` already did for the kernel — and gives the child its
-// parent's current directory and standard descriptors (one of them replaced, for a shell's `>`).
+// parent's current directory, environment and standard descriptors, any of them replaced as `attr`
+// says (a shell's `>`, `<`, a pipeline's ends, an exported variable).
 // `fork` would copy the parent's address space only for `exec` to throw the copy away, and would
 // need a second kernel stack that returns from the same system call into a copy of the trap frame;
 // keel has no copy-on-write, so the copy would be every page, and nothing in keel needs a forked
@@ -17,11 +18,11 @@ module keel.proc
 // parent to reap it. `wait` sleeps on `changed`, which every ending wakes.
 
 import abi.keel.abi.{ANY_CHILD, ARGS_ROOM, E2BIG, EAGAIN, ECHILD, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOEXEC,
-    ENOMEM, Errno, ExitStatus, INIT_PID, NO_FD}
+    EBADF, ENOMEM, ENV_ROOM, Errno, ExitStatus, INIT_PID, MAX_FDS, NO_FD, SpawnAttr}
 import keel.fs
 import keel.mm
 import keel.sched
-import keel.sched.{IrqLock, OpenFile, Process, WaitQueue}
+import keel.sched.{Holds, IrqLock, OpenFile, Process, WaitQueue}
 import sysl.buf.{Buf, buf, buf_with_capacity}
 import sysl.text.from_utf8
 
@@ -75,7 +76,7 @@ private[proc] table_empty() -> bool
     family.unlock(flags)
     empty
 
-// spawn(path, path_len, args, args_len, out_fd) -> the child's pid
+// spawn(path, path_len, args, args_len, *SpawnAttr | 0) -> the child's pid
 private[proc] sys_spawn(p: *Process, regs: *u64) -> Result[i64, Errno]
     val path_len = regs[1]
     if path_len == 0 then return Err(ENOENT)
@@ -93,11 +94,41 @@ private[proc] sys_spawn(p: *Process, regs: *u64) -> Result[i64, Errno]
 
     // The file must be executable by the caller; the child runs as the caller, or as the file's owner
     // when it is set-user-ID.
+    // What the caller asked for besides: none of it, or a SpawnAttr.
+    var attr = SpawnAttr([NO_FD, NO_FD, NO_FD], 0, 0, 0)
+    if regs[4] != 0
+        val b: *u8 = ptr_cast(&attr)
+        if !mm.copy_from_user(&p.space, regs[4], b[0..<sizeof(SpawnAttr)]) then return Err(EFAULT)
+    var env: Buf[u8] = buf()
+    if attr.env_given != 0
+        if attr.env_len > ENV_ROOM then return Err(E2BIG)
+        for _ in 0..<attr.env_len
+            env.push(0)
+        if attr.env_len > 0 && !mm.copy_from_user(&p.space, attr.env, env.view()) then return Err(EFAULT)
+        if attr.env_len > 0 && env.at(env.len() - 1) != 0 then return Err(EINVAL)
+    else
+        env.extend(p.env[0..<p.env_len])
+
+    // The file must be executable by the caller; the child runs as the caller, or as the file's owner
+    // when it is set-user-ID.
     val image = fs.read_executable(p.cwd[0..<p.cwd_len], path[0..<usize(path_len)], sched.cred_of(p))?
-    val out = if regs[4] == NO_FD then None else Some(fs.inherit(p, regs[4])?)
-    start_image(image.bytes.view(), args.view(), p, out, image.run_as) match
+    val std = standard_files(p, attr.fds)?
+    start_image(image.bytes.view(), args.view(), p, std, env.view(), image.run_as) match
         Ok(child) -> Ok(i64(child.pid))
         Err(e) -> Err(errno_of(e))
+
+// The child's descriptors 0 to 2: for each, the caller's descriptor `fds[i]` names, or its own i for
+// NO_FD (which may be free), counted as open once more. EBADF for a named descriptor that is not open.
+private standard_files(p: *Process, fds: [3]u64) -> Result[[3]OpenFile, Errno]
+    for i in 0..<3
+        val fd = if fds[i] == NO_FD then u64(i) else fds[i]
+        if fd >= MAX_FDS || (fds[i] != NO_FD && p.files[usize(fd)].holds == Holds.Free) then return Err(EBADF)
+    var std: [3]OpenFile = [sched.free_file(); 3]
+    for i in 0..<3
+        val fd = if fds[i] == NO_FD then usize(i) else usize(fds[i])
+        std[i] = p.files[fd]
+        duplicate(std[i])
+    Ok(std)
 
 // NUL-terminated arguments, one after another, as strings.
 private unpacked(packed: []const u8) -> Result[Buf[string], Errno]
