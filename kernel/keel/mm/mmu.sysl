@@ -103,7 +103,7 @@ struct BootMaps
 build_boot_maps() -> BootMaps
     val (id_root, id_pa) = new_table()
     val ram = PhysAddr(RAM_BASE)
-    map_range(id_root, VirtAddr(RAM_BASE), ram, RAM_SIZE, identity())
+    map_range(id_root, VirtAddr(RAM_BASE), ram, RAM_SIZE, identity)
 
     val (root, root_pa) = new_table()
     remember_kernel_root(root)
@@ -113,13 +113,13 @@ build_boot_maps() -> BootMaps
     val guard = phys_of(usize(&__stack_guard))
     val paged_end = ram + IMAGE_REGION_END
 
-    map_kernel(root, PhysAddr(0), RAM_BASE, device())
-    map_kernel(root, ram, u64(start) - u64(ram), ram_rw())
-    map_kernel(root, start, u64(text_end) - u64(start), text())
-    map_kernel(root, text_end, u64(rodata_end) - u64(text_end), ram_ro())
-    map_kernel(root, rodata_end, u64(guard) - u64(rodata_end), ram_rw())
-    map_kernel(root, guard + u64(4096), u64(paged_end) - u64(guard) - 4096, ram_rw())
-    map_kernel(root, paged_end, RAM_SIZE - IMAGE_REGION_END, ram_rw())
+    map_kernel(root, PhysAddr(0), RAM_BASE, device)
+    map_kernel(root, ram, u64(start) - u64(ram), ram_rw)
+    map_kernel(root, start, u64(text_end) - u64(start), text)
+    map_kernel(root, text_end, u64(rodata_end) - u64(text_end), ram_ro)
+    map_kernel(root, rodata_end, u64(guard) - u64(rodata_end), ram_rw)
+    map_kernel(root, guard + u64(4096), u64(paged_end) - u64(guard) - 4096, ram_rw)
+    map_kernel(root, paged_end, RAM_SIZE - IMAGE_REGION_END, ram_rw)
 
     boot_maps = BootMaps(id_pa, root_pa)
     boot_maps

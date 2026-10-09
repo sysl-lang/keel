@@ -52,7 +52,7 @@ alloc_stack() -> Option[Stack]
         val f = alloc_frame() match
             Some(f) -> f
             None -> break
-        map_range(kernel_root(), VirtAddr(top - STACK_SIZE + mapped), frame_addr(f), PAGE, ram_rw())
+        map_range(kernel_root(), VirtAddr(top - STACK_SIZE + mapped), frame_addr(f), PAGE, ram_rw)
         mapped += PAGE
     cpu.publish_tables()
     val ok = mapped == STACK_SIZE

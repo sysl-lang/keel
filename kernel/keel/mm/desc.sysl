@@ -75,16 +75,16 @@ struct Prot
     access: Access
     exec: bool
 
-// The protections keel maps with. They are functions rather than module `val`s because a module
-// `val` holding any variant but an enum's first is emitted as IR clang refuses (FINDINGS.md 15).
-ram_rw() -> Prot = Prot(Normal, KernelRw, false)
-ram_ro() -> Prot = Prot(Normal, KernelRo, false)
-text() -> Prot = Prot(Normal, KernelRo, true)
-device() -> Prot = Prot(Device, KernelRw, false)
+// The protections keel maps with. Each is a constructor over literals, so it folds into the image and
+// is there before the MMU is on.
+val ram_rw: Prot = Prot(Normal, KernelRw, false)
+val ram_ro: Prot = Prot(Normal, KernelRo, false)
+val text: Prot = Prot(Normal, KernelRo, true)
+val device: Prot = Prot(Device, KernelRw, false)
 
 // The identity map is used only between switching the MMU on and branching to the high half, by code
 // that is both running there and still using its stack there.
-identity() -> Prot = Prot(Normal, KernelRw, true)
+val identity: Prot = Prot(Normal, KernelRw, true)
 
 // RAM is inner shareable so every core will see one coherent copy; device memory's shareability is
 // ignored, and outer shareable is what Arm recommends writing for it.

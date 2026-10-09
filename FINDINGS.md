@@ -433,6 +433,10 @@ template that may name a constant would cover them.
 
 ## 15. A module `val` holding any enum variant but the first is emitted as IR clang refuses
 
+**FIXED (checked on prerelease `8619de6609`):** the input below, with a `u2` enum's third variant
+beside it, prints `B Bare true`. keel's five protections are module `val`s again (branch `lsrm`); the
+image has no `main` (finding 31's trap) and the values fold into the code that maps with them.
+
 Milestone 2, the protection a mapping is made with. Shortest input:
 
     enum Wide
