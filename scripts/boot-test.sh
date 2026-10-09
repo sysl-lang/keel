@@ -5,6 +5,7 @@
 #   scripts/boot-test.sh            build at sysl's default level, run under HVF
 #   KEEL_OPT=-O0 scripts/boot-test.sh
 #   KEEL_ACCEL=tcg scripts/boot-test.sh   run under TCG (-cpu cortex-a72) instead of HVF
+#   KEEL_SYSL=<path>/bin/sysl scripts/boot-test.sh   build with that compiler instead of `sysl`
 #
 # QEMU installs its own SIGALRM handler, so an alarm cannot bound it; the watchdog below kills it by
 # PID instead.
@@ -19,13 +20,12 @@ mkdir -p $out
 limit=${KEEL_TIMEOUT:-15}
 opt=${KEEL_OPT:-}
 accel=${KEEL_ACCEL:-hvf}
+compiler=${KEEL_SYSL:-sysl}
 
-archive=$out/libkeel.a
 elf=$out/keel.elf
 log=$out/boot.log
 
-sysl build-c --target aarch64-freestanding ${opt:+$opt} -o $archive $root/kernel
-ld.lld -T $root/kernel/link.ld --gc-sections -o $elf $archive
+$compiler build --target aarch64-freestanding ${opt:+$opt} -o $elf $root/kernel
 
 if [[ $accel == hvf ]]; then
     machine=(-accel hvf -cpu host)

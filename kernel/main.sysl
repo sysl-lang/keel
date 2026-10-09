@@ -4,25 +4,23 @@ import keel.boot.zero_bss
 import keel.psci.system_off
 
 // The first instruction the machine runs. QEMU loads the ELF image into RAM and starts the boot
-// processor at `_start`, at EL1 with the MMU off, no stack, and floating point possibly trapped.
-// `_start` gives it a stack and the FP/SIMD unit and branches to `kmain`, which never returns.
+// processor at `_start`, at EL1 with the MMU off and no stack. `_start` gives it a stack and branches
+// to `kmain`, which never returns.
 //
-// It is NOT `@export("_start")`: an export publishes an entry that calls the definition, and at -O0
-// that entry saves the link register on a stack that does not exist yet. A function of the root
-// module is emitted under its own name, and `@section` keeps it and places it first in the image.
-// The body is one assembly block and nothing else, so the definition itself needs no frame.
+// It is assembly at the top of the file rather than a function, because a function may save a
+// register on the stack before its first instruction and there is no stack yet. The label is the
+// symbol as written, and `@section` places it first in the image. The kernel is built with
+// `codegen.general_regs_only`, so nothing touches the FP/SIMD unit and it stays switched off.
 @section(".text.boot")
-_start() -> never
-    asm
-        [aarch64]
-            "adrp x0, __stack_top"
-            "add x0, x0, :lo12:__stack_top"
-            "mov sp, x0"
-            "mov x0, #(3 << 20)"
-            "msr cpacr_el1, x0"
-            "isb"
-            "b kmain"
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel boots on aarch64 only"
+asm
+    [aarch64]
+        ".globl _start"
+        "_start:"
+        "adrp x0, __stack_top"
+        "add x0, x0, :lo12:__stack_top"
+        "mov sp, x0"
+        "b kmain"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel boots on aarch64 only"
 
 @export("kmain")
 kmain() -> never

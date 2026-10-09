@@ -4,3 +4,18 @@ package {
   name    = "keel"
   version = "0.0.1"
 }
+
+// Kernel code never touches the FP/SIMD registers (exception entry need not save them, and nothing
+// traps before the unit is enabled) and never makes an unaligned access (with the MMU off all memory
+// is Device memory).
+codegen {
+  general_regs_only = true
+  strict_align      = true
+}
+
+targets {
+  aarch64-freestanding {
+    linker_script = "link.ld"
+    entry         = "_start"
+  }
+}
