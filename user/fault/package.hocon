@@ -1,0 +1,21 @@
+// A user program that reads the kernel's memory, which a user program may not: it is killed.
+
+package {
+  name    = "fault"
+  version = "0.0.1"
+}
+
+dependencies {
+  rt { workspace = true }
+}
+
+codegen {
+  general_regs_only = true
+}
+
+targets {
+  aarch64-freestanding {
+    linker_script = "../user.ld"
+    entry         = "_start"
+  }
+}

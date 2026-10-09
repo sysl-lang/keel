@@ -1,0 +1,14 @@
+// Spin for ever, making no system call, so nothing but the timer can take the processor away — and
+// check, every time round, that this process's memory still holds what it wrote there. Every process
+// is linked at the same addresses, so a core that resumed this one with another process's address
+// space in TTBR0 would show it here: the word would hold the other's pid, or not be mapped at all.
+
+import rt.keel.user
+
+val pid = user.getpid()
+var tag = pid
+val cell: *volatile u64 = ptr_cast(&tag)
+loop
+    if *cell != pid
+        print("user: process", pid, "found", *cell, "in its own memory")
+        user.exit(3)

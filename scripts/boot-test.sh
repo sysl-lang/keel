@@ -49,9 +49,13 @@ expected=(
     "keel: smp heap ok"     # 4 threads x 10,000 Bufs on the heap at once; every block and frame back
     "user: hello from EL0"  # a sysl program at EL0, in its own address space, printing through `write`
     "keel: process 1 exited 0"   # ...and ending with `exit(0)`
+    "keel: process 2 killed: permission fault"   # a program reading kernel memory is killed, alone
+    "keel: preempt user ok" # one spinner per core never yields; a worker still ran, and each was preempted
+    "keel: bad pointer rejected"   # write() with four bad buffers answered EFAULT, and the kernel lives
+    "keel: processes reclaimed"    # every frame, table and ASID the processes had came back
 )
 
-user_programs=(hello)
+user_programs=(hello fault spin worker badptr)
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
 frames_min=65000

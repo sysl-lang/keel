@@ -1,0 +1,19 @@
+// Hand `write` buffers this process may not read, and expect EFAULT for each, with nothing printed and
+// the kernel unharmed: one in the unmapped page at address 0x1000, one in the kernel's own text, one
+// that starts in the last stack page and runs past the top of user memory, and one in the guard page
+// below the stack. Exit 0 only if all four were refused, and a good buffer still works after them.
+
+import abi.keel.abi.EFAULT
+import rt.keel.user
+
+private attempt(addr: u64, len: u64) -> i64 = user.write(1, ptr_cast(usize(addr)), len)
+
+val unmapped = attempt(0x1000, 8)
+val kernel = attempt(0xffff_0000_4020_0000, 8)
+val past_top = attempt(0xffff_f000, 0x2000)
+val guard = attempt(0xfffe_f000, 16)
+print("user: write answered", unmapped, kernel, past_top, guard)
+
+val good = user.put("user: a good buffer still prints\n")
+val all_refused = unmapped == -EFAULT && kernel == -EFAULT && past_top == -EFAULT && guard == -EFAULT
+user.exit(if all_refused && good > 0 then 0 else 1)

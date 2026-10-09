@@ -1,0 +1,16 @@
+// Run beside as many spinning processes as there are cores, for long enough to be preempted many times
+// over, checking as the spinners do that this process's memory is its own; then exit 0. The boot test
+// starts it after the spinners, so it runs at all only because the timer takes a core from one of them.
+
+import rt.keel.user
+
+private const ROUNDS: u64 = 50_000_000
+
+val pid = user.getpid()
+var tag = pid
+val cell: *volatile u64 = ptr_cast(&tag)
+for i in 0..<ROUNDS
+    if *cell != pid
+        print("user: process", pid, "found", *cell, "in its own memory")
+        user.exit(3)
+user.exit(0)

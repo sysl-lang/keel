@@ -1,0 +1,10 @@
+// Read a word of the kernel's own text. The kernel half is mapped in every process (TTBR1), but only
+// for EL1, so the load is a permission fault: the kernel kills this process and carries on.
+
+import rt.keel.user
+
+print("user: reading the kernel's memory")
+val text: usize = 0xffff_0000_4020_0000
+val kernel: *volatile u64 = ptr_cast(text)
+val word = *kernel
+print("user: read the kernel's memory:", word)

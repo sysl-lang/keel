@@ -1,0 +1,22 @@
+// A user program that hands `write` pointers it does not own: each must answer EFAULT.
+
+package {
+  name    = "badptr"
+  version = "0.0.1"
+}
+
+dependencies {
+  rt { workspace = true }
+  abi { workspace = true }
+}
+
+codegen {
+  general_regs_only = true
+}
+
+targets {
+  aarch64-freestanding {
+    linker_script = "../user.ld"
+    entry         = "_start"
+  }
+}

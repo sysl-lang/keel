@@ -20,3 +20,4 @@ struct Process
     exit_code: i64              // what it passed to `exit`
     fault: u64                  // why it was killed (keel.proc's encoding); 0 when it exited by itself
     thread: Option[&sync Thread]
+    preemptions: u64            // times the timer took the processor from its thread, once it has ended

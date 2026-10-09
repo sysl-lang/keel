@@ -2,33 +2,102 @@ module keel.selftest
 
 // What milestone 6 is for, run by kmain after the SMP tests: user programs, each in an address space of
 // its own at EL0, reaching the kernel only through system calls — and a program that misbehaves ending
-// alone, with the kernel carrying on.
+// alone, with the kernel carrying on. Every line is printed by the boot core, after the process it is
+// about has ended; the programs' own lines come from whichever core ran them.
 
 import keel.heap
 import keel.mm
 import keel.proc
 import keel.sched
+import keel.sched.Process
 import keel.trap
-import sysl.sync.{Atomic, Ordering}
+import sysl.buf.{Buf, buf}
+import sysl.sync.Ordering
 
 user()
     val frames_before = mm.frames_free()
-    hello_process()
+    val blocks_before = heap.live()
 
-// --- Hello ----------------------------------------------------------------------------------------
-//
-// The first process prints through `write` (the line is the program's own) and exits 0.
+    run_one("hello", proc.hello())          // pid 1: prints, grows its heap, exits 0
+    run_one("fault", proc.fault())          // pid 2: reads kernel memory, is killed
+    preempt_user()
+    bad_pointers()
 
-private hello_process()
-    proc.start(proc.hello()) match
+    // Every frame the processes took — pages, tables, roots — and every ASID came back.
+    val frames_after = mm.frames_free()
+    if frames_after == frames_before && mm.asids_in_use() == 0 && heap.live() == blocks_before
+        print("keel: processes reclaimed")
+    else
+        print("keel: processes leaked: frames free", frames_after, "of", frames_before, "asids",
+            mm.asids_in_use(), "blocks live", heap.live(), "of", blocks_before)
+
+// Start a program, wait for it, and say how it ended.
+private run_one(name: string, image: []const u8)
+    proc.start(image) match
         Ok(p) ->
             proc.wait(p)
             report(p)
-        Err(e) -> print("keel: hello did not load")
+        Err(_) -> print(s"keel: $name did not load")
 
 // "keel: process <pid> exited <code>", or "keel: process <pid> killed: <why>".
-private report(p: &sync sched.Process)
+private report(p: &sync Process)
     if proc.exited(p)
         print("keel: process", proc.pid(p), "exited", proc.exit_code(p))
     else
         print(s"keel: process ${proc.pid(p)} killed: ${proc.why(p)}")
+
+// --- Preemption at EL0 ----------------------------------------------------------------------------
+//
+// One spinning process per core, which never makes a system call, then a worker that has a fixed
+// amount of work to do. The worker can run only on a core the timer took from a spinner, so its
+// finishing is the test; the spinners are then killed, which they notice at their next tick. All of
+// them check their own memory as they go, so a process resumed in another's address space ends with 3.
+
+private preempt_user()
+    val irqs_before = trap.user_irqs.load(Ordering.Acquire)
+    var spinners: Buf[&sync Process] = buf()
+    for _ in 0..<sched.cores_up()
+        proc.start(proc.spin()) match
+            Ok(p) -> spinners.push(p)
+            Err(_) -> print("keel: spin did not load")
+
+    val worker = proc.start(proc.worker()) match
+        Ok(p) -> p
+        Err(_) ->
+            print("keel: worker did not load")
+            return
+    proc.wait(worker)
+
+    for s in spinners
+        proc.kill(s)
+    var killed: u64 = 0
+    var preempted: u64 = 0
+    for s in spinners
+        proc.wait(s)
+        if proc.was_killed_by_request(s) then killed += 1 else report(s)
+        preempted += proc.preemptions(s)
+    val irqs = trap.user_irqs.load(Ordering.Acquire) - irqs_before
+
+    val worker_ok = proc.exited(worker) && proc.exit_code(worker) == 0
+    if worker_ok && killed == u64(spinners.len()) && preempted > 0 && irqs > 0
+        print("keel: preempt user ok: worker ran beside", spinners.len(), "spinners, preempted", preempted,
+            "times;", irqs, "interrupts from EL0")
+    else
+        report(worker)
+        print("keel: preempt user wrong: spinners killed", killed, "of", spinners.len(), "preempted", preempted,
+            "irqs from EL0", irqs)
+
+// --- Bad pointers ---------------------------------------------------------------------------------
+//
+// The program hands `write` four buffers it may not read, and exits 0 only if each was refused with
+// EFAULT; that the kernel is still here to print the line is the other half.
+
+private bad_pointers()
+    proc.start(proc.badptr()) match
+        Ok(p) ->
+            proc.wait(p)
+            if proc.exited(p) && proc.exit_code(p) == 0
+                print("keel: bad pointer rejected")
+            else
+                report(p)
+        Err(_) -> print("keel: badptr did not load")

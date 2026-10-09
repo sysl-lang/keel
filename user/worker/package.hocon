@@ -1,0 +1,22 @@
+// A user program that does a fixed amount of work and exits: it can finish only if the processes
+// spinning beside it are preempted.
+
+package {
+  name    = "worker"
+  version = "0.0.1"
+}
+
+dependencies {
+  rt { workspace = true }
+}
+
+codegen {
+  general_regs_only = true
+}
+
+targets {
+  aarch64-freestanding {
+    linker_script = "../user.ld"
+    entry         = "_start"
+  }
+}

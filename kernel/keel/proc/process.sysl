@@ -21,7 +21,7 @@ private var next_pid: Atomic[u64] = Atomic(1)
 start(image: []const u8) -> Result[&sync Process, LoadError]
     val l = load(image)?
     val p: &sync Process = Process(next_pid.add(1), l.space, l.heap_base, l.heap_base, Context([0; 12], 0, 0),
-        Atomic(0), 0, 0, None)
+        Atomic(0), 0, 0, None, 0)
     val raw: *Process = &*p
     val entry = l.entry
     p.thread = Some(sched.spawn(() -> run(raw, entry)))
@@ -47,7 +47,9 @@ private run(p: *Process, entry: u64)
 // Wait for the process to end, then give its address space back.
 wait(p: &sync Process)
     p.thread match
-        Some(t) -> sched.join(t)
+        Some(t) ->
+            sched.join(t)
+            p.preemptions = sched.preemptions(t)
         None -> ()
     p.thread = None
     val raw: *Process = &*p
@@ -63,6 +65,7 @@ exit_code(p: &sync Process) -> i64 = p.exit_code
 was_killed_by_request(p: &sync Process) -> bool = p.fault == KILLED
 
 why(p: &sync Process) -> string = reason(p.fault)
+preemptions(p: &sync Process) -> u64 = p.preemptions
 
 // The process the calling thread runs, or null for a kernel thread.
 private[proc] current_process() -> *Process = sched.current().process
