@@ -8,7 +8,6 @@ extern __image_start: u8
 extern __text_end: u8
 extern __rodata_end: u8
 extern __stack_guard: u8
-extern __image_end: u8
 
 // TCR_EL1 (Arm ARM D19.2.139). The `0` halves (T0SZ, EPD0, ...) are the low half, TTBR0's; the `1`
 // halves are the kernel's, TTBR1's.

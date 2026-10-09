@@ -165,6 +165,9 @@ Workaround that works (probed, not used): a field may be volatile, so wrap the w
 
 keel keeps the plain `var` and relies on the `wfi` block's memory clobber, with a comment saying so.
 
+Milestone 2: with the MMU on and RAM mapped Normal, `Atomic` works, and `keel.irq.ticks` is now an
+`Atomic[u64]`. The half about code that runs before the MMU (or with a device's memory) still stands.
+
 Clean form: `volatile` accepted on a module `var` (it is storage), or an ordering-only access in
 `sysl.sync` (a load/store that is a compiler barrier and needs no exclusive), or both.
 
@@ -304,6 +307,234 @@ the template.
 
 `print` writes integers in decimal only (`sysl.printu`), and `sysl.encoding.hex` encodes bytes, not
 an integer. A register dump is read in hex. Workaround (used): `keel.pl011.put_hex`, twelve lines.
+
+## Milestone 2: the MMU, with the kernel in the high half
+
+Findings 12-17 are against the same prerelease alpha.5 (`census-34` at `7a59452170`), found while
+writing the page tables, the boot path that runs before and after the MMU is switched on, and the
+high-half kernel. By how much each blocks: 12 (silent, wrong tables), 15 (the build stops), 13, 16,
+14, 17. None was fixed here.
+
+## 12. `@align(n)` on a struct does not reach storage: a 4 KiB-aligned table type lands anywhere
+
+Milestone 2, the translation table pool. A table is one 4 KiB page and the hardware ignores the low
+twelve bits of its address, so the type says so:
+
+    @align(4096)
+    struct Table
+        e: [512]u64
+
+    var tables: [2]Table                // module storage
+    var one: Table
+
+    @align(4096)
+    var raw: [512]u64                   // the binding form
+
+    main()
+        var local: Table
+        print(sizeof(Table), alignof(Table))
+        print(usize(&tables[0]) % 4096, usize(&tables[1]) % 4096, usize(&one) % 4096,
+              usize(&raw) % 4096, usize(&local) % 4096)
+
+prints
+
+    4096 4096
+    64 64 64 0 2272
+
+`alignof` answers 4096, and no value of the type is on that boundary: the module globals are emitted
+with no `align` at all (`@tables = private global [2 x %struct.Table] zeroinitializer`), and the stack
+slot of a local is not aligned either. Only `@align` on the binding works
+(`@raw = ... align 4096`).
+
+Spec: attributes.md § "`@align(n)` on a binding": "A boundary put on a type travels with every value
+of it ... so reach for the type when more than one thing needs the boundary." It does not travel.
+Nothing diagnoses it; a kernel built this way hands the MMU a table address with low bits set, which
+the walker silently truncates to the wrong table.
+
+Workaround (used, `keel.mm.table`): `@align(4096)` repeated on `var pool: [16]Table`, with a comment.
+`sizeof(Table)` being 4096 keeps every element aligned once the first is.
+
+Clean form: the type's alignment on every global, stack slot and heap allocation of it, as LLVM's
+`align` on the `global`/`alloca`.
+
+## 13. A function that runs before the MMU cannot know which of two addresses `&x` gives it
+
+Milestone 2, `keel_boot`. The image is linked at 0xFFFF_0000_4008_0000 and runs at 0x4008_0000 until
+the MMU is on, so the boot code must take physical addresses of linker symbols and of its own module
+storage. `&` gives it two different kinds of address, and the source cannot tell them apart:
+
+    extern __bss_start: u8              // keel.boot
+    @align(4096) private var pool: [16]Table    // keel.mm
+
+    usize(&__bss_start)                 // the LINK address: 0xFFFF_0000_4008_5000, from the GOT
+    usize(&pool[0])                     // the RUN address: 0x4008_6000 before the MMU, PC-relative
+
+The compiled code, at -O1 and -O0 alike:
+
+    keel.boot$keel_boot:
+        adrp x8, 0xffff000040084000     // the GOT's page
+        ldr  x8, [x8, #0x6f0]           // __bss_start's link address, read from the GOT
+    keel.mm$invalidate_pool:
+        adrp x8, 0xffff000040086000     // pool, PC-relative: wherever the code is running
+        add  x8, x8, #0x0
+
+An `extern` is emitted as `@__bss_start = external global i8` without `dso_local`, so even in this
+static, non-PIC link LLVM reaches it through the GOT; a module variable is `private` and reached
+PC-relative. Writing through `&__bss_start` with the MMU off faults; writing through `&pool[0]` works.
+lld can also relax an adjacent `adrp`/`ldr` GOT pair into `adrp`/`add`, which would silently turn the
+first kind into the second for whichever accesses the optimizer happens to schedule together.
+
+There is nothing to say instead: no attribute marks a function as running at an address other than
+its link address (`__attribute__((section(".idmap.text")))` plus `-fPIC` is how C kernels arrange
+it), no form asks for a symbol's link address or its run address explicitly, and no diagnostic
+notices an absolute address in code that will run before relocation.
+
+Workaround (used, `keel.mm.phys_of`): mask the top sixteen bits. The kernel's VA is its PA plus
+0xFFFF_0000_0000_0000, so `addr & 0x0000_FFFF_FFFF_FFFF` is the physical address whichever kind
+`addr` is. It works only because keel chose that layout; a kernel at, say, 0xFFFF_FFFF_8000_0000
+(Linux's kimage) could not use it.
+
+Clean form: one of `@position_independent` on a function (refuse GOT loads and absolute relocations
+inside it, and make `&extern` PC-relative), or `dso_local` on `extern` variables in a freestanding
+image, so that `&` always means "where it is now".
+
+## 14. Barriers and maintenance instructions have no spelling (`dsb`, `isb`, `tlbi`, `dc`, `at`)
+
+Milestone 2. Turning the MMU on and changing a translation table needs `dsb` (with a domain:
+`sy`, `ish`, `nsh`, `ishst`), `isb`, `tlbi vmalle1`, `dc ivac` over the tables written with the MMU
+off, and `at s1e1r` to ask the MMU what a mapping is. `sysl.sync.atomic_fence` is the one barrier sysl
+has, and it is a `dmb`: it orders accesses against accesses, not against the translation machinery.
+
+So each is a function of its own, as finding 10's registers are:
+
+    flush_tlb()
+        asm
+            [aarch64]
+                "dsb ishst"
+                "tlbi vmalle1"
+                "dsb nsh"
+                "isb"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+Milestone 2 added fourteen such functions to `keel.cpu` (107 lines of sysl around 21 instructions):
+eight system registers (MAIR, TCR read and write, TTBR0, TTBR1, SCTLR read and write, ID_AA64MMFR0,
+CTR_EL0, PAR_EL1 via `at`) and five barriers or maintenance operations.
+
+Not a blocker. Clean form: clang's `__builtin_arm_dsb(n)`, `__builtin_arm_isb(n)` are intrinsics with
+a domain argument; with finding 10's register intrinsic, a module like `keel.cpu` would be a list of
+one-line functions. `tlbi`/`dc`/`at` take an operand and have no intrinsic in clang either, so an asm
+template that may name a constant would cover them.
+
+## 15. A module `val` holding any enum variant but the first is emitted as IR clang refuses
+
+Milestone 2, the protection a mapping is made with. Shortest input:
+
+    enum Wide
+        A
+        B
+
+    struct P2
+        w: Wide
+
+    val W: P2 = P2(B)
+
+    main()
+        print(Wide::Image(W.w))
+
+    sysl: error: clang failed (exit 1):
+    ...ll:475:40: error: constant expression type mismatch
+      475 | @W = private constant %struct.P2 { i32 { i32 1, [0 x i8] zeroinitializer } }
+
+The enum's discriminant is written as if it were a data enum's `{ tag, payload }` in a slot whose type
+is the bare integer. It is the same with an underlying type (`enum Access: u2`,
+`val BARE: Access = Ro` gives `@BARE = private constant i2 { i32 2, [0 x i8] zeroinitializer }`), with
+the enum bare or inside a struct, and only for a non-zero discriminant (the first variant is a
+`zeroinitializer`, which is why `Normal` alone would have passed).
+
+Spec: a constructor over literals is a module `val` that folds into the image (a freestanding image
+depends on it, having no initializer to run); nothing says an enum value is an exception.
+
+Workaround (used, `keel.mm.desc`): `ram_rw()`, `text()`, `device()` and the rest are functions
+returning the `Prot` rather than module `val`s.
+
+## 16. A bitfield struct may not contain a bitfield struct, so a descriptor's attribute group is written out in every descriptor
+
+Milestone 2, the descriptors. A block and a page descriptor (and, later, a stage 2 descriptor) share
+the same lower-attribute field group, bits [11:2], and the same upper group, [63:50]. The natural form
+names the group once:
+
+    @packed
+    struct Lower
+        attr: u3
+        ns: u1
+        ap: u2
+        sh: u2
+        af: u1
+        ng: u1
+
+    @packed
+    struct Desc
+        valid: u1
+        page: u1
+        lower: Lower
+        oa: u36
+        rest: u16
+
+    error: 'Desc.lower' is Lower, and 'Desc' is '@packed' with a field narrower than a byte — so it is
+    one integer, and every field of it has to be one too. Put the narrow fields in a '@packed' struct
+    of their own and hold that here: it lays out identically and leaves Lower what it is
+
+`Lower` is itself one integer (ten bits), which is what the rule asks of a field. The advice
+describes what was written.
+
+Spec: attributes.md § "Bitfields": "**Nesting is the composition path** ... a bitfield struct is a
+leaf, and an ordinary `@packed` struct lays one out as a field of its size" — whole bytes, so a ten-bit
+group at bit 2 has no spelling.
+
+Workaround (used): one `LeafDesc` for both blocks and pages (they share a layout and differ in bit 1),
+its seventeen fields written out; a stage 2 descriptor will repeat them again.
+
+Clean form: a bitfield struct allowed as a field of a bitfield struct, occupying its own bit width.
+The diagnostic should say that a bitfield struct cannot be nested, rather than advising what was done.
+
+## 17. A distinct address type is spellable, but it is an integer with every integer operation (minor)
+
+Milestone 2, `keel.mm.PhysAddr` and `VirtAddr`. `type PhysAddr = new u64` does what was wanted
+first: a `PhysAddr` will not pass where a `VirtAddr` or a `u64` is wanted, and `new u36` works as a
+bitfield field (`Frame`, the descriptor's output address). Three rough edges:
+
+- `PhysAddr * PhysAddr`, `PhysAddr + PhysAddr` and the rest are inherited and cannot be taken away
+  (errors.md § "A derivation inherits its base's behaviour and may replace none of it").
+- An offset is `impl Add[u64] for PhysAddr`, which is allowed, but a literal does not take the
+  extension's type: `p + 4096` is refused with `'+' needs matching types, got PhysAddr and int`, so
+  every call site writes `p + u64(4096)`.
+- A derived type has no inherent methods (`impl PhysAddr` is `'for' expected`), so the conversions
+  are free functions, `to_virt(p)` rather than `p.to_virt()`.
+
+A struct with one field would control all three, and would then not be a bitfield field. Not a
+blocker. Clean form: a literal infers from the one `Add` argument a derived type has beyond its base,
+and an inherent `impl` block for a derived type.
+
+## What worked in milestone 2
+
+- Page tables entirely in sysl: `TableDesc`, `LeafDesc`, `Tcr`, `Sctlr`, `Ttbr` and `Par` are
+  `@packed` bitfield structs with `@assert(sizeof(...) == 8)`, and enum-valued fields (`MemAttr: u3`,
+  `Access: u2`, `Shareability: u2`, `Cacheability`, `Granule0`/`Granule1`) are written by name. Two
+  enums with variants of the same name (`Granule0.Kb4 = 0`, `Granule1.Kb4 = 2`) resolve by the field's
+  type in a constructor. Finding 8's round trip through memory is two generic functions,
+  `cpu.to_word[T]` and `cpu.from_word[T]`, with the size `@assert`ed per instantiation.
+- `type Frame = new u36` as a bitfield field: the output address is a frame number that cannot be
+  confused with an address.
+- The boot path is one sysl call: `_start` sets a physical stack, `bl keel_boot`, adds the answer to
+  SP and branches to `kmain`'s link address (7 instructions; milestone 1 had 4). Everything before
+  the switch, including the table walk and the pool, is ordinary sysl that happens to compile to
+  PC-relative code — at -O1 and -O0, under HVF and TCG.
+- A linker script with `AT()` per section: QEMU loads by physical address and adjusts the ELF entry
+  point to `_start`'s physical address by itself.
+- `sysl.sync.Atomic` with the MMU on: `ticks.add(1, Relaxed)` is an `ldxr`/`stxr` loop on Normal
+  memory and works (finding 6's fault is gone). The trap handler's probe flags are atomics too.
+- A data abort the handler steps over: `*volatile u64` from `ptr_cast` is one `ldr`, so `elr += 4`
+  resumes after it.
 
 ## What worked in milestone 1
 
