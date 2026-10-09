@@ -2176,6 +2176,102 @@ Workaround (used, 8 lines): `ls`'s `padded(text, width)` appends spaces in a loo
 Clean form: lower `%s` with a width, a precision or `-` through `display_str`/`display_pad` on every
 target, as `%d` already is, so `%-6s` means the same with or without a C library.
 
+## Milestone 13: shell plumbing
+
+## 65. `sysl.env` has no hook layer, so a target with no C library can supply an environment only by impersonating libc
+
+Milestone 13, `/bin/env` and the shell's starting variables. `sysl.fs`, `sysl.io` and `sysl.process`
+each reach the system through a `*.sys` module of hooks a freestanding program answers with
+`@export`s (`sysl_fs_*`, `sysl_io_*`, `sysl_proc_*`). `sysl.env` does not: it names C's own
+`extern "getenv"` and `extern environ: **u8` directly.
+
+    import rt.keel.user
+    import sysl.env
+
+    for (name, value) in env.vars()
+        print(s"$name=$value")
+
+    $ sysl build --target aarch64-freestanding -o env.elf user/env
+    ld.lld: error: undefined symbol: environ
+    >>> referenced by env.elf.ll ... (sysl.env$vars)
+    ld.lld: error: undefined symbol: getenv
+    >>> referenced by sysl.code.o.ll ... (sysl.env$raw)
+
+Nothing refuses it before the link — keel's manifests take no capability away, so `os` (the module's
+`@requires`) and `posix` (`vars`'s `@needs`) count as provided — and the link error names libc's
+symbols rather than a hook the program owes. `sysl.process.sys`'s header promises the opposite for
+its own hooks ("refused when it is compiled, naming the hooks it reached").
+
+Workaround (used, ~35 lines in `user/rt`): the runtime defines libc's two names itself — `getenv` as
+an `@export`ed sysl function walking the vector, and `environ` as a `.data` word in a top-level `asm`
+block (module storage cannot be `@export`ed: finding 57), set by `keel_user_start` to the vector the
+kernel lays after argv. keel.fsys reads the same vector (`user.environment()`) to build a child's
+environment for `sysl_proc_spawn`.
+
+Clean form: a `sysl.env.sys` hook pair in the house style — `sysl_env_count() -> isize` and
+`sysl_env_entry(i, into, room, got) -> int` (text as pointer and length, never a C string) — answered
+by `getenv`/`environ` on a hosted target and by an `@export` on a freestanding one.
+
+## 66. `sysl.process` cannot build a pipeline: no standard input for a child, no pipe, and no start that neither waits nor captures
+
+Milestone 13, the shell's `a | b | c` and `< file`. `Stdio` exists for the two output streams only,
+and `begun` hands the hook `stdin_fd = -1` unconditionally, so no call can give a child a standard
+input:
+
+    val f = fs.open("/etc/group").unwrap()
+    print(process.run("/usr/bin/wc", ["-l"], stdin = Stdio.ToFile(f)))
+
+    $ sysl build -o p main.sysl
+    error: function 'sysl.process.run' declares no parameter named 'stdin' — it takes 'program',
+    'args', 'dir', 'env', 'timeout', 'inherit_env', 'stdout' and 'stderr'
+
+The other two halves of a pipeline are missing as well: nothing in `sysl.fs`, `sysl.io` or
+`sysl.process` makes a pipe (a grep of the 7e2a32d3 library for a `pipe` function finds none), and
+`run` waits while `start` always redirects the child's standard output into a temporary file — the
+module's own header explains why (a pipe between a waiting parent and a child can deadlock), which
+is right for `capture` and is exactly what a pipeline wants instead: every stage started, sharing
+pipes, then every stage waited for.
+
+The hook already carries everything needed — `sysl_proc_spawn` takes `stdin_fd`, `stdout_fd` and
+`stderr_fd` — and keel.fsys now honours all three and the environment. Only the library above it
+cannot ask.
+
+Workaround (used, ~70 lines of `sh`): a single command without `<` still runs through
+`process.run(…, env = …, stdout = ToFile(f))`; a pipeline, or a `<`, runs through keel's own calls in
+the user runtime — `user.pipe()`, `user.spawn(path, args, stdin =, stdout =, env =)`, `user.wait(pid)`,
+`user.close(fd)` — with the shell closing its copy of every pipe end once the stage that needs it has
+its own.
+
+Clean form: `stdin: Stdio = Inherit` beside `stdout`/`stderr` (with a `FromFile`/`FromPath`
+reading), a `sysl.process.pipe() -> Result[(File, File), IoError]` over a `sysl_proc_pipe` hook, and a
+`spawn(program, args, …, stdin, stdout, stderr) -> Result[&Child, IoError]` whose `wait` answers a
+`Status` without reading any file — the shape `posix_spawn` with file actions and Rust's
+`Command::spawn` both have.
+
+## What worked in milestone 13
+
+- **The descriptor table generalised with one enum**: `keel.sched.Holds` (`Free` first, so a zeroed
+  descriptor is free; `Console`, `File`, `PipeRead`, `PipeWrite`) is a field of the `OpenFile` that
+  was already there, and `match f.holds` in `descriptors.sysl` is the whole dispatch for read, write,
+  close, dup2, dup and a child's copy. keel.fs only lost code (its `close`, `close_all`, `inherit`).
+- **A pipe is 20 lines on milestone 4's primitives**: one `IrqLock` for the table and two
+  `WaitQueue`s per pipe, zero-filled module storage needing no initializer (the trap of finding 31
+  does not arise).
+- **A `&sync` box refuses a `Buf` field and refuses a slice of an array inside it**, each with a
+  message that says what to do instead ("Read it by index, or walk it with 'for'"); the environment
+  became a boxed fixed array read by index. Both refusals are the design working.
+- **A kernel stack is 16 KiB, and -O0 is what finds the edge**: the first spawn with a 1 KiB
+  environment inline in `Process` overflowed into the guard page (a trap frame pushed at
+  `far=0xffff004000018000`, the boot never finishing) under `KEEL_OPT=-O0` only. `llvm-objdump`'s
+  `sub sp` per function measured it (`start_loaded` 4,368 bytes at -O0 against 3,104 on dev); boxing
+  the environment and splitting the SpawnAttr reading into its own function brought it back.
+- **Every hook argument `sysl_proc_spawn` takes is now honoured but `dir`**, so the shell's single
+  commands carry their environment through `sysl.process` unchanged; `env > file` then `grep` checks
+  that path, `env | grep` the raw one.
+- Controls: a pipe read that waits while the pipe is empty even with no writer left — `files` hangs
+  at its end-of-input check and the boot times out; `dup2` putting the copy at the lowest free
+  descriptor instead of its target — `user: FAILED: dup2 did not answer its target`.
+
 ## What worked in milestone 12
 
 - **The permission model is 30 lines** (`kernel/keel/fs/perm.sysl`): one `permits(inode, cred, want)`
