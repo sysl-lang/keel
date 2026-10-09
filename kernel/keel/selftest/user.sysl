@@ -22,6 +22,7 @@ user()
     run_one("fault", proc.fault())          // pid 2: reads kernel memory, is killed
     preempt_user()
     bad_pointers()
+    arguments()
 
     // Every frame the processes took — pages, tables, roots — and every ASID came back.
     val frames_after = mm.frames_free()
@@ -38,6 +39,24 @@ private run_one(name: string, image: []const u8)
             proc.wait(p)
             report(p)
         Err(_) -> print(s"keel: $name did not load")
+
+// A program started with arguments gets them: `echo` prints "user: echo one two" — and a second
+// start, whose arguments do not fit the room at the top of the stack, is refused before it runs.
+private arguments()
+    proc.start_with(proc.echo(), ["echo", "one", "two"]) match
+        Ok(p) ->
+            proc.wait(p)
+            if !proc.exited(p) || proc.exit_code(p) != 0 then report(p)
+        Err(_) -> print("keel: echo did not load")
+    var many: Buf[string] = buf()
+    for _ in 0..<600
+        many.push("argument")
+    proc.start_with(proc.echo(), many.view()) match
+        Ok(p) ->
+            proc.wait(p)
+            print("keel: 600 arguments were not refused")
+        Err(proc.TooManyArgs) -> print("keel: argv ok")
+        Err(_) -> print("keel: 600 arguments: the wrong refusal")
 
 // "keel: process <pid> exited <code>", or "keel: process <pid> killed: <why>".
 private report(p: &sync Process)

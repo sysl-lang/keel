@@ -1,0 +1,12 @@
+// What the standard library's `sysl.fs` asks of the system under it (`sysl.fs.sys`'s hooks), answered
+// over keel's system calls. A program that uses `sysl.fs` depends on this and imports it.
+
+package {
+  name    = "fsys"
+  version = "0.0.1"
+}
+
+dependencies {
+  abi { workspace = true }
+  rt { workspace = true }
+}

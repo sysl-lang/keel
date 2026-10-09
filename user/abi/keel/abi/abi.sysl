@@ -24,6 +24,15 @@ const SYS_UNLINK: u64 = 13      // unlink(path, path_len) -> 0: a file
 const SYS_RMDIR: u64 = 14       // rmdir(path, path_len) -> 0: an empty directory
 const SYS_RENAME: u64 = 15      // rename(from, from_len, to, to_len) -> 0
 const SYS_SYNC: u64 = 16        // sync() -> 0: every changed block is on the disk when it returns
+const SYS_GETCWD: u64 = 17      // getcwd(buf, len) -> bytes of the current directory's path; ERANGE if it does not fit
+const SYS_CHDIR: u64 = 18       // chdir(path, path_len) -> 0
+const SYS_TRUNCATE: u64 = 19    // truncate(path, path_len, length) -> 0: cut to `length`, or grown with zeros
+const SYS_FTRUNCATE: u64 = 20   // ftruncate(fd, length) -> 0: the same, through a descriptor open for writing
+const SYS_ACCESS: u64 = 21      // access(path, path_len, how) -> 0 if the path is there (keel has no permissions)
+
+// A path that does not begin with `/` is taken from the process's current directory, which starts at
+// `/`. A process starts with its arguments on its stack, as Linux lays them out: SP points at argc (a
+// u64), then argc pointers to NUL-terminated strings, then a zero.
 
 // Descriptors 0 to 2 are the console: 1 and 2 write to the UART, 0 reads nothing yet. A file opened
 // gets the lowest free descriptor from 3 up.
@@ -88,6 +97,7 @@ enum Errno: i64
     EMFILE = 24                 // every descriptor is in use
     EFBIG = 27                  // past the largest file the filesystem holds
     ENOSPC = 28                 // no free block or inode
+    ERANGE = 34                 // a result does not fit the buffer it was asked into
     ENAMETOOLONG = 36
     ENOSYS = 38                 // no such system call
     ENOTEMPTY = 39

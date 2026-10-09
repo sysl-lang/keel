@@ -55,6 +55,8 @@ before_user_line=(
     "keel: process 2 killed: permission fault"   # a program reading kernel memory is killed, alone
     "keel: preempt user ok" # one spinner per core never yields; a worker still ran, and each was preempted
     "keel: bad pointer rejected"   # write() with four bad buffers answered EFAULT, and the kernel lives
+    "user: echo one two"    # a program started with arguments got them, through sysl's main(args)
+    "keel: argv ok"         # ...and 600 of them, more than fit at the top of the stack, were refused
     "keel: processes reclaimed"    # every frame, table and ASID the processes had came back
     "keel: virtio-blk found, capacity 8192 sectors"   # the 4 MiB image, found in a virtio-mmio slot
     "keel: disk read ok"    # sector 1 read back the bytes this script put there
@@ -76,7 +78,7 @@ after_user_line=(
 # in the `files` program failed.
 not_expected=("keel: bounds failure was not fatal" "user: FAILED")
 
-user_programs=(hello fault spin worker badptr files fsload)
+user_programs=(hello fault spin worker badptr files fsload echo)
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
 frames_min=65000

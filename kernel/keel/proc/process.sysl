@@ -18,18 +18,59 @@ import sysl.sync.{Atomic, Ordering}
 
 private var next_pid: Atomic[u64] = Atomic(1)
 
-// Load `image` and start it running. The process gets the next pid.
-start(image: []const u8) -> Result[&sync Process, LoadError]
-    val l = load(image)?
+// Load `image` and start it running with no arguments. The process gets the next pid.
+start(image: []const u8) -> Result[&sync Process, LoadError] = start_with(image, [])
+
+// Load `image` and start it running with `args` — its argv, the program's name first by convention.
+start_with(image: []const u8, args: []const string) -> Result[&sync Process, LoadError]
+    var l = load(image)?
+    val sp = lay_out_args(&l.space, args) match
+        Some(sp) -> sp
+        None ->
+            mm.free_space(&l.space)
+            return Err(TooManyArgs)
     val p: &sync Process = Process(next_pid.add(1), l.space, l.heap_base, l.heap_base, Context([0; 12], 0, 0),
-        Atomic(0), 0, 0, None, 0, sched.no_files())
+        Atomic(0), 0, 0, None, 0, sched.no_files(), sched.root_dir(), 1)
     val raw: *Process = &*p
     val entry = l.entry
-    p.thread = Some(sched.spawn(() -> run(raw, entry)))
+    p.thread = Some(sched.spawn(() -> run(raw, entry, sp)))
     Ok(p)
 
+// The most a process's arguments may take at the top of its stack, strings and vector together.
+private const ARGS_ROOM: u64 = 4096
+
+// Write `args` at the top of the new process's stack, Linux's way: the strings, each with a NUL after
+// it, at the very top; below them, 16-aligned, argc and then the argc pointers and a zero. Answers the
+// stack pointer the program starts with, which points at argc; None if they do not fit ARGS_ROOM.
+private lay_out_args(space: *mm.Space, args: []const string) -> Option[u64]
+    var strings: u64 = 0
+    for a in args
+        strings += u64(a.bytes.len) + 1
+    val vector = (u64(args.len) + 2) * 8
+    if strings + vector + 16 > ARGS_ROOM then return None
+
+    val text_at = mm.USER_STACK_TOP - strings
+    val sp = (text_at - vector) & ~u64(15)
+    var at = text_at
+    var slot = sp
+    if !put_word(space, slot, u64(args.len)) then return None
+    for a in args
+        slot += 8
+        if !put_word(space, slot, at) then return None
+        if !mm.copy_to_user(space, at, a.bytes) then return None
+        if !mm.copy_to_user(space, at + u64(a.bytes.len), [u8(0)]) then return None
+        at += u64(a.bytes.len) + 1
+    if !put_word(space, slot + 8, 0) then return None
+    Some(sp)
+
+private put_word(space: *mm.Space, va: u64, w: u64) -> bool
+    var bytes: [8]u8 = [0; 8]
+    for i in 0..<8
+        bytes[i] = u8((w >> u64(8 * i)) & 0xff)
+    mm.copy_to_user(space, va, bytes[..])
+
 // The process's thread: switch to its address space and enter it; come back when it is over.
-private run(p: *Process, entry: u64)
+private run(p: *Process, entry: u64, sp: u64)
     val t = sched.current()
     val flags = cpu.irq_save()
     t.process = p
@@ -37,7 +78,7 @@ private run(p: *Process, entry: u64)
     sched.load_ttbr0(t.ttbr0)
     cpu.irq_restore(flags)
 
-    val _ = enter_user(&p.kernel, entry, mm.USER_STACK_TOP, 0)
+    val _ = enter_user(&p.kernel, entry, sp, 0)
 
     // Back from `keel_leave_user`, with IRQs masked as the exception left them.
     t.process = null

@@ -1,0 +1,227 @@
+module keel.fsys
+
+// `sysl.fs` on keel: the twenty-five hooks `sysl.fs.sys` declares, each `@export`ed under the name the
+// standard library calls and answered with keel's system calls (keel.abi).
+//
+// A hook answers 0, or the code of the `IoError` the call failed with; `status` is the one place a
+// kernel's error number becomes such a code. Paths cross as they arrive — a pointer and a length is
+// what both sysl.fs and keel's calls take — and so does a descriptor. What keel has no call for
+// (permissions, links, a temporary directory) answers `UNSUPPORTED`, which `sysl.fs` reports as "not
+// supported on this target".
+
+import abi.keel.abi.{EBADF, EEXIST, EISDIR, EMFILE, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, Errno, KIND_DIR,
+    O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, SYS_ACCESS, SYS_CHDIR, SYS_CLOSE, SYS_FSTAT,
+    SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR,
+    SYS_STAT, SYS_TRUNCATE, SYS_UNLINK, SYS_WRITE}
+import rt.keel.user.syscall
+import sysl.fs.IoError
+import sysl.fs.sys as fsys
+
+// --- Errors ----------------------------------------------------------------------------------------
+
+// The code `sysl.fs` hears for a call it cannot have here; no error number is negative.
+private const UNSUPPORTED: int = -1
+
+// A system call's answer as a hook's status: 0 for a result, or the `IoError` code of the error. keel's
+// numbers are Linux's, which `IoError`'s named cases were recognised from, but the table is written out
+// rather than passed through: a number the cases do not name goes over as `Other`, and ENOSYS — a call
+// this kernel does not have — is "unsupported", which is what it means to a program.
+private status(r: i64) -> int
+    if r >= 0 then return 0
+    Errno.try(-r) match
+        Some(e) -> code_of(e)
+        None -> IoError.Other(int(-r)).code()
+
+private code_of(e: Errno) -> int = e match
+    ENOENT -> IoError.NotFound.code()
+    EEXIST -> IoError.AlreadyExists.code()
+    ENOTDIR -> IoError.NotADirectory.code()
+    EISDIR -> IoError.IsADirectory.code()
+    ENOTEMPTY -> IoError.DirectoryNotEmpty.code()
+    EMFILE -> IoError.TooManyOpenFiles.code()
+    ENOSPC -> IoError.NoSpaceLeft.code()
+    EBADF -> IoError.NotOpen.code()
+    ENOSYS -> UNSUPPORTED
+    else IoError.Other(int(i64(e))).code()
+
+// --- Descriptors -----------------------------------------------------------------------------------
+
+private addr(p: *u8) -> u64 = u64(usize(p))
+
+// `sysl.fs`'s `open_*` bits as keel's (Linux's) `O_*` flags. The permission bits a new file asks for
+// are not passed: keel gives every new file 0o644.
+private open_flags(flags: u32) -> u64
+    val read = (flags & fsys.open_read) != 0
+    val write = (flags & fsys.open_write) != 0
+    var o = if read && write then O_RDWR elif write then O_WRONLY else O_RDONLY
+    if (flags & fsys.open_create) != 0 then o = o | O_CREAT
+    if (flags & fsys.open_truncate) != 0 then o = o | O_TRUNC
+    if (flags & fsys.open_append) != 0 then o = o | O_APPEND
+    o
+
+@export("sysl_fs_open")
+open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int
+    val r = syscall(SYS_OPEN, addr(path), u64(len), open_flags(flags), 0)
+    if r >= 0 then *fd = int(r)
+    status(r)
+
+@export("sysl_fs_read")
+read(fd: int, into: *u8, room: usize, got: *usize) -> int
+    val r = syscall(SYS_READ, u64(fd), addr(into), u64(room), 0)
+    if r >= 0 then *got = usize(r)
+    status(r)
+
+@export("sysl_fs_write")
+write(fd: int, from: *u8, len: usize, put: *usize) -> int
+    val r = syscall(SYS_WRITE, u64(fd), addr(from), u64(len), 0)
+    if r >= 0 then *put = usize(r)
+    status(r)
+
+@export("sysl_fs_close")
+close(fd: int) -> int = status(syscall(SYS_CLOSE, u64(fd), 0, 0, 0))
+
+// `seek_*` are POSIX's 0, 1 and 2, and so are keel's SEEK_*.
+@export("sysl_fs_seek")
+seek(fd: int, offset: long, whence: int, at: *long) -> int
+    val r = syscall(SYS_LSEEK, u64(fd), u64(offset), u64(whence), 0)
+    if r >= 0 then *at = long(r)
+    status(r)
+
+@export("sysl_fs_fstat")
+fstat(fd: int, out: *fsys.Stat) -> int
+    var s = Stat(0, 0, 0, 0, 0)
+    val r = syscall(SYS_FSTAT, u64(fd), u64(usize(&s)), 0, 0)
+    if r >= 0 then *out = converted(s)
+    status(r)
+
+@export("sysl_fs_ftruncate")
+ftruncate(fd: int, length: long) -> int = status(syscall(SYS_FTRUNCATE, u64(fd), u64(length), 0, 0))
+
+// keel's 24-byte `Stat` as `sysl.fs`'s thirteen numbers: the kind goes into the top bits of `mode`, as
+// POSIX encodes it; keel keeps no owners, devices or times, so those stay zero.
+private converted(s: Stat) -> fsys.Stat
+    val kind: long = if s.kind == KIND_DIR then 0o040000 else 0o100000
+    fsys.Stat(long(s.size), kind | long(s.mode & 0o7777), long(s.links), 0, 0, long(s.ino), 0, 0, 0, 0, 0, 0, 0)
+
+// --- Paths -----------------------------------------------------------------------------------------
+
+// keel has no symbolic links, so `follow` changes nothing.
+@export("sysl_fs_stat")
+stat(path: *u8, len: usize, follow: int, out: *fsys.Stat) -> int
+    var s = Stat(0, 0, 0, 0, 0)
+    val r = syscall(SYS_STAT, addr(path), u64(len), u64(usize(&s)), 0)
+    if r >= 0 then *out = converted(s)
+    status(r)
+
+@export("sysl_fs_truncate")
+truncate(path: *u8, len: usize, length: long) -> int =
+    status(syscall(SYS_TRUNCATE, addr(path), u64(len), u64(length), 0))
+
+@export("sysl_fs_mkdir")
+mkdir(path: *u8, len: usize, mode: u32) -> int = status(syscall(SYS_MKDIR, addr(path), u64(len), 0, 0))
+
+@export("sysl_fs_rmdir")
+rmdir(path: *u8, len: usize) -> int = status(syscall(SYS_RMDIR, addr(path), u64(len), 0, 0))
+
+@export("sysl_fs_unlink")
+unlink(path: *u8, len: usize) -> int = status(syscall(SYS_UNLINK, addr(path), u64(len), 0, 0))
+
+@export("sysl_fs_rename")
+rename(from: *u8, from_len: usize, to: *u8, to_len: usize) -> int =
+    status(syscall(SYS_RENAME, addr(from), u64(from_len), addr(to), u64(to_len)))
+
+@export("sysl_fs_access")
+access(path: *u8, len: usize, how: int) -> int = status(syscall(SYS_ACCESS, addr(path), u64(len), u64(how), 0))
+
+@export("sysl_fs_chmod")
+chmod(path: *u8, len: usize, mode: u32) -> int = UNSUPPORTED
+
+// --- Directories -----------------------------------------------------------------------------------
+
+// An open directory: its descriptor, and the whole `Dirent` records the last `getdents` handed back,
+// taken one at a time. A stream is a slot of a fixed table, and the `usize` sysl.fs holds is the slot's
+// number plus one, so zero is never a stream.
+private struct Stream
+    fd: u64                     // 0 for a free slot: descriptor 0 is the console, never a directory
+    held: usize                 // bytes of records in `records`
+    at: usize                   // the next record's offset
+    records: [RECORDS]u8
+
+private const STREAMS: usize = 8
+private const RECORDS: usize = 512              // 16 records of keel.abi's 32-byte `Dirent`
+private const RECORD: usize = 32
+private const NAME_AT: usize = 8                // a `Dirent`'s `name`; its length is the byte at 4
+
+private var streams: [STREAMS]Stream
+
+@export("sysl_fs_opendir")
+opendir(path: *u8, len: usize, dir: *usize) -> int
+    var slot: usize = 0
+    while slot < STREAMS && streams[slot].fd != 0
+        slot += 1
+    if slot == STREAMS then return IoError.TooManyOpenFiles.code()
+    val fd = syscall(SYS_OPEN, addr(path), u64(len), O_RDONLY, 0)
+    if fd < 0 then return status(fd)
+    var s = Stat(0, 0, 0, 0, 0)
+    val r = syscall(SYS_FSTAT, u64(fd), u64(usize(&s)), 0, 0)
+    if r < 0 || s.kind != KIND_DIR
+        val _ = syscall(SYS_CLOSE, u64(fd), 0, 0, 0)
+        return if r < 0 then status(r) else IoError.NotADirectory.code()
+    streams[slot].fd = u64(fd)
+    streams[slot].held = 0
+    streams[slot].at = 0
+    *dir = slot + 1
+    0
+
+@export("sysl_fs_readdir")
+readdir(dir: usize, into: *u8, room: usize, got: *usize) -> int
+    if dir == 0 || dir > STREAMS || streams[dir - 1].fd == 0 then return IoError.NotOpen.code()
+    val s = &streams[dir - 1]
+    if s.at >= s.held
+        val r = syscall(SYS_GETDENTS, s.fd, u64(usize(&s.records[0])), u64(RECORDS), 0)
+        if r < 0 then return status(r)
+        s.held = usize(r)
+        s.at = 0
+        if r == 0
+            *got = 0
+            return 0
+    val n = usize(s.records[s.at + 4])
+    val take = if n < room then n else room
+    for i in 0..<take
+        into[i] = s.records[s.at + NAME_AT + i]
+    s.at += RECORD
+    *got = take
+    0
+
+@export("sysl_fs_closedir")
+closedir(dir: usize) -> int
+    if dir == 0 || dir > STREAMS || streams[dir - 1].fd == 0 then return IoError.NotOpen.code()
+    val fd = streams[dir - 1].fd
+    streams[dir - 1].fd = 0
+    status(syscall(SYS_CLOSE, fd, 0, 0, 0))
+
+@export("sysl_fs_getcwd")
+getcwd(into: *u8, room: usize, got: *usize) -> int
+    val r = syscall(SYS_GETCWD, addr(into), u64(room), 0, 0)
+    if r >= 0 then *got = usize(r)
+    status(r)
+
+@export("sysl_fs_chdir")
+chdir(path: *u8, len: usize) -> int = status(syscall(SYS_CHDIR, addr(path), u64(len), 0, 0))
+
+@export("sysl_fs_temp_dir")
+temp_dir(prefix: *u8, len: usize, into: *u8, room: usize, got: *usize) -> int = UNSUPPORTED
+
+// --- Links: keel has none ----------------------------------------------------------------------------
+
+@export("sysl_fs_symlink")
+symlink(target: *u8, target_len: usize, link: *u8, link_len: usize) -> int = UNSUPPORTED
+
+@export("sysl_fs_link")
+link(existing: *u8, existing_len: usize, fresh: *u8, fresh_len: usize) -> int = UNSUPPORTED
+
+@export("sysl_fs_readlink")
+readlink(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> int = UNSUPPORTED
+
+@export("sysl_fs_realpath")
+realpath(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> int = UNSUPPORTED

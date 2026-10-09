@@ -2,9 +2,11 @@ module keel.user
 
 // A user program's runtime on keel.
 //
-// The kernel enters a program at `_start`, at EL0, with SP_EL0 at the top of the stack it mapped and
-// every other register zero. `_start` calls the program — sysl's `main`, which fills the module storage
-// and runs the entry file's statements — and ends the process with whatever `main` answered.
+// The kernel enters a program at `_start`, at EL0, with SP_EL0 pointing at its arguments (keel.abi has
+// the layout: argc, then argv) and every other register zero. `_start` calls the program with C's pair
+// — sysl's `main`, which fills the module storage and then either runs the entry file's statements or,
+// for a `main(args: []string)`, turns the pair into the slice and calls it — and ends the process with
+// whatever `main` answered.
 
 import abi.keel.abi.{Errno, STDOUT, SYS_BRK, SYS_CLOSE, SYS_EXIT, SYS_FSTAT, SYS_GETDENTS, SYS_GETPID, SYS_LSEEK,
     SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_STAT, SYS_SYNC, SYS_UNLINK, SYS_WRITE, Stat}
@@ -15,6 +17,8 @@ asm
     [aarch64]
         ".globl _start"
         "_start:"
+        "ldr x0, [sp]"
+        "add x1, sp, #8"
         "bl main"
         "bl keel_user_finish"
         "brk #0"
@@ -140,6 +144,11 @@ rename(from: string, to: string) -> Result[unit, Errno] =
     done(call(SYS_RENAME, addr(from.bytes), len(from.bytes), addr(to.bytes), len(to.bytes)))
 
 sync() -> Result[unit, Errno] = done(call(SYS_SYNC, 0, 0, 0, 0))
+
+// A system call of up to four arguments, its answer exactly as the kernel gave it: the result, or a
+// negative error number. For a caller that turns the number into something of its own (keel.fsys
+// turns it into an `IoError`'s code).
+syscall(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 = call(nr, a0, a1, a2, a3)
 
 // Write a string to standard output, all of it unless the kernel refuses.
 put(s: string) -> i64 = write_bytes(STDOUT, s.bytes)

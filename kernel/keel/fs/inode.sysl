@@ -160,14 +160,51 @@ private[fs] write_bytes(st: *State, i: *Inode, offset: u64, src: []const u8) -> 
 
 // Give back every block the file holds and make it empty. The caller writes the inode back.
 private[fs] truncate(st: *State, i: *Inode) -> Result[unit, Errno]
-    for n in 0..<NDIRECT
+    free_from(st, i, 0)?
+    i.size = 0
+    Ok(())
+
+// The file cut to `length` bytes, or grown to it with zeroed blocks — `truncate(2)`. The bytes of the
+// last block past the end of the file are kept zero, so growing a file again reads zeros there. The
+// caller writes the inode back.
+private[fs] resize(st: *State, i: *Inode, length: u64) -> Result[unit, Errno]
+    val bs = u64(BLOCK_SIZE)
+    val keep = (length + bs - 1) / bs
+    if keep > ondisk.MAX_FILE_BLOCKS then return Err(EFBIG)
+    val had = usize((i.size + bs - 1) / bs)
+    if length >= i.size
+        for n in had..<usize(keep)
+            block_of(st, i, n, true) match
+                Ok(_) -> ()
+                Err(e) ->
+                    free_from(st, i, had)?
+                    return Err(e)
+        i.size = length
+        return Ok(())
+    val tail = usize(length % bs)
+    if tail != 0
+        val b = block_of(st, i, usize(keep) - 1, false)?
+        val slot = get(st, b)?
+        var data = bytes(st, slot)
+        for k in tail..<BLOCK_SIZE
+            data[k] = 0
+        mark_dirty(st, slot)
+        put(st, slot)
+    free_from(st, i, usize(keep))?
+    i.size = length
+    Ok(())
+
+// Give back the file's blocks from block `keep` on, and its indirect block once nothing is in it.
+private free_from(st: *State, i: *Inode, keep: usize) -> Result[unit, Errno]
+    for n in keep..<NDIRECT
         if i.direct[n] != 0
             free_block(st, i.direct[n])?
             i.direct[n] = 0
     if i.indirect != 0
+        val first = if keep > NDIRECT then keep - NDIRECT else 0
         val slot = get(st, i.indirect)?
         val table = bytes(st, slot)
-        for n in 0..<NINDIRECT
+        for n in first..<NINDIRECT
             val entry: *u32 = ondisk.at(table, n * 4)
             if *entry != 0
                 free_block(st, *entry) match
@@ -175,8 +212,10 @@ private[fs] truncate(st: *State, i: *Inode) -> Result[unit, Errno]
                     Err(e) ->
                         put(st, slot)
                         return Err(e)
+                *entry = 0
+                mark_dirty(st, slot)
         put(st, slot)
-        free_block(st, i.indirect)?
-        i.indirect = 0
-    i.size = 0
+        if first == 0
+            free_block(st, i.indirect)?
+            i.indirect = 0
     Ok(())

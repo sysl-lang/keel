@@ -22,6 +22,17 @@ struct Process
     thread: Option[&sync Thread]
     preemptions: u64            // times the timer took the processor from its thread, once it has ended
     files: [OPEN_FILES]OpenFile // indexed by descriptor; 0 to 2 are the console and never used here
+    cwd: [CWD_ROOM]u8           // the current directory: an absolute path with no `.`, `..` or `//`
+    cwd_len: usize
+
+// Room for the current directory's path; keel.fs's longest path argument is the same.
+const CWD_ROOM: usize = 256
+
+// A new process's current directory, `/`.
+root_dir() -> [CWD_ROOM]u8
+    var d: [CWD_ROOM]u8 = [0; CWD_ROOM]
+    d[0] = u8('/')
+    d
 
 // How many descriptors a process has, the console's three included (keel.abi's MAX_FDS).
 const OPEN_FILES: usize = 16

@@ -15,7 +15,7 @@ module keel.fs
 // mkfs's check reports.
 
 import abi.keel.abi.{EBADF, EBUSY, EEXIST, EFAULT, EINVAL, EISDIR, EMFILE, ENAMETOOLONG, ENOENT, ENOTDIR,
-    ENOTEMPTY, Errno, FIRST_FILE_FD, MAX_FDS, O_ACCMODE, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY,
+    ENOTEMPTY, ERANGE, Errno, FIRST_FILE_FD, MAX_FDS, O_ACCMODE, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY,
     SEEK_CUR, SEEK_END, SEEK_SET, STDERR, STDIN, STDOUT, Stat}
 import keel.mm
 import keel.sched.{OPEN_FILES, OpenFile, Process}
@@ -335,12 +335,112 @@ private inside(st: *State, dir: u32, ancestor: u32) -> Result[bool, Errno]
         var d = read_inode(st, ino)?
         ino = named(st, &d, "..".bytes)?.ino
 
-// A path argument, copied in.
+// A path argument, copied in. One that does not begin with `/` is taken from the current directory:
+// what comes back is the current directory, a `/`, and the argument, for `resolve` to walk from the
+// root (`.` and `..` are entries every directory has, so the walk needs no help with them).
 private path_in(p: *Process, va: u64, len: u64, room: []u8) -> Result[[]const u8, Errno]
     if len == 0 then return Err(ENOENT)
     if len > u64(room.len) then return Err(ENAMETOOLONG)
     if !mm.copy_from_user(&p.space, va, room[0..<usize(len)]) then return Err(EFAULT)
-    Ok(room[0..<usize(len)])
+    if room[0] == u8('/') then return Ok(room[0..<usize(len)])
+    val n = usize(len)
+    val total = p.cwd_len + 1 + n
+    if total > room.len then return Err(ENAMETOOLONG)
+    var k = n
+    while k > 0
+        k -= 1
+        room[p.cwd_len + 1 + k] = room[k]
+    for j in 0..<p.cwd_len
+        room[j] = p.cwd[j]
+    room[p.cwd_len] = u8('/')
+    Ok(room[0..<total])
+
+// getcwd(buf, len) -> bytes of the path; ERANGE when it does not fit.
+sys_getcwd(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val n = p.cwd_len
+    if regs[1] < u64(n) then return Err(ERANGE)
+    if !mm.copy_to_user(&p.space, regs[0], p.cwd[0..<n]) then return Err(EFAULT)
+    Ok(i64(n))
+
+// chdir(path, path_len) -> 0. The directory is found by walking the path as given; what is kept is the
+// same path with `.`, `..` and repeated slashes taken out of its text, which names the same directory
+// because keel has no symbolic links.
+sys_chdir(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var room: [MAX_PATH]u8 = [0; MAX_PATH]
+    val path = path_in(p, regs[0], regs[1], room[..])?
+    val st = lock()
+    defer unlock()
+    val ino = resolve(st, path)?
+    if read_inode(st, ino)?.kind != KIND_DIR then return Err(ENOTDIR)
+    var clean: [MAX_PATH]u8 = [0; MAX_PATH]
+    val n = normalized(path, clean[..])
+    for j in 0..<n
+        p.cwd[j] = clean[j]
+    p.cwd_len = n
+    Ok(0)
+
+// truncate(path, path_len, length) -> 0
+sys_truncate(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var room: [MAX_PATH]u8 = [0; MAX_PATH]
+    val path = path_in(p, regs[0], regs[1], room[..])?
+    val st = lock()
+    defer unlock()
+    val ino = resolve(st, path)?
+    resized(st, ino, regs[2])
+
+// ftruncate(fd, length) -> 0, on a descriptor open for writing.
+sys_ftruncate(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val f = file_of(p, regs[0])?
+    if (u64(f.flags) & O_ACCMODE) == O_RDONLY then return Err(EBADF)
+    val st = lock()
+    defer unlock()
+    resized(st, f.ino, regs[1])
+
+// access(path, path_len, how) -> 0 when the path names something. keel keeps permission bits but
+// enforces none, so whether the program may read or write it is always yes.
+sys_access(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var room: [MAX_PATH]u8 = [0; MAX_PATH]
+    val path = path_in(p, regs[0], regs[1], room[..])?
+    val st = lock()
+    defer unlock()
+    val _ = resolve(st, path)?
+    Ok(0)
+
+private resized(st: *State, ino: u32, length: u64) -> Result[i64, Errno]
+    if i64(length) < 0 then return Err(EINVAL)
+    var i = read_inode(st, ino)?
+    if i.kind == KIND_DIR then return Err(EISDIR)
+    resize(st, &i, length)?
+    write_inode(st, ino, i)?
+    Ok(0)
+
+// `path`, absolute, with its `.` and `..` components and empty ones taken out of the text, into `out`;
+// answers its length. `..` at the root stays at the root, as the root's own `..` entry does.
+private normalized(path: []const u8, out: []u8) -> usize
+    var n: usize = 0
+    var at: usize = 0
+    while at < path.len
+        while at < path.len && path[at] == u8('/')
+            at += 1
+        val start = at
+        while at < path.len && path[at] != u8('/')
+            at += 1
+        val name = path[start..<at]
+        if name.len == 0 || name == ".".bytes then continue
+        if name == "..".bytes
+            while n > 0 && out[n - 1] != u8('/')
+                n -= 1
+            if n > 0 then n -= 1
+            continue
+        out[n] = u8('/')
+        n += 1
+        for c in name
+            out[n] = c
+            n += 1
+    if n == 0
+        out[0] = u8('/')
+        n = 1
+    n
 
 // The open file a descriptor names.
 private file_of(p: *Process, fd: u64) -> Result[*OpenFile, Errno]

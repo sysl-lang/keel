@@ -1,0 +1,8 @@
+// `echo`: its arguments after its own name, on one line after `user: echo`. A `main(args: []string)`
+// is handed them by the entry point the compiler lays out, from the pair keel.user's `_start` passes.
+
+import rt.keel.user
+import sysl.text.join
+
+main(args: []string)
+    print("user: echo", join(args[1..], " "))

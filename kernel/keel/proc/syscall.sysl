@@ -1,7 +1,8 @@
 module keel.proc
 
-import abi.keel.abi.{EFAULT, ENOSYS, Errno, STDERR, STDOUT, SYS_BRK, SYS_CLOSE, SYS_EXIT, SYS_FSTAT, SYS_GETDENTS, SYS_GETPID,
-    SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_STAT, SYS_SYNC, SYS_UNLINK, SYS_WRITE}
+import abi.keel.abi.{EFAULT, ENOSYS, Errno, STDERR, STDOUT, SYS_ACCESS, SYS_BRK, SYS_CHDIR, SYS_CLOSE, SYS_EXIT,
+    SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_GETPID, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ,
+    SYS_RENAME, SYS_RMDIR, SYS_STAT, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINK, SYS_WRITE}
 import keel.fs
 import keel.mm
 import keel.pl011.put_byte
@@ -36,6 +37,11 @@ private[proc] system_call(regs: *u64)
         SYS_RMDIR -> fs.sys_rmdir(p, regs)
         SYS_RENAME -> fs.sys_rename(p, regs)
         SYS_SYNC -> fs.sys_sync()
+        SYS_GETCWD -> fs.sys_getcwd(p, regs)
+        SYS_CHDIR -> fs.sys_chdir(p, regs)
+        SYS_TRUNCATE -> fs.sys_truncate(p, regs)
+        SYS_FTRUNCATE -> fs.sys_ftruncate(p, regs)
+        SYS_ACCESS -> fs.sys_access(p, regs)
         else Err(ENOSYS)
     regs[0] = r match
         Ok(v) -> u64(v)

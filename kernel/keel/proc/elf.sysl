@@ -53,6 +53,7 @@ enum LoadError
     BadSegment                  // a segment outside the file, or outside the user range
     BadEntry                    // the entry point is in no executable segment
     NoMemory                    // no frame, or no ASID
+    TooManyArgs                 // the arguments do not fit the room at the top of the stack
 
 // What loading made: the address space, where to start, and where the heap begins.
 struct Loaded
