@@ -91,14 +91,24 @@ private[proc] sys_spawn(p: *Process, regs: *u64) -> Result[i64, Errno]
         packed.push(0)
     if args_len > 0 && !mm.copy_from_user(&p.space, regs[2], packed.view()) then return Err(EFAULT)
     val args = unpacked(packed.view())?
+    val (env, fds) = asked_for(p, regs[4])?
 
     // The file must be executable by the caller; the child runs as the caller, or as the file's owner
     // when it is set-user-ID.
-    // What the caller asked for besides: none of it, or a SpawnAttr.
+    val image = fs.read_executable(p.cwd[0..<p.cwd_len], path[0..<usize(path_len)], sched.cred_of(p))?
+    val std = standard_files(p, fds)?
+    start_image(image.bytes.view(), args.view(), p, std, env.view(), image.run_as) match
+        Ok(child) -> Ok(i64(child.pid))
+        Err(e) -> Err(errno_of(e))
+
+// What a spawn's caller asked for besides the program and its arguments — the SpawnAttr at `va`, or
+// every default for 0: the child's environment, and the caller's descriptors for its 0 to 2. A function
+// of its own so that its frame is gone before the child is built (kernel stacks are 16 KiB).
+private asked_for(p: *Process, va: u64) -> Result[(Buf[u8], [3]u64), Errno]
     var attr = SpawnAttr([NO_FD, NO_FD, NO_FD], 0, 0, 0)
-    if regs[4] != 0
+    if va != 0
         val b: *u8 = ptr_cast(&attr)
-        if !mm.copy_from_user(&p.space, regs[4], b[0..<sizeof(SpawnAttr)]) then return Err(EFAULT)
+        if !mm.copy_from_user(&p.space, va, b[0..<sizeof(SpawnAttr)]) then return Err(EFAULT)
     var env: Buf[u8] = buf()
     if attr.env_given != 0
         if attr.env_len > ENV_ROOM then return Err(E2BIG)
@@ -107,15 +117,9 @@ private[proc] sys_spawn(p: *Process, regs: *u64) -> Result[i64, Errno]
         if attr.env_len > 0 && !mm.copy_from_user(&p.space, attr.env, env.view()) then return Err(EFAULT)
         if attr.env_len > 0 && env.at(env.len() - 1) != 0 then return Err(EINVAL)
     else
-        env.extend(p.env[0..<p.env_len])
-
-    // The file must be executable by the caller; the child runs as the caller, or as the file's owner
-    // when it is set-user-ID.
-    val image = fs.read_executable(p.cwd[0..<p.cwd_len], path[0..<usize(path_len)], sched.cred_of(p))?
-    val std = standard_files(p, attr.fds)?
-    start_image(image.bytes.view(), args.view(), p, std, env.view(), image.run_as) match
-        Ok(child) -> Ok(i64(child.pid))
-        Err(e) -> Err(errno_of(e))
+        for i in 0..<p.env.len
+            env.push(p.env.bytes[i])
+    Ok((env, attr.fds))
 
 // The child's descriptors 0 to 2: for each, the caller's descriptor `fds[i]` names, or its own i for
 // NO_FD (which may be free), counted as open once more. EBADF for a named descriptor that is not open.

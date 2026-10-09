@@ -62,16 +62,14 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
         None ->
             mm.free_space(&l.space)
             return Err(TooManyArgs)
-    var files = sched.no_files()
-    for fd in 0..<3
-        files[fd] = std[fd]
-    var env_room: [sched.ENV_ROOM]u8 = [0; sched.ENV_ROOM]
-    for i in 0..<env.len
-        env_room[i] = env[i]
+    // The descriptors are filled in once the process is in its box: a kernel stack is 16 KiB, and every
+    // copy of a Process made on the way to the box is more than a KiB of it.
     val p: &sync Process = Process(next_pid.add(1), l.space, l.heap_base, l.heap_base, Context([0; 12], 0, 0),
-        Atomic(0), 0, 0, None, 0, files, sched.root_dir(), 1, 0, false, None, run_as.uid, run_as.gid,
-        env_room, env.len)
+        Atomic(0), 0, 0, None, 0, sched.no_files(), sched.root_dir(), 1, 0, false, None, run_as.uid, run_as.gid,
+        sched.env_of(env))
     val raw: *Process = &*p
+    for fd in 0..<3
+        raw.files[fd] = std[fd]
     if parent != null
         raw.ppid = parent.pid
         raw.cwd = parent.cwd

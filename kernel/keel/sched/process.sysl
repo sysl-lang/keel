@@ -29,8 +29,7 @@ struct Process
     me: Option[&sync Process]   // the box keeping itself alive while it is in keel.proc's table
     uid: u32                    // who it runs as: 0 is root; a child starts with its parent's
     gid: u32                    // its one group; there are no supplementary groups
-    env: [ENV_ROOM]u8           // its environment, which a child is given unless its parent says otherwise
-    env_len: usize
+    env: &sync Env              // its environment, which a child is given unless its parent says otherwise
 
 // Who a process runs as, for keel.fs's permission checks.
 struct Cred
@@ -83,3 +82,17 @@ no_files() -> [OPEN_FILES]OpenFile
 
 // Room for a process's environment: `NAME=value` entries, each followed by a NUL (keel.abi's ENV_ROOM).
 const ENV_ROOM: usize = 1024
+
+// A process's environment, in a box of its own rather than inline: a Process is built by value before
+// it is boxed, and a kernel stack is 16 KiB. A `Buf` cannot be a field, every count inside a `&sync`
+// box having to be atomic.
+struct Env
+    bytes: [ENV_ROOM]u8
+    len: usize
+
+// An environment holding `entries`, which must fit ENV_ROOM.
+env_of(entries: []const u8) -> &sync Env
+    val e: &sync Env = Env([0; ENV_ROOM], entries.len)
+    for i in 0..<entries.len
+        e.bytes[i] = entries[i]
+    e
