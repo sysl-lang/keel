@@ -1,0 +1,8 @@
+// keel's filesystem as it lies on the disk: the structs and the arithmetic over them that the kernel
+// (which mounts it) and tools/mkfs (which builds and checks it, on the host) must agree on. The same
+// source is compiled for aarch64-freestanding inside the kernel and for the host inside mkfs.
+
+package {
+  name    = "ondisk"
+  version = "0.0.1"
+}

@@ -1,0 +1,331 @@
+// mkfs — keel's filesystem, built, checked and read on the host. The format is keel.ondisk, the module
+// the kernel mounts it with; kernel/keel/fs/FORMAT.md describes it.
+//
+//   mkfs build <image> <blocks> [<dir>]   a fresh filesystem of <blocks> 4 KiB blocks, holding a copy
+//                                         of <dir>'s files and directories
+//   mkfs check <image>                    fsck: "host: fsck ok …", or every problem found and exit 1
+//   mkfs cat <image> <path>               a file's contents, to standard output
+
+import ondisk.keel.ondisk
+import ondisk.keel.ondisk.{BLOCK_SIZE, DIRENT_SIZE, Dirent, Inode, KIND_DIR, KIND_FILE, KIND_FREE, NAME_MAX,
+    NDIRECT, ROOT_INO, Super}
+import sysl.buf.{Buf, buf}
+import sysl.fs
+import sysl.text.{from_utf8, split}
+
+// Room for this many inodes in a fresh filesystem: four blocks of them.
+private const INODES: u32 = 256
+
+private const ENTRIES_PER_BLOCK: usize = BLOCK_SIZE / DIRENT_SIZE
+
+private struct Image
+    bytes: []u8
+    sb: Super
+    next_ino: u32               // building: the next inode to hand out
+    next_block: u32             // building: the next data block to hand out
+
+main(args: []string)
+    val n = args.len
+    if n >= 4 && args[1] == "build"
+        val blocks = parse_count(args[3])
+        exit(build(args[2], blocks, if n >= 5 then Some(args[4]) else None))
+    if n == 3 && args[1] == "check" then exit(check(args[2]))
+    if n == 4 && args[1] == "cat" then exit(cat(args[2], args[3]))
+    print("usage: mkfs build <image> <blocks> [<dir>] | mkfs check <image> | mkfs cat <image> <path>")
+    exit(2)
+
+private parse_count(s: string) -> u32
+    var v: u32 = 0
+    for c in s.bytes
+        if c < u8('0') || c > u8('9') then fail(s"mkfs: '$s' is not a number of blocks")
+        v = v * 10 + u32(c - u8('0'))
+    v
+
+private fail(why: string) -> never
+    print(why)
+    exit(1)
+
+// --- Reading an image ----------------------------------------------------------------------------
+
+private block(img: *Image, b: u32) -> []u8 = img.bytes[usize(b) * BLOCK_SIZE..<usize(b + 1) * BLOCK_SIZE]
+
+private inode(img: *Image, ino: u32) -> *Inode = ondisk.at(block(img, ondisk.inode_block(img.sb, ino)), ondisk.inode_offset(ino))
+
+private used(img: *Image, b: u32) -> bool =
+    (block(img, ondisk.bitmap_block(img.sb, b))[ondisk.bitmap_byte(b)] & ondisk.bitmap_mask(b)) != 0
+
+// The block holding byte `n * BLOCK_SIZE` of the file, or 0 for none.
+private block_at(img: *Image, i: *Inode, n: usize) -> u32
+    if n < NDIRECT then return i.direct[n]
+    if i.indirect == 0 then return 0
+    val table: *u32 = ondisk.at(block(img, i.indirect), (n - NDIRECT) * 4)
+    *table
+
+private entry(img: *Image, dir: *Inode, slot: usize) -> *Dirent =
+    ondisk.at(block(img, block_at(img, dir, slot / ENTRIES_PER_BLOCK)), (slot % ENTRIES_PER_BLOCK) * DIRENT_SIZE)
+
+// The inode `name` names in directory `dir`, or 0.
+private lookup(img: *Image, dir: u32, name: []const u8) -> u32
+    val d = inode(img, dir)
+    for slot in 0..<usize(d.size) / DIRENT_SIZE
+        val e = entry(img, d, slot)
+        if e.ino != 0 && ondisk.name_of(e) == name then return e.ino
+    0
+
+private opened(path: string) -> Image
+    val bytes = fs.read_bytes(path) match
+        Ok(b) -> b
+        Err(_) -> fail(s"mkfs: cannot read $path")
+    if bytes.len < 2 * BLOCK_SIZE || bytes.len % BLOCK_SIZE != 0 then fail(s"mkfs: $path is not a whole number of blocks")
+    var img = Image(bytes, Super(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), 0, 0)
+    val sb: *Super = ondisk.at(block(&img, ondisk.SUPER_BLOCK), 0)
+    img.sb = *sb
+    if !ondisk.valid(img.sb, u64(bytes.len / BLOCK_SIZE)) then fail(s"mkfs: $path has no keel filesystem")
+    img
+
+// --- build ---------------------------------------------------------------------------------------
+
+private build(path: string, blocks: u32, from: Option[string]) -> int
+    var bytes: Buf[u8] = buf()
+    for _ in 0..<usize(blocks) * BLOCK_SIZE
+        bytes.push(0)
+    var img = Image(bytes.view(), ondisk.layout(blocks, INODES), ROOT_INO, 0)
+    if img.sb.data_start + 1 >= blocks then fail(s"mkfs: $blocks blocks leave no room for data")
+    img.next_block = img.sb.data_start
+    val sb: *Super = ondisk.at(block(&img, ondisk.SUPER_BLOCK), 0)
+    *sb = img.sb
+    for b in 0..<img.sb.data_start
+        mark(&img, b)
+
+    val root = new_inode(&img, KIND_DIR)
+    add_entry(&img, root, ".", root, KIND_DIR)
+    add_entry(&img, root, "..", root, KIND_DIR)
+    inode(&img, root).links = 2
+    from match
+        Some(dir) -> fill(&img, root, dir)
+        None -> ()
+
+    fs.write_bytes(path, img.bytes) match
+        Ok(_) -> ()
+        Err(_) -> fail(s"mkfs: cannot write $path")
+    print(s"mkfs: $path: $blocks blocks, ${img.next_ino - 1} inodes, ${img.next_block - img.sb.data_start} data blocks used")
+    0
+
+private mark(img: *Image, b: u32)
+    val bits = block(img, ondisk.bitmap_block(img.sb, b))
+    val i = ondisk.bitmap_byte(b)
+    bits[i] = bits[i] | ondisk.bitmap_mask(b)
+
+private new_block(img: *Image) -> u32
+    val b = img.next_block
+    if b >= img.sb.blocks then fail("mkfs: the image is full")
+    img.next_block += 1
+    mark(img, b)
+    b
+
+private new_inode(img: *Image, kind: u16) -> u32
+    val ino = img.next_ino
+    if ino >= img.sb.inodes then fail("mkfs: out of inodes")
+    img.next_ino += 1
+    val i = inode(img, ino)
+    i.kind = kind
+    i.mode = if kind == KIND_DIR then 0o755 else 0o644
+    i.links = 1
+    ino
+
+// The block holding byte `n * BLOCK_SIZE` of the file, given one if it has none.
+private block_for(img: *Image, ino: u32, n: usize) -> u32
+    val i = inode(img, ino)
+    if n < NDIRECT
+        if i.direct[n] == 0 then i.direct[n] = new_block(img)
+        return i.direct[n]
+    if i.indirect == 0 then i.indirect = new_block(img)
+    val table: *u32 = ondisk.at(block(img, i.indirect), (n - NDIRECT) * 4)
+    if *table == 0 then *table = new_block(img)
+    *table
+
+private add_entry(img: *Image, dir: u32, name: string, ino: u32, kind: u16)
+    if name.bytes.len > NAME_MAX then fail(s"mkfs: '$name' is longer than $NAME_MAX bytes")
+    val slot = usize(inode(img, dir).size) / DIRENT_SIZE
+    val b = block_for(img, dir, slot / ENTRIES_PER_BLOCK)
+    val e: *Dirent = ondisk.at(block(img, b), (slot % ENTRIES_PER_BLOCK) * DIRENT_SIZE)
+    ondisk.set_entry(e, ino, kind, name.bytes)
+    inode(img, dir).size += u64(DIRENT_SIZE)
+
+// Copy host directory `from` into directory `dir`, recursively.
+private fill(img: *Image, dir: u32, from: string)
+    val names = fs.entries(from) match
+        Ok(n) -> n
+        Err(_) -> fail(s"mkfs: cannot list $from")
+    for name in names
+        val host = s"$from/$name"
+        if fs.is_dir(host)
+            val child = new_inode(img, KIND_DIR)
+            add_entry(img, child, ".", child, KIND_DIR)
+            add_entry(img, child, "..", dir, KIND_DIR)
+            inode(img, child).links = 2
+            add_entry(img, dir, name, child, KIND_DIR)
+            inode(img, dir).links += 1
+            fill(img, child, host)
+        else
+            val bytes = fs.read_bytes(host) match
+                Ok(b) -> b
+                Err(_) -> fail(s"mkfs: cannot read $host")
+            val ino = new_inode(img, KIND_FILE)
+            var off: usize = 0
+            while off < bytes.len
+                val n = if bytes.len - off < BLOCK_SIZE then bytes.len - off else BLOCK_SIZE
+                val b = block(img, block_for(img, ino, off / BLOCK_SIZE))
+                for k in 0..<n
+                    b[k] = bytes[off + k]
+                off += n
+            inode(img, ino).size = u64(bytes.len)
+            add_entry(img, dir, name, ino, KIND_FILE)
+
+// --- check ---------------------------------------------------------------------------------------
+//
+// Everything an image owes, read without changing a byte: the superblock describes the disk; every
+// directory reached from the root has `.` and `..` naming itself and its parent, and names only inodes
+// in use, of the kind its entries say; every inode in use is named, as many times as its link count
+// says; every block a file owns is a data block, owned once, and every block up to its size is there;
+// and the bitmap marks exactly the metadata blocks and the owned ones.
+
+private struct Fsck
+    problems: Buf[string]
+    refs: Buf[u32]              // per inode: directory entries naming it
+    subdirs: Buf[u32]           // per inode: directories inside it
+    seen: Buf[bool]             // per inode: a directory already walked
+    owner: Buf[u32]             // per block: the inode owning it, or 0
+    files: u32
+    dirs: u32
+
+private check(path: string) -> int
+    var img = opened(path)
+    var k = Fsck(buf(), buf(), buf(), buf(), buf(), 0, 0)
+    for _ in 0..<img.sb.inodes
+        k.refs.push(0)
+        k.subdirs.push(0)
+        k.seen.push(false)
+    for _ in 0..<img.sb.blocks
+        k.owner.push(0)
+
+    if inode(&img, 0).kind != KIND_FREE then k.problems.push("inode 0 is in use")
+    if inode(&img, ROOT_INO).kind != KIND_DIR
+        k.problems.push("the root is not a directory")
+    else
+        walk(&img, &k, ROOT_INO, ROOT_INO)
+
+    for ino in 1..<img.sb.inodes
+        val i = inode(&img, ino)
+        if i.kind == KIND_FREE then continue
+        if i.kind != KIND_FILE && i.kind != KIND_DIR
+            k.problems.push(s"inode $ino has kind ${i.kind}")
+            continue
+        if i.kind == KIND_FILE then k.files += 1 else k.dirs += 1
+        val refs = k.refs[usize(ino)]
+        if refs == 0 then k.problems.push(s"inode $ino is in use and no directory names it")
+        if u32(i.links) != refs then k.problems.push(s"inode $ino has link count ${i.links}, named $refs times")
+        if i.kind == KIND_DIR && u32(i.links) != 2 + k.subdirs[usize(ino)]
+            k.problems.push(s"directory $ino has link count ${i.links} and ${k.subdirs[usize(ino)]} subdirectories")
+        claim_blocks(&img, &k, ino, i)
+
+    for b in 0..<img.sb.blocks
+        val meta = b < img.sb.data_start
+        val owned = k.owner[usize(b)] != 0
+        if used(&img, b) && !meta && !owned then k.problems.push(s"block $b is marked used and nothing owns it")
+        if !used(&img, b) && meta then k.problems.push(s"metadata block $b is marked free")
+        if !used(&img, b) && owned then k.problems.push(s"block $b is owned by inode ${k.owner[usize(b)]} and marked free")
+
+    if k.problems.len() != 0
+        for p in k.problems
+            print(s"host: fsck: $p")
+        print(s"host: fsck failed, ${k.problems.len()} problems")
+        return 1
+    var in_use: u32 = 0
+    for b in 0..<img.sb.blocks
+        if used(&img, b) then in_use += 1
+    print(s"host: fsck ok: ${k.files} files, ${k.dirs} directories, $in_use of ${img.sb.blocks} blocks used")
+    0
+
+private walk(img: *Image, k: *Fsck, dir: u32, parent: u32)
+    if k.seen[usize(dir)]
+        k.problems.push(s"directory $dir is reached twice")
+        return
+    k.seen[usize(dir)] = true
+    val d = inode(img, dir)
+    if d.size % u64(DIRENT_SIZE) != 0 then k.problems.push(s"directory $dir has size ${d.size}")
+    var dot = false
+    var dotdot = false
+    for slot in 0..<usize(d.size) / DIRENT_SIZE
+        if block_at(img, d, slot / ENTRIES_PER_BLOCK) == 0
+            k.problems.push(s"directory $dir has a hole")
+            return
+        val e = entry(img, d, slot)
+        if e.ino == 0 then continue
+        val name = ondisk.name_of(e)
+        if e.ino >= img.sb.inodes || usize(e.len) > NAME_MAX
+            k.problems.push(s"directory $dir has a malformed entry at slot $slot")
+            continue
+        val i = inode(img, e.ino)
+        if i.kind == KIND_FREE
+            k.problems.push(s"directory $dir names free inode ${e.ino}")
+            continue
+        if u16(e.kind) != i.kind then k.problems.push(s"directory $dir's entry for inode ${e.ino} has the wrong kind")
+        k.refs[usize(e.ino)] = k.refs[usize(e.ino)] + 1
+        if name == ".".bytes
+            dot = true
+            if e.ino != dir then k.problems.push(s"directory $dir's '.' names ${e.ino}")
+        else if name == "..".bytes
+            dotdot = true
+            if e.ino != parent then k.problems.push(s"directory $dir's '..' names ${e.ino}, not its parent $parent")
+        else if i.kind == KIND_DIR
+            k.subdirs[usize(dir)] = k.subdirs[usize(dir)] + 1
+            walk(img, k, e.ino, dir)
+    if !dot || !dotdot then k.problems.push(s"directory $dir lacks '.' or '..'")
+
+private claim_blocks(img: *Image, k: *Fsck, ino: u32, i: *Inode)
+    val needed = (usize(i.size) + BLOCK_SIZE - 1) / BLOCK_SIZE
+    if u64(needed) > ondisk.MAX_FILE_BLOCKS
+        k.problems.push(s"inode $ino is ${i.size} bytes, more than a file can hold")
+        return
+    for n in 0..<NDIRECT
+        if n >= needed && i.direct[n] != 0 then k.problems.push(s"inode $ino holds block ${i.direct[n]} past its end")
+    if needed > NDIRECT
+        claim(img, k, ino, i.indirect)
+    else if i.indirect != 0
+        k.problems.push(s"inode $ino holds an indirect block it does not need")
+    for n in 0..<needed
+        val b = block_at(img, i, n)
+        if b == 0 then k.problems.push(s"inode $ino has a hole at block $n") else claim(img, k, ino, b)
+
+private claim(img: *Image, k: *Fsck, ino: u32, b: u32)
+    if b < img.sb.data_start || b >= img.sb.blocks
+        k.problems.push(s"inode $ino holds block $b, outside the data blocks")
+        return
+    val was = k.owner[usize(b)]
+    if was != 0
+        k.problems.push(s"block $b is held by inode $was and by inode $ino")
+        return
+    k.owner[usize(b)] = ino
+
+// --- cat -----------------------------------------------------------------------------------------
+
+private cat(path: string, file: string) -> int
+    var img = opened(path)
+    var ino = ROOT_INO
+    for part in split(file, "/")
+        if part.bytes.len == 0 then continue
+        if inode(&img, ino).kind != KIND_DIR then fail(s"mkfs: $file: not found")
+        ino = lookup(&img, ino, part.bytes)
+        if ino == 0 then fail(s"mkfs: $file: not found")
+    val i = inode(&img, ino)
+    if i.kind != KIND_FILE then fail(s"mkfs: $file is not a file")
+    var out: Buf[u8] = buf()
+    for n in 0..<(usize(i.size) + BLOCK_SIZE - 1) / BLOCK_SIZE
+        val b = block(&img, block_at(&img, i, n))
+        val end = if usize(i.size) - n * BLOCK_SIZE < BLOCK_SIZE then usize(i.size) - n * BLOCK_SIZE else BLOCK_SIZE
+        out.extend(b[0..<end])
+    from_utf8(out.view()) match
+        Ok(text) -> prints(text)
+        Err(_) -> fail(s"mkfs: $file is not text")
+    0

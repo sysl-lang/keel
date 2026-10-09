@@ -1,0 +1,133 @@
+module keel.ondisk
+
+// keel's filesystem as it lies on the disk. kernel/keel/fs/FORMAT.md describes it in prose; this file
+// is the definition both sides compile: the kernel (aarch64-freestanding) mounts it, tools/mkfs (the
+// host) builds and checks it.
+//
+// Every number is little-endian, which is the byte order of both machines that read it — nothing in a
+// struct can say so (FINDINGS.md 39), so the structs are read and written in place, through a pointer
+// into a block's bytes, and the layout of each is pinned by `@assert`s below.
+
+import sysl.slices.as_mut_ptr
+
+const SECTOR_SIZE: usize = 512
+const BLOCK_SIZE: usize = 4096
+const SECTORS_PER_BLOCK: u64 = 8
+
+const MAGIC: u32 = 0x6c65_656b                 // the bytes "keel", read as a little-endian u32
+const VERSION: u32 = 1
+
+// Block 0 is the boot block: the filesystem never uses it (the virtio test writes sectors 1 and 2).
+const SUPER_BLOCK: u32 = 1
+const BITMAP_START: u32 = 2
+
+// Inode 0 is never used, so a directory entry whose inode is 0 is a free slot. The root is inode 1.
+const ROOT_INO: u32 = 1
+
+// `Inode.kind`. Plain numbers rather than an enum: the field is read straight off the disk, and an enum
+// field holding a value no variant has is a trap waiting in the first `match` (FINDINGS.md 9).
+const KIND_FREE: u16 = 0
+const KIND_FILE: u16 = 1
+const KIND_DIR: u16 = 2
+
+const NDIRECT: usize = 10
+const NINDIRECT: usize = BLOCK_SIZE / 4
+const MAX_FILE_BLOCKS: u64 = 1034               // NDIRECT + NINDIRECT
+const INODE_SIZE: usize = 64
+const INODES_PER_BLOCK: u32 = 64
+const DIRENT_SIZE: usize = 32
+const NAME_MAX: usize = 24
+const BITS_PER_BLOCK: u32 = 32768
+
+// Block 1, at offset 0. Every count is in blocks unless it says otherwise.
+struct Super
+    magic: u32
+    version: u32
+    block_size: u32             // bytes
+    blocks: u32                 // the whole filesystem, boot block included
+    bitmap_start: u32
+    bitmap_blocks: u32
+    inode_start: u32
+    inode_blocks: u32
+    inodes: u32                 // inode slots, 0 included
+    data_start: u32             // the first block a file or a directory may own
+    root: u32                   // the root directory's inode
+    reserved: u32
+
+@assert(sizeof(Super) == 48, "the superblock is 48 bytes")
+
+// One file or directory: 64 bytes, 64 to a block. Block numbers are absolute; 0 means none (block 0 is
+// the boot block, which nothing owns).
+struct Inode
+    kind: u16                   // KIND_FREE, KIND_FILE, KIND_DIR
+    mode: u16                   // permission bits, kept and reported, not enforced
+    links: u16                  // directory entries naming it: 1 for a file, 2 + subdirectories for a directory
+    reserved: u16
+    size: u64                   // bytes
+    direct: [NDIRECT]u32        // the first ten blocks
+    indirect: u32               // a block of 1024 more block numbers
+    reserved2: u32
+
+@assert(sizeof(Inode) == 64, "an inode is 64 bytes")
+@assert(offsetof(Inode, size) == 8, "Inode.size is at 8")
+@assert(offsetof(Inode, direct) == 16, "Inode.direct is at 16")
+@assert(offsetof(Inode, indirect) == 56, "Inode.indirect is at 56")
+
+// One directory entry: 32 bytes, 128 to a block. A directory is a file of these; `.` and `..` are its
+// first two. A name is up to 24 bytes, not terminated.
+struct Dirent
+    ino: u32                    // 0: a free slot
+    len: u8                     // bytes of `name` in use
+    kind: u8                    // the inode's kind, so a listing need not read every inode
+    reserved: u16
+    name: [NAME_MAX]u8
+
+@assert(sizeof(Dirent) == 32, "a directory entry is 32 bytes")
+@assert(offsetof(Dirent, name) == 8, "Dirent.name is at 8")
+
+// The layout of a filesystem of `blocks` blocks with room for at least `inodes` inodes: boot block,
+// superblock, bitmap, inode table, data.
+layout(blocks: u32, inodes: u32) -> Super
+    val bitmap_blocks = (blocks + BITS_PER_BLOCK - 1) / BITS_PER_BLOCK
+    val inode_blocks = (inodes + INODES_PER_BLOCK - 1) / INODES_PER_BLOCK
+    val inode_start = BITMAP_START + bitmap_blocks
+    Super(MAGIC, VERSION, u32(BLOCK_SIZE), blocks, BITMAP_START, bitmap_blocks, inode_start, inode_blocks,
+        inode_blocks * INODES_PER_BLOCK, inode_start + inode_blocks, ROOT_INO, 0)
+
+// Whether a superblock read off a disk of `capacity` blocks is one this code can use: the regions in
+// order, inside the disk, and big enough for what they hold.
+valid(sb: Super, capacity: u64) -> bool
+    if sb.magic != MAGIC || sb.version != VERSION || sb.block_size != u32(BLOCK_SIZE) then return false
+    if u64(sb.blocks) > capacity || sb.bitmap_start != BITMAP_START then return false
+    if u64(sb.bitmap_blocks) * u64(BITS_PER_BLOCK) < u64(sb.blocks) then return false
+    if sb.inode_start != sb.bitmap_start + sb.bitmap_blocks then return false
+    if sb.inodes != sb.inode_blocks * INODES_PER_BLOCK || sb.inodes < 2 then return false
+    if sb.data_start != sb.inode_start + sb.inode_blocks || sb.data_start >= sb.blocks then return false
+    sb.root == ROOT_INO
+
+// Where inode `ino` is: its block, and its offset inside it.
+inode_block(sb: Super, ino: u32) -> u32 = sb.inode_start + ino / INODES_PER_BLOCK
+inode_offset(ino: u32) -> usize = usize(ino % INODES_PER_BLOCK) * INODE_SIZE
+
+// Where block `b`'s bit is: the bitmap block, the byte inside it, and the bit inside that.
+bitmap_block(sb: Super, b: u32) -> u32 = sb.bitmap_start + b / BITS_PER_BLOCK
+bitmap_byte(b: u32) -> usize = usize(b % BITS_PER_BLOCK) / 8
+bitmap_mask(b: u32) -> u8 = u8(1) << (b % 8)
+
+// A struct inside a block's bytes: `T` at `offset`. The caller keeps the bytes alive and aligned for
+// `T`; the bounds are checked here.
+at[T](bytes: []u8, offset: usize) -> *T
+    if offset + sizeof(T) > bytes.len then panic("keel.ondisk: a struct past the end of its block")
+    ptr_cast(usize(as_mut_ptr(bytes)) + offset)
+
+// A directory entry's name.
+name_of(d: *Dirent) -> []const u8 = d.name[0..<usize(d.len)]
+
+// Fill in a directory entry; `name` is at most NAME_MAX bytes.
+set_entry(d: *Dirent, ino: u32, kind: u16, name: []const u8)
+    d.ino = ino
+    d.len = u8(name.len)
+    d.kind = u8(kind)
+    d.reserved = 0
+    for i in 0..<NAME_MAX
+        d.name[i] = if i < name.len then name[i] else 0

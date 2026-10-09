@@ -1,0 +1,11 @@
+// mkfs: builds a keel filesystem image on the host, optionally filled from a host directory, checks
+// one (an fsck that reads and repairs nothing), and reads a file out of one.
+
+package {
+  name    = "mkfs"
+  version = "0.0.1"
+}
+
+dependencies {
+  ondisk { workspace = true }
+}
