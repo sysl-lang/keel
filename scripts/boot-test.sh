@@ -40,6 +40,7 @@ before_user_line=(
     "keel: buf ok"          # a Buf[u64] grew to 10,000 elements on the kernel heap and summed right
     "keel: hello from the heap"              # a string built by interpolation
     "keel: closure ok"      # a closure capturing a boxed value
+    "keel: aligned boxes ok"  # @align(64) and @align(4096) boxes on their boundaries
     "keel: heap reclaimed"  # every frame came back once those were dropped, and no block is live
     "keel: interleaved ok"  # two spinning threads took turns: only the timer can have switched them
     "keel: mutex ok"        # 4 threads x 10,000 additions under a blocking Mutex[u64] total 40,000

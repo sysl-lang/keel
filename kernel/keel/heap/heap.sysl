@@ -71,6 +71,25 @@ keel_free(p: *u8)
     lock.unlock()
     cpu.irq_restore(flags)
 
+// The pair the compiler calls for a box whose type asks for more than 16 bytes' alignment. The block is
+// `n + align` bytes from `keel_alloc`; the pointer handed out is the first `align` boundary at least 8
+// bytes into it, and the word before it holds the block's own address for `sysl_free_aligned`. A
+// 16-aligned block starts 8 short of an 8-aligned boundary, so rounding up adds at most `align - 8`
+// and the object always fits.
+@export("sysl_alloc_aligned")
+alloc_aligned(n: usize, align: usize) -> *u8
+    val block = keel_alloc(n + align)
+    val at = (usize(block) + 8 + align - 1) & ~(align - 1)
+    val slot: *usize = ptr_cast(at - 8)
+    *slot = usize(block)
+    ptr_cast(at)
+
+@export("sysl_free_aligned")
+free_aligned(p: *u8)
+    if p == null then return
+    val slot: *usize = ptr_cast(usize(p) - 8)
+    keel_free(ptr_cast(*slot))
+
 // How many blocks are handed out and not yet freed.
 live() -> u64 = allocated
 

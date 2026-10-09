@@ -155,6 +155,21 @@ private init_memory(x0_at_entry: u64)
 private struct Cell
     value: u64
 
+@align(64)
+private struct LineSized
+    x: u64
+
+@align(4096)
+private struct PageSized
+    words: [512]u64
+
+// Boxes of types asking for more than keel.heap's 16-byte alignment, and how far each payload is off
+// its boundary: both 0, the compiler laying a box out on the boundary its type asks for. Both are
+// freed when this returns, which `heap reclaimed` checks.
+private aligned_boxes() -> (usize, usize)
+    val a: &LineSized = LineSized(1)
+    val b: &PageSized = PageSized([0; 512])
+    (usize(&*a) % 64, usize(&*b) % 4096)
 
 // What milestone 3 is for: `Buf`, `string`, `&T` and closures in the kernel, all on keel.heap, and
 // every frame they took given back once they are gone.
@@ -171,6 +186,12 @@ private heap_tests()
     print(greeting("the heap"))
 
     if closure_result() == 42 then print("keel: closure ok") else print("keel: closure wrong")
+
+    val (line, page) = aligned_boxes()
+    if line == 0 && page == 0
+        print("keel: aligned boxes ok")
+    else
+        print("keel: aligned boxes wrong:", line, page)
 
     val after = mm.frames_free()
     if after == before && heap.live() == 0

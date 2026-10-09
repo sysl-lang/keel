@@ -626,6 +626,17 @@ package may name a sysl function as its allocator directly.
 
 ## 20. A boxed value gets at most the allocator's 16-byte alignment, whatever its type asks for
 
+**FIXED in sysl census-35 7e2a32d3 (`aligned-alloc`; prerelease `7e2a32d396`):** a box of a type
+aligned past the allocating pair's 16 bytes goes through `sysl_alloc_aligned(size, align)` /
+`sysl_free_aligned(p)`; on a target with no C library to answer them the program must, and leaving
+them out is refused at the box: *"a box of 'LineSized' asks for the 64-byte boundary its type is
+aligned on, and the allocating pair ('keel_alloc' and 'keel_free') promises only 16 — … Define
+'sysl_alloc_aligned(size: usize, align: usize) -> *u8' and 'sysl_free_aligned(p: *u8)' with
+'@export'"*. keel.heap now exports both (over-allocate by `align`, keep the block's address in the
+word before the object), and milestone 3 checks the probe below: `keel: aligned boxes ok` for an
+`@align(64)` and an `@align(4096)` box, both reclaimed. Control: handing out `block + 16` prints
+`aligned boxes wrong: 16 80` and fails the boot.
+
 Milestone 3, probing the kernel heap. keel's `keel_alloc` answers 16-byte aligned blocks, as malloc
 does on AArch64. A box puts its three header words (memory.md § "What a heap object costs") in front
 of the payload:
