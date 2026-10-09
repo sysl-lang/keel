@@ -1767,6 +1767,203 @@ to `-1` fails the boot test at `cp -r` with exactly the line above.
 Clean form: `copy_dir_all` skipping `set_permissions` (or accepting an unsupported answer) where the
 target has no permission bits, or `Meta` saying whether `mode`'s permission bits mean anything there.
 
+## Milestone 11: networking
+
+Findings 51-54 are against the prerelease `8619de6609`. Found while writing `keel.net` — a virtio-net
+driver over the virtio-mmio transport the disk uses (now shared, `keel.virtio`'s `queue.sysl`), an
+ARP/IPv4/ICMP/UDP stack in the kernel, a UDP echo service on port 7, five socket system calls and
+`/bin/udpecho`, a sysl program serving the same echo from EL0. Ranked: 51 is what every protocol
+header costs, a wrapper type per field width for want of a byte order; 52 is a distinct type that
+cannot be a constant or live in zeroed storage, which is exactly what an address type is for; 53 is a
+small inconsistency (reported as a bug) about writing through a `val` pointer; 54 is milestone 9 and
+10's question again for sockets. Findings 36 (the card's buffers are bounce-copied, as the disk's are)
+and 37 (the card's interrupt must not sleep, and nothing checks it) apply unchanged. None was fixed
+here.
+
+## 51. A wire field cannot be declared big-endian, and the library leaves byte order to slice readers that answer `Option`
+
+Milestone 11, every header in `keel.net`'s `wire.sysl`. A protocol header is a struct laid over the
+frame's bytes: Ethernet's EtherType, IPv4's length, identification, checksum and addresses, UDP's
+ports — all big-endian, on a little-endian machine. `@packed` lays the struct out exactly, and that is
+the problem: an integer field is read in the machine's order (`hosted`, `sysl run`):
+
+    @packed
+    struct Ipv4
+        ver_ihl: u8
+        tos: u8
+        total: u16
+        ...
+    var frame: [40]u8 = [0; 40]
+    frame[2] = 0x00
+    frame[3] = 0x54                     // 84, as the wire spells it
+    val h: *Ipv4 = ptr_cast(&frame[0])
+    print(h.total)                      // 21504
+
+The reference says so on purpose (`attributes.md § @packed`: "a claim about endianness, which nothing
+in sysl is allowed to make … A wire format's byte order belongs to the protocol rather than to the CPU,
+and stays with `sysl.encoding.binary`'s `get_u16_le` and the rest"), and `sysl.encoding`'s own header
+says the library deliberately has no `swap_bytes`. What `sysl.encoding` offers is
+`get_u16_be(b: []const u8) -> Option[u16]` and `put_u16_be(b: []u8, v: u16) -> bool`: a reader over a
+slice that answers `None` when the slice is short. A stack that has checked the frame's length once
+then writes, for every field of every header, a sub-slice by hand-computed offset and an unwrap of an
+`Option` that cannot be `None` — the struct, its `@assert`ed offsets and its field names are all lost,
+and the offsets live in the code instead of in a declaration.
+
+Rust has the same split and answers it in libraries (`zerocopy`'s `U16<BigEndian>`, `network-types`);
+C has `ntohs` and a struct of `uint16_t` the reader must remember to convert, which is the bug the
+byte-order wrapper exists to prevent.
+
+Workaround (used): `struct Be16 { hi: u8, lo: u8 }` and `struct Be32 { b: [4]u8 }` with `get()` and
+constructors `be16(v)`/`be32(v)`, every multi-byte header field one of them. Every field being bytes,
+every header has alignment 1 and needs no `@packed`; `h.total.get()` reads, `h.total = be16(n)`
+writes. It works (the boot test's checksums are verified by slirp and by the host), and it is a type
+per width that every protocol package will write again.
+
+Clean form: a byte order on an integer field or a whole struct (`@byte_order(big)`, or big-endian
+integer types `u16be`/`u32be` that convert to and from `u16`/`u32` with the swap in the conversion),
+honoured by loads and stores — finding 39's clean form already asks for the attribute; this is the
+case that needs it.
+
+## 52. A `new` type has no zero and cannot be a constant, so an address type can be neither a well-known value nor a field of zero-filled storage
+
+Milestone 11, `type Ip = new u32` — the type finding 17 says is spellable, used for an IPv4 address so
+that one is not passed where a port, a length or a sequence number is wanted. The first two things an
+IP stack writes with it are refused:
+
+    const OUR_IP: Ip = Ip(0x0a00_020f)
+
+    error: 'OUR_IP' is declared Ip, which is a 'new' type — reaching one from its base is a written
+    conversion, and a constant is the value it is written as, so there is nowhere here to write it
+
+    private struct ArpEntry
+        valid: bool
+        ip: Ip
+        mac: Mac
+    private var stack: Stack            // holds [8]ArpEntry
+
+    error: 'keel.net.stack' needs a value: storage with no initializer starts at its type's zero, and
+    keel.net.Stack has none
+
+(the shortest form: `type Ip = new u32; struct Entry { ip: Ip }; var e: Entry` — *"Entry has no zero
+value, so 'e' needs an initial value"*.) The reference states the second rule for a *constrained*
+type (`errors.md § A constrained type has no zero value`: "whether or not the range contains zero");
+a `new u32` has no range and no predicate, so every `u32` is an `Ip`, zero included, and the rule
+protects nothing here. And an initializer is no way round it in a kernel: `var stack: Stack =
+Stack(...)` with an `Ip(...)` inside does not fold, so it would be filled by a `main` that `_start`
+never calls — now refused at compile time, which is finding 31's fix working.
+
+So the type that exists to keep addresses apart cannot be the type of an address in kernel storage
+(the ARP table, a queued datagram's sender), and a well-known address cannot be a constant.
+
+Workaround (used): storage holds the address as `u32` (`ArpEntry.ip`, `Datagram.from`), converted at
+every read and write, and the well-known addresses are functions, `our_ip() -> Ip` and `gateway() ->
+Ip`. `Ip` survives only in signatures.
+
+Clean form: a `new` type with no range and no predicate has its base's zero, and a `const` of one is
+the base value written through the conversion (`const OUR_IP: Ip = Ip(0x0a00_020f)` folds exactly as
+`u32` would); the no-zero rule kept for types that check something.
+
+## 53. A `val` raw pointer writes through `p[i] = v`, but `p[a..<b]` of it is a `[]const T` (bug, minor)
+
+Milestone 11, `sys_sendto` copying a `SockAddr` in from the program through a byte view of a local:
+
+    fill(b: []u8)
+        b[0] = 7
+
+    var x: u64 = 0
+    val p: *u8 = ptr_cast(&x)
+    p[0] = 9                    // accepted: writes x
+    fill(p[0..<8])              // refused
+
+    error: a '[]const byte' views elements it may not write, and a '[]byte' is a licence to write
+    them — so the one does not become the other
+
+A `val` promises its *name* is written once; a `*T` does not hold the bytes it points at (the
+compiler's own rule for places: an index into a slice or through a pointer leaves the binding's
+storage, which is why `p[0] = 9` is accepted). `arrays.md` makes slicing a `val` `[]const T` for a
+`val` *array*, the binding's own bytes; a raw pointer's view (`arrays.md § A raw pointer is indexed
+anyway`) "owns nothing", and inheriting the binding's `val` there disagrees with the subscript beside
+it. The diagnostic names neither the binding nor the pointer.
+
+Workaround (used): `var raw: *u8 = ptr_cast(&to)` — the same pointer, never reassigned.
+
+Clean form: a view of a `*T` is `[]T` whatever binds the pointer (`[]const T` for a `*const T`, if
+that exists), as its subscript already is.
+
+## 54. The standard library has no datagram socket, and its TCP module is C shims with no seam a target without a C library can answer
+
+Milestone 11, `/bin/udpecho`. The program a socket API is for — bind a port, receive a datagram and
+its sender, send one back — cannot be written with the standard library on keel, for three reasons,
+each the shape findings 40, 48 and 49 had for files, standard input and processes:
+
+- **There is no UDP.** `sysl.posix.net` is TCP only, and says so (*"What is deliberately out: UDP,
+  multicast, unix domain sockets, non-blocking mode …"*); `sysl_net_socket` in its `__posix__/net.c`
+  hard-codes `SOCK_STREAM, IPPROTO_TCP`. A portable `sysl.net` is promised "later, over this".
+- **What there is reaches C by name, and keel learns so at the link.** The module is
+  `@requires(posix)`, which a manifest that mentions no capabilities provides, so a freestanding
+  program compiles against it. A probe (a workspace member depending on `rt`, built and removed):
+
+      import rt.keel.user
+      import sysl.posix.net
+
+      net.resolve_passive(8007) match
+          Ok(addrs) ->
+              net.socket(addrs[0]) match
+                  Ok(s) ->
+                      var sock = s
+                      val _ = sock.bind(addrs[0])
+                  Err(_) -> user.exit(1)
+          Err(_) -> user.exit(1)
+
+      $ sysl build --target aarch64-freestanding … user/netprobe
+      ld.lld: error: undefined symbol: sysl_net_resolve
+      ld.lld: error: undefined symbol: sysl_net_socket
+      ld.lld: error: undefined symbol: sysl_net_bind
+
+  No diagnostic names a hook to supply, as `sysl.fs` and `sysl.io` now do; there is no
+  `sysl.posix.net.sys` layer at all. Supplying `sysl_net_*` under those names from the program would
+  work at the link and mean implementing C's `getaddrinfo` contract.
+- **The address is C's.** `Address` is 128 opaque bytes laid out as a `sockaddr_storage` by the C
+  shim and read back through `sysl_net_family`/`sysl_net_text`; there is no sysl spelling of an IPv4
+  address and a port, so a hook layer would have nothing typed to pass across.
+
+Workaround (used): keel's own calls, wrapped in the user runtime — `user.socket()`, `bind(sd, port)`,
+`recvfrom(sd, into, timeout_ms) -> (n, SockAddr)`, `sendto(sd, bytes, SockAddr)`, `sockclose` — over
+system calls 25-29, with `SockAddr { ip: u32, port: u16 }` in `keel.abi`. udpecho is 50 lines of sysl
+and uses the standard library only for `parse_int` and `print`.
+
+Clean form: a `sysl.net` whose addresses are sysl values (an `Ipv4`/`Ipv6` address and a port), a
+`UdpSocket` beside the stream (`bind`, `recv_from`, `send_to`, a receive timeout), and a
+`sysl.net.sys` hook layer — socket, bind, recv-from, send-to, close, and the timeout — answered by
+`__posix__` on a hosted target and by the program on one without a C library, under the same
+compile-time check that names a missing `sysl.fs` hook.
+
+## What worked in milestone 11
+
+- **A value parameter made the virtqueue shareable.** `struct Avail[const N: usize]` and
+  `Used[const N: usize]` (`reference/generics.md`) let the disk's 32-entry queue and the card's two
+  16-entry queues use one declaration, with `@assert`ed offsets on each driver's layout; `negotiate`,
+  `set_queue` and `driver_ok` moved beside them, and the disk driver lost 59 lines and still passes.
+- **`@assert(alignof(Ipv4Header) == 1)` holds** with every field a `u8`, `Be16`, `Be32` or `Mac`, so
+  a header may be viewed at offset 14 under `codegen.strict_align` with no fault and no `@packed`.
+- **The stack is one IrqLock and one WaitQueue**: the card's interrupt acknowledges and wakes; the
+  stack's thread (`spawn(netd)`, a named function into a `&sync Fn`) handles every frame where the
+  device left it and replies from there; a socket's receive and `ping` sleep on the same queue with a
+  deadline, woken by the timer every tick while anyone waits (keel has no timed sleep; an `Atomic`
+  count keeps the timer from taking the lock otherwise).
+- **Module storage needed no initializer** except the waiter count: the lock, the queue, the card's
+  state, the ARP table and the socket table are zero-filled (finding 52 is why the table holds `u32`s).
+- **Size**: `keel.net` is 926 lines with comments (wire 149, card 239, stack 538), the socket calls
+  75, udpecho 56; the card's memory
+  is 18 contiguous frames (two rings, 16+16 buffers of 2 KiB).
+- **Timing**: per boot 1.7-1.8 s under HVF, 2.0-2.3 s at -O0, 3.2-3.5 s under TCG — the network adds
+  about half a second: ARP and ping answer in milliseconds, and the host clients' first datagrams wait
+  for keel to listen.
+- Control: `SPOIL_IP_CHECKSUM = true` (every IPv4 header keel sends one too high) fails: `keel: ping gateway failed`, `keel: udp echo saw no bye; echoed 55` (keel
+  received and answered every datagram; slirp dropped every answer), both host clients `FAILED`, and
+  the boot does not finish (udpecho keeps receiving). The receiving side's checks are the same
+  `checksum` over the received header, which the host's datagrams pass.
+
 ## What worked in milestone 10
 
 - **Spawn, not fork, cost almost nothing new.** `spawn` is `start` with a parent: the loader, the

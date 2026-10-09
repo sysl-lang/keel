@@ -28,3 +28,4 @@ the language rather than worked around here.
 | 8 | A simple filesystem; `open`/`read`/`write`/`close`, directories | files survive a reboot ✅ |
 | 9 | **sysl targets keel**: a target whose standard library reaches keel's system calls | `cp` written in sysl with `sysl.fs` copies a file ✅ |
 | 10 | Processes and a shell: `fork`/`exec`/`wait` (or `spawn`), a serial shell, `ls`/`cat`/`cp` | a session at the shell ✅ |
+| 11 | Networking: virtio-net, ARP, IPv4, ICMP, UDP | the host pings keel and gets a UDP echo ✅ (slirp cannot forward ICMP to the guest, so keel pings the gateway; the host gets UDP echoes from the kernel and from a sysl program at EL0) |
