@@ -134,6 +134,19 @@ ctr() -> u64
         [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
     v
 
+// Ask the MMU to translate `va` as an EL1 read would, and answer PAR_EL1, which holds the result.
+translate_read(va: u64) -> u64
+    var v: u64 = 0
+    asm
+        [aarch64]
+            "at s1e1r, {va}"
+            "isb"
+            "mrs {v}, par_el1"
+            in va : reg
+            out v : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    v
+
 // Barriers and maintenance. `sysl.sync.atomic_fence` is a `dmb`, which orders memory accesses
 // against each other; these order them against the translation machinery (FINDINGS.md 14).
 

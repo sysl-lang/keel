@@ -141,6 +141,30 @@ enable(maps: BootMaps)
     s.i = 1
     cpu.set_sctlr(cpu.to_word(s))
 
+// PAR_EL1 after a successful address translation (Arm ARM D19.2.97, F = 0).
+@packed
+struct Par
+    f: u1                       // [0]      1: the translation faulted, and the rest means otherwise
+    res0a: u6                   // [6:1]
+    sh: Shareability            // [8:7]
+    ns: u1                      // [9]
+    res0b: u2                   // [11:10]
+    pa: Frame                   // [47:12]
+    res0c: u8                   // [55:48]
+    attr: u8                    // [63:56]  the MAIR attribute byte the walk found
+
+@assert(sizeof(Par) == 8, "PAR_EL1 is 64 bits")
+
+// Where a kernel virtual address leads, and the MAIR attribute byte it is mapped with, as the MMU
+// itself sees it — or None if reading it would fault.
+translate(va: VirtAddr) -> Option[(PhysAddr, u8)]
+    val par: Par = cpu.from_word(cpu.translate_read(u64(va)))
+    if par.f == 1 then return None
+    Some((frame_addr(par.pa) + (u64(va) & 0xfff), par.attr))
+
+// The attribute byte a device mapping must have: Device-nGnRE.
+const DEVICE_ATTR: u8 = u8(DEVICE_NGNRE)
+
 // Take the identity map away: no walks through TTBR0 at all, so the whole low half faults. Called
 // first thing in the high half, once nothing runs at a physical address any more.
 drop_identity()

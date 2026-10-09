@@ -4,6 +4,7 @@ import keel.cpu.{current_el, enable_irqs, wait_for_interrupt}
 import keel.gic
 import keel.irq
 import keel.mm
+import keel.pl011
 import keel.pl011.{put_hex, put_str}
 import keel.psci.system_off
 import keel.timer
@@ -51,6 +52,18 @@ kmain() -> never
     put_str("keel: mmu on, kmain at ")
     put_hex(u64(usize(&kmain)))
     put_str("\n")
+
+    // QEMU does not model memory types on MMIO, so a UART mapped as Normal memory would still print.
+    // The MMU's own answer for the UART's address is what says it is mapped as a device.
+    mm.translate(mm.to_virt(mm.PhysAddr(pl011.BASE))) match
+        Some((_, attr)) ->
+            if attr == mm.DEVICE_ATTR
+                print("keel: uart is Device-nGnRE")
+            else
+                put_str("keel: uart is mapped with attributes ")
+                put_hex(u64(attr))
+                put_str("\n")
+        None -> print("keel: uart is not mapped")
 
     trap.install()
     breakpoint()
