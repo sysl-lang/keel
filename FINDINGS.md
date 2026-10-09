@@ -1870,6 +1870,9 @@ the base value written through the conversion (`const OUR_IP: Ip = Ip(0x0a00_020
 
 ## 53. A `val` raw pointer writes through `p[i] = v`, but `p[a..<b]` of it is a `[]const T` (bug, minor)
 
+**FIXED in sysl census-35 7e2a32d3 (`val-ptr-slice`; prerelease `7e2a32d396`):** a view of a `*T` is
+`[]T` whatever binds the pointer. `sys_sendto`'s and `files`' byte views are `val` again.
+
 Milestone 11, `sys_sendto` copying a `SockAddr` in from the program through a byte view of a local:
 
     fill(b: []u8)

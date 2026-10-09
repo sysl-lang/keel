@@ -51,7 +51,7 @@ names(path: string) -> Buf[string]
             return out
     // Three entries at a time, into storage typed as entries; `getdents` takes it as bytes.
     var room: [3]Dirent = [Dirent(0, 0, 0, 0, [0; 24]); 3]
-    var raw: *u8 = ptr_cast(&room[0])
+    val raw: *u8 = ptr_cast(&room[0])
     loop
         val n = user.getdents(fd, raw[0..<sizeof([3]Dirent)]) match
             Ok(n) -> usize(n) / sizeof(Dirent)

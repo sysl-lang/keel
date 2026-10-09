@@ -62,7 +62,7 @@ private[proc] sys_sendto(p: *Process, regs: *u64) -> Result[i64, Errno]
     var bytes: [net.MAX_PAYLOAD]u8 = [0; net.MAX_PAYLOAD]
     if !mm.copy_from_user(&p.space, regs[1], bytes[0..<len]) then return Err(EFAULT)
     var to = SockAddr(0, 0, 0)
-    var raw: *u8 = ptr_cast(&to)
+    val raw: *u8 = ptr_cast(&to)
     if !mm.copy_from_user(&p.space, regs[3], raw[0..<sizeof(SockAddr)]) then return Err(EFAULT)
     net.socket_send(usize(regs[0]), p.pid, Ip(to.ip), to.port, bytes[0..<len]) match
         Ok(n) -> Ok(i64(n))
