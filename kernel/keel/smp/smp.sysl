@@ -1,0 +1,114 @@
+module keel.smp
+
+// The secondary cores. QEMU's `virt` holds every core but the boot core powered off until PSCI's
+// `CPU_ON` starts it, at a physical address, at EL1, with its MMU and caches off, IRQs masked, and
+// one argument in x0. keel hands each core a boot stack and the same page tables as the boot core,
+// and makes it a scheduling core with an idle thread of its own:
+//
+//   keel_secondary_start     (asm) SP := the boot stack's physical top, which x0 carries
+//   keel_secondary_boot      MMU on with the boot maps (identity in TTBR0, kernel in TTBR1); answers
+//                            the distance to the high half, which moves SP there
+//   keel_secondary_main      in the high half: drop the identity map, vectors, the `Cpu` record in
+//                            TPIDR_EL1, this core's redistributor and timer, check in, and idle
+//
+// A boot stack is four frames from the frame allocator, reached at its physical address before the MMU
+// is on and through the linear map after, and kept for good: it becomes the idle thread's stack. It has
+// no guard page — the linear map has no holes — which an idle thread's shallow stack never needs.
+
+import keel.cpu
+import keel.gic
+import keel.irq
+import keel.mm
+import keel.psci
+import keel.sched
+import keel.timer
+import keel.trap
+import sysl.sync.{Atomic, Ordering}
+
+// The first instructions a secondary core runs. As small as `_start`: no stack exists until x0 is one.
+// TPIDR_EL1 resets to an unknown value and the ownership runtime reads it on every release, so it is
+// zeroed before any sysl code runs.
+asm
+    [aarch64]
+        ".globl keel_secondary_start"
+        "keel_secondary_start:"
+        "msr tpidr_el1, xzr"
+        "mov sp, x0"
+        "bl keel_secondary_boot"
+        "add sp, sp, x0"
+        "ldr x1, =keel_secondary_main"
+        "br x1"
+        ".ltorg"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+extern keel_secondary_start: u8
+
+private const BOOT_STACK_FRAMES: u64 = 4
+private const PAGE: u64 = 4096
+
+// How many secondaries have checked in from `keel_secondary_main`. A core's increment is a release and
+// the boot core's read an acquire, so everything the secondary set up before is visible once it counts.
+private var checked_in: Atomic[u64] = Atomic(0)
+
+// Timer ticks the boot core waits for every started core to check in before it gives up on them.
+private const PATIENCE: u64 = 100
+
+// Start every other core, wait for each to check in, and answer how many cores are scheduling.
+start() -> u64
+    gic.enable(gic.RESCHEDULE)
+    val entry = u64(mm.phys_of(usize(&keel_secondary_start)))
+    var launched: u64 = 0
+    for core in 1..<sched.MAX_CPUS
+        val stack = mm.alloc_frames(BOOT_STACK_FRAMES) match
+            Some(f) -> f
+            None -> panic("keel: no frames for a secondary core's boot stack")
+        val base = mm.frame_addr(stack)
+        val top = u64(base) + BOOT_STACK_FRAMES * PAGE
+        // The core writes this stack with its caches off, straight to memory. Any line of it still in
+        // a cache (the frames were the heap's a moment ago) would hide those writes once the core's
+        // own caches are on, or overwrite them when evicted; so none may be left anywhere.
+        flush_range(u64(mm.to_virt(base)), BOOT_STACK_FRAMES * PAGE)
+        val status = psci.cpu_on(u64(core), entry, top)
+        if status != 0
+            mm.free_frames(stack, BOOT_STACK_FRAMES)
+            print("keel: core", core, "did not start: PSCI status", status)
+            break
+        launched += 1
+
+    val since = irq.ticks.load(Ordering.Relaxed)
+    while checked_in.load(Ordering.Acquire) < launched
+        if irq.ticks.load(Ordering.Relaxed) - since > PATIENCE
+            print("keel: started", launched, "cores, and", checked_in.load(Ordering.Acquire), "checked in")
+            break
+        cpu.relax()
+    sched.cores_up()
+
+// Clean and invalidate every data cache line of [va, va + len) to the point of coherency.
+private flush_range(va: u64, len: u64)
+    val line = u64(4) << ((cpu.ctr() >> 16) & 0xf)
+    var a = va & ~(line - 1)
+    while a < va + len
+        cpu.clean_invalidate_dcache_line(a)
+        a += line
+    cpu.dsb()
+
+// Called by `keel_secondary_start` on the core's boot stack, at physical addresses, with the MMU off.
+// Like `keel_boot`, it may use only PC-relative addresses until it returns.
+@export("keel_secondary_boot")
+secondary_boot() -> u64
+    mm.enable_secondary()
+    mm.KERNEL_BASE
+
+// A secondary core's kernel proper, in the high half on its boot stack, IRQs still masked.
+@export("keel_secondary_main")
+secondary_main() -> never
+    mm.drop_identity()
+    trap.install()
+    sched.init_secondary()
+    gic.init_cpu()
+    gic.enable(timer.IRQ)
+    gic.enable(gic.RESCHEDULE)
+    timer.start_this_core()
+    checked_in.add(1, Ordering.Release)
+    cpu.enable_irqs()
+    sched.run_idle()

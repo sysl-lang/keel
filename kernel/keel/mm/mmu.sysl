@@ -121,7 +121,13 @@ build_boot_maps() -> BootMaps
     map_kernel(root, guard + u64(4096), u64(paged_end) - u64(guard) - 4096, ram_rw())
     map_kernel(root, paged_end, RAM_SIZE - IMAGE_REGION_END, ram_rw())
 
-    BootMaps(id_pa, root_pa)
+    boot_maps = BootMaps(id_pa, root_pa)
+    boot_maps
+
+// The roots `build_boot_maps` made, for the secondary cores, which switch their MMUs on with the same
+// tables. Written once with the MMU off — straight to memory, never into a cache line — and only read
+// after that, so a secondary reading it with its own caches off sees what the boot core wrote.
+private var boot_maps: BootMaps = BootMaps(PhysAddr(0), PhysAddr(0))
 
 private map_kernel(root: *Table, pa: PhysAddr, len: u64, prot: Prot)
     map_range(root, to_virt(pa), pa, len, prot)
@@ -132,7 +138,17 @@ enable(maps: BootMaps)
     cpu.dsb()
     invalidate_pool()
     cpu.dsb()
+    switch_on(maps)
 
+// Turn a secondary core's translation on, with the boot core's tables: the identity map in TTBR0 for
+// the instructions between this and the jump to the high half, the kernel's in TTBR1. Runs with the
+// core's MMU and caches off, at physical addresses. The pool is not invalidated here: the boot core has
+// been writing tables through its cache since its own MMU went on, and discarding those lines would
+// throw its writes away. The walks this core makes once its MMU is on are cacheable and inner
+// shareable, so they see the boot core's cache.
+enable_secondary() = switch_on(boot_maps)
+
+private switch_on(maps: BootMaps)
     cpu.set_mair(mair())
     val parange = cpu.mmfr0() & 0xf
     cpu.set_tcr(cpu.to_word(tcr_value(u3(if parange > 5 then 5 else parange))))

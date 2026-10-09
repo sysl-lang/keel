@@ -19,6 +19,7 @@ module keel.sched
 // `lock`, so a waker — who needs both — cannot make the sleeper runnable before it is off the core.
 
 import keel.cpu
+import keel.gic
 import sysl.sync.{Atomic, Ordering, SpinLock}
 
 const MAX_CPUS: usize = 4
@@ -29,13 +30,17 @@ private const SLICE: u64 = 1
 // Off only to show the boot test's interleaving check failing without preemption.
 private const PREEMPTION: bool = true
 
+// One core's record. Only that core writes `last`, `slice`, `need_resched` and `reaper`; `current` is
+// written with `lock` held, so another core holding it may read which cores are idle. The records sit
+// side by side in `cpus`, a cache line apart only by luck of size (FINDINGS.md 31).
 struct Cpu
     id: u64
     current: *Thread
-    idle: *Thread
+    idle: *Thread               // null until the core is up
     last: *Thread               // the thread this core switched away from, for `finish_switch`
     slice: u64                  // ticks left in `current`'s time slice
-    need_resched: bool          // the slice ran out; switch on the way out of the interrupt
+    need_resched: bool          // the slice ran out, or another core asked; switch on the way out
+    reaper: Reaper              // the drain list for releases made before this core has a thread
 
 private var cpus: [MAX_CPUS]Cpu
 
@@ -44,10 +49,15 @@ private var ready: Queue = Queue(null, null)
 private var started: bool = false
 private[sched] var next_id: Atomic[u64] = Atomic(0)
 
-// The drain list for references released before there is a current thread.
+// The drain list for references released before any core has a `Cpu` (kmain, before `init`).
 private var boot_reaper: Reaper = Reaper(null, 0)
 
-// The running core's record. Valid once `init` has run on it.
+// The running core's record. Valid once `init` or `init_secondary` has run on it.
+//
+// **Only with IRQs masked** (or `lock` held, which implies it): a thread preempted between reading
+// TPIDR_EL1 and using the answer may resume on another core and read that core's record, and nothing
+// in the language marks the window — per-core data is a pointer the program keeps, not storage the
+// compiler knows is per core (FINDINGS.md 27).
 private[sched] this_cpu() -> *Cpu = ptr_cast(usize(cpu.tpidr()))
 
 // Make the code running now — kmain, on the boot stack — the boot core's first thread, give the core an
@@ -56,21 +66,61 @@ private[sched] this_cpu() -> *Cpu = ptr_cast(usize(cpu.tpidr()))
 init()
     val c = &cpus[usize(cpu.core_id())]
     c.id = cpu.core_id()
+    c.reaper = Reaper(null, 0)
 
     val boot: &sync Thread = Thread(Context([0; 12], 0, 0), next_id.add(1), Running, null, None, None, None,
         empty_wait_queue(), Reaper(null, 0), 0)
     val bp: *Thread = &*boot
     bp.me = Some(boot)
-    c.current = bp
 
     val idle = new_thread(Some(idle_loop))
-    c.idle = &*idle
-    c.slice = SLICE
 
     val flags = cpu.irq_save()
+    lock.lock()
+    c.current = bp
+    c.idle = &*idle
+    c.slice = SLICE
     cpu.set_tpidr(u64(usize(c)))
     started = true
+    lock.unlock()
     cpu.irq_restore(flags)
+
+// Make the code running now — a secondary core, on the boot stack `keel.smp` gave it — that core's idle
+// thread, and start scheduling there. Called with IRQs masked; TPIDR_EL1 is set before anything can
+// release a reference, so the runtime's reaper hook finds this core's list from the start.
+init_secondary()
+    val c = &cpus[usize(cpu.core_id())]
+    c.id = cpu.core_id()
+    c.reaper = Reaper(null, 0)
+    c.current = null
+    cpu.set_tpidr(u64(usize(c)))
+
+    val idle: &sync Thread = Thread(Context([0; 12], 0, 0), next_id.add(1), Running, null, None, None, None,
+        empty_wait_queue(), Reaper(null, 0), 0)
+    val ip: *Thread = &*idle
+    ip.me = Some(idle)
+
+    lock.lock()
+    c.current = ip
+    c.idle = ip
+    c.slice = SLICE
+    lock.unlock()
+
+// Become this core's idle thread for good. The caller is the code `init_secondary` made into one.
+run_idle() -> never
+    idle_loop()
+    panic("keel: an idle loop returned")
+
+// How many cores are scheduling.
+cores_up() -> u64
+    val flags = cpu.irq_save()
+    lock.lock()
+    var n: u64 = 0
+    for i in 0..<MAX_CPUS
+        if cpus[i].idle != null then n += 1
+    lock.unlock()
+    cpu.irq_restore(flags)
+    n
 
 // What a core runs when nothing is ready. Idle itself makes threads ready — `finish_switch` wakes an
 // exited thread's joiners in whichever thread runs next, often this one — so it hands the core over
@@ -87,13 +137,39 @@ private idle_loop()
         if nothing then cpu.wait_for_interrupt()
         cpu.irq_restore(flags)
 
-// The thread running on this core.
-current() -> *Thread = this_cpu().current
+// The thread calling this. IRQs are masked for the read (see `this_cpu`); the answer stays right after,
+// because a thread is its own wherever it runs.
+current() -> *Thread
+    val flags = cpu.irq_save()
+    val t = this_cpu().current
+    cpu.irq_restore(flags)
+    t
 
-// Ready to run: on the run queue. Called with `lock` held.
+// Ready to run: on the run queue, and one idle core, if there is one, told so. Called with `lock` held.
 private[sched] make_ready_locked(t: *Thread)
     t.state = Ready
     ready.push(t)
+    if IPI then wake_an_idle_core()
+
+// Off only to show what the reschedule interrupt is for: without it an idle core notices new work at its
+// next timer tick instead of at once.
+private const IPI: bool = true
+
+// Send the reschedule interrupt to one core that is running its idle thread, other than this one.
+// Called with `lock` held, which is what makes `current` safe to read on another core's record; the
+// woken core takes `lock` before it looks at the run queue, so it sees the push this follows.
+private wake_an_idle_core()
+    val me = this_cpu()
+    for i in 0..<MAX_CPUS
+        val c = &cpus[i]
+        if c != me && c.idle != null && c.current == c.idle
+            gic.send_sgi(gic.RESCHEDULE, c.id)
+            return
+
+// The reschedule interrupt's part: switch on the way out of it, if anything is ready.
+reschedule_requested()
+    if !started then return
+    this_cpu().need_resched = true
 
 // Switch this core to the next ready thread. Called with `lock` held and IRQs masked; returns, with the
 // lock held, when something switches back to the caller. A caller still `Running` goes to the back of
@@ -162,10 +238,17 @@ preempt()
 // The ownership runtime asks this for the running thread's drain list whenever a release reaches zero
 // (link.ld names it `__sysl_arc_reaper`, FINDINGS.md 21). Each thread needs its own: a thread preempted
 // half way through draining would otherwise have its list taken over by the next.
+//
+// It runs with IRQs on, from any thread, so the TPIDR_EL1 read and the `current` load are made with
+// IRQs masked: preempted between them, the thread could resume on another core and take that core's
+// thread's list.
 @export("keel_arc_reaper")
 arc_reaper() -> *Reaper
+    val flags = cpu.irq_save()
     val c = cpu.tpidr()
-    if c == 0 then return &boot_reaper
-    val p: *Cpu = ptr_cast(usize(c))
-    if p.current == null then return &boot_reaper
-    &p.current.reaper
+    var r: *Reaper = &boot_reaper
+    if c != 0
+        val p: *Cpu = ptr_cast(usize(c))
+        r = if p.current == null then &p.reaper else &p.current.reaper
+    cpu.irq_restore(flags)
+    r

@@ -6,7 +6,7 @@ module keel.trap
 // every call, so the handler and everything it reaches is proven allocator-free. (Releasing a counted
 // reference is still allowed and reaches `keel_free`, which is why the heap masks IRQs.)
 
-import keel.cpu.{esr, far, set_vbar}
+import keel.cpu.{core_id, esr, far, irq_restore, irq_save, set_vbar}
 import keel.irq.dispatch
 import keel.mm
 import keel.pl011.{put_byte, put_hex, put_str}
@@ -208,7 +208,7 @@ private data_abort(s: Syndrome, raw: u64, frame: *Frame)
     put_byte(u8('0') + u8(level))
     details(raw, frame)
 
-    if probing.load(Ordering.Acquire) == 1
+    if probing.load(Ordering.Acquire) == core_id() + 1
         probe_faulted.store(1, Ordering.Release)
         frame.elr += 4
     else
@@ -220,20 +220,24 @@ private fault_kind(group: u64) -> string = group match
     3 -> "permission fault"
     else "data abort"
 
-// Whether a probe is in flight, and whether it faulted. Set and read on one core, by kmain and by the
-// handler that interrupts it, so atomics only to make every access a real one.
+// Which core has a probe in flight (its id plus one; zero for none), and whether it faulted. A fault on
+// any other core is a real one. Probes are made one at a time — the boot test's are.
 private var probing: Atomic[u64] = Atomic(0)
 private var probe_faulted: Atomic[u64] = Atomic(0)
 
 // Read the word at `addr`, and answer whether that worked rather than faulting. The read is one
-// volatile load, which is the one instruction the handler steps over if it faults.
+// volatile load, which is the one instruction the handler steps over if it faults. IRQs are masked so
+// the thread cannot move to another core between saying which core is probing and the load.
 probe(addr: mm.VirtAddr) -> bool
+    val flags = irq_save()
     probe_faulted.store(0, Ordering.Relaxed)
-    probing.store(1, Ordering.Release)
+    probing.store(core_id() + 1, Ordering.Release)
     val p: *volatile u64 = ptr_cast(usize(u64(addr)))
     val _ = *p
     probing.store(0, Ordering.Release)
-    probe_faulted.load(Ordering.Acquire) == 0
+    val ok = probe_faulted.load(Ordering.Acquire) == 0
+    irq_restore(flags)
+    ok
 
 // The rest of a trap's line: the syndrome, where it was taken, and the faulting address.
 private details(raw: u64, frame: *Frame)

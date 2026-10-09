@@ -9,8 +9,9 @@ import keel.timer
 import keel.pl011.{put_hex, put_str}
 import sysl.sync.{Atomic, Ordering}
 
-// Timer interrupts taken since boot. The IRQ handler is its only writer and kmain reads it, so it is an
-// atomic: every load is a real load. An exclusive load/store pair needs Normal memory, which is why
+// Timer interrupts taken since boot, on every core (each core's timer ticks every 10 ms, so with four
+// cores up this counts 400 a second). Every core's IRQ handler adds to it and threads read it, so it
+// is an atomic: every load is a real load, and no two adds lose one. An exclusive load/store pair needs Normal memory, which is why
 // this waited for the MMU (FINDINGS.md 6).
 var ticks: Atomic[u64] = Atomic(0)
 
@@ -22,6 +23,8 @@ dispatch()
         timer.rearm()
         ticks.add(1, Ordering.Relaxed)
         sched.tick()
+    else if id == gic.RESCHEDULE
+        sched.reschedule_requested()
     else
         put_str("keel: unexpected interrupt ")
         put_hex(u64(id))

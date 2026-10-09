@@ -43,6 +43,10 @@ expected=(
     "keel: waitqueue ok"    # a producer and a consumer slept on two wait queues and passed 200 in order
     "keel: stack guard faults"  # the page below a thread's stack is unmapped
     "keel: threads reclaimed"   # every joined thread's stack frames and heap blocks came back
+    "keel: cores 4"         # PSCI CPU_ON started the three secondaries, and each checked in
+    "keel: smp ran on "     # threads ran on more than one core (the count is checked below)
+    "keel: smp mutex ok"    # 4 threads x 100,000 additions under the Mutex, on >= 2 cores at once
+    "keel: smp heap ok"     # 4 threads x 10,000 Bufs on the heap at once; every block and frame back
 )
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
@@ -60,7 +64,7 @@ else
     machine=(-cpu cortex-a72)
 fi
 
-qemu-system-aarch64 -M virt,gic-version=3 $machine -m 256M -nographic -kernel $elf > $log 2>&1 < /dev/null &
+qemu-system-aarch64 -M virt,gic-version=3 $machine -smp ${KEEL_SMP:-4} -m 256M -nographic -kernel $elf > $log 2>&1 < /dev/null &
 qpid=$!
 
 waited=0
@@ -99,6 +103,12 @@ done
 frames=${${(M)${(f)"$(<$log)"}:#keel: frames *}#keel: frames }
 if [[ $frames != <-> ]] || (( frames < frames_min || frames > frames_max )); then
     print -r -- "FAIL: 'keel: frames $frames' is not a free count between $frames_min and $frames_max"
+    return 1
+fi
+spread=${${(M)${(f)"$(<$log)"}:#keel: smp ran on *}#keel: smp ran on }
+spread=${spread% cores}
+if [[ $spread != <-> ]] || (( spread < 2 )); then
+    print -r -- "FAIL: 'keel: smp ran on $spread cores' — threads have to have run on at least 2 cores"
     return 1
 fi
 if (( qemu_exit != 0 )); then

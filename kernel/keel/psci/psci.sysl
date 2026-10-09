@@ -5,6 +5,25 @@ module keel.psci
 // — and a call is a function number in x0.
 
 private const SYSTEM_OFF: u64 = 0x8400_0008
+private const CPU_ON: u64 = 0xC400_0003          // the SMC64/HVC64 form: 64-bit addresses
+
+// Start the core whose MPIDR affinity is `target` at physical address `entry`, with its MMU and caches
+// off, at EL1, and `context` in x0. Answers PSCI's status: 0 for success, negative otherwise (-2 an
+// invalid parameter, -4 already on).
+cpu_on(target: u64, entry: u64, context: u64) -> i64
+    val id = CPU_ON
+    var status: i64 = 0
+    asm
+        [aarch64]
+            "hvc #0"
+            in id : "x0"
+            in target : "x1"
+            in entry : "x2"
+            in context : "x3"
+            out status : "x0"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    status
+
 
 // Ask the machine to power off. QEMU exits when it is answered; should it ever return, the processor
 // waits for an interrupt that is never coming.

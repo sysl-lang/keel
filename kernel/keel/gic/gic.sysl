@@ -22,7 +22,7 @@ private const CTLR_ARE: u32 = 1 << 4         // affinity routing, which GICv3 pr
 private struct RedistributorControl
     ctlr: volatile u32                  // 0x000
     iidr: volatile u32                  // 0x004
-    typer: [2]volatile u32              // 0x008
+    typer: volatile u64                 // 0x008 read whole: under HVF either 32-bit half reads as 0
     statusr: volatile u32               // 0x010
     waker: volatile u32                 // 0x014
 
@@ -53,15 +53,49 @@ private const SGI_FRAME: u64 = 0x1_0000
 // What `acknowledge` answers when nothing is pending after all.
 const SPURIOUS: u32 = 1023
 
-private dist() -> *Distributor = mm.io(mm.PhysAddr(DIST_BASE))
-private redist_control() -> *RedistributorControl = mm.io(mm.PhysAddr(REDIST_BASE))
-private redist() -> *Redistributor = mm.io(mm.PhysAddr(REDIST_BASE + SGI_FRAME))
+// Each core has a redistributor of its own: two frames, one after another in core order.
+private const REDIST_STRIDE: u64 = 0x2_0000
+private const TYPER_LAST: u64 = 1 << 4          // GICR_TYPER: the last redistributor in the region
 
-// Switch on the distributor, wake this processor's redistributor, and open the CPU interface to
-// group 1 interrupts of every priority.
+// The interrupt keel sends a core to make it look at the run queue (an SGI, 0-15).
+const RESCHEDULE: u32 = 0
+
+private dist() -> *Distributor = mm.io(mm.PhysAddr(DIST_BASE))
+
+// This core's redistributor: the one whose GICR_TYPER affinity is this core's MPIDR affinity. The
+// search is made each time rather than remembered, because remembering it is per-core data and keel
+// keeps that only in `sched.Cpu`; it runs only while a core sets itself up.
+private redist_base() -> u64
+    val me = mpidr_affinity()
+    var base = REDIST_BASE
+    loop
+        val r: *RedistributorControl = mm.io(mm.PhysAddr(base))
+        val typer = r.typer                     // one 64-bit read: HVF's GIC answers 32-bit halves with 0
+        if u32((typer >> 32) & 0xffff) == me then return base   // [63:32]: Aff3.Aff2.Aff1.Aff0
+        if (typer & TYPER_LAST) != 0 then panic("keel: no redistributor for this core")
+        base += REDIST_STRIDE
+
+private redist_control() -> *RedistributorControl = mm.io(mm.PhysAddr(redist_base()))
+private redist() -> *Redistributor = mm.io(mm.PhysAddr(redist_base() + SGI_FRAME))
+
+// MPIDR_EL1's Aff1.Aff0, as GICR_TYPER's low affinity bytes hold them.
+private mpidr_affinity() -> u32
+    var v: u64 = 0
+    asm
+        [aarch64]
+            "mrs {v}, mpidr_el1"
+            out v : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    u32(v & 0xffff)
+
+// Switch on the distributor, once, from the boot core; then the boot core's own interface.
 init()
     dist().ctlr = dist().ctlr | CTLR_ARE | CTLR_ENABLE_GRP1
+    init_cpu()
 
+// Wake this core's redistributor, and open its CPU interface to group 1 interrupts of every priority.
+// Every core runs this for itself.
+init_cpu()
     val w = redist_control()
     w.waker = w.waker & ~WAKER_PROCESSOR_SLEEP
     while (w.waker & WAKER_CHILDREN_ASLEEP) != 0 do ()
@@ -70,8 +104,23 @@ init()
     set_priority_mask(0xff)
     enable_group1()
 
-// Enable private interrupt `id` (16-31) in group 1, which this processor takes as an IRQ, at the
-// middle priority.
+// Send software-generated interrupt `id` to the core whose MPIDR Aff0 is `core` (in cluster 0, which
+// is every core QEMU's `virt` has up to 16). ICC_SGI1R_EL1: INTID [27:24], Aff1 [23:16], the target
+// list [15:0] a bit per Aff0. The run queue the target will look at was written before this, and a
+// system register write is not a memory access, so no `sysl.sync` ordering puts the stores first: the
+// `dsb ishst` does (FINDINGS.md 28).
+send_sgi(id: u32, core: u64)
+    val v = (u64(id) << 24) | (u64(1) << core)
+    asm
+        [aarch64]
+            "dsb ishst"
+            "msr icc_sgi1r_el1, {v}"
+            "isb"
+            in v : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// Enable private interrupt `id` (0-31: an SGI or a PPI) in group 1 on this core's redistributor, which
+// this processor takes as an IRQ, at the middle priority.
 enable(id: u32)
     val r = redist()
     val word = usize(id / 4)

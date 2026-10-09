@@ -38,9 +38,14 @@ private set_control(bits: u64)
             in bits : reg
         [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
 
-// Raise the timer's interrupt every `ms` milliseconds.
+// Raise the timer's interrupt every `ms` milliseconds. Each core has a timer of its own; the boot core
+// sets the period, and the others start theirs with `start_this_core`.
 start(ms: u64)
     period = frequency() * ms / 1000
+    start_this_core()
+
+// Start this core's timer at the period `start` set.
+start_this_core()
     set_countdown(period)
     set_control(1)
 

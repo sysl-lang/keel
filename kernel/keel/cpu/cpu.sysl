@@ -162,6 +162,13 @@ dsb()
         [aarch64] "dsb sy"
         [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
 
+// Every store before this one is visible to the other cores before anything after it happens —
+// including a system register write, which no `sysl.sync` ordering can order (FINDINGS.md 28).
+dsb_ishst()
+    asm
+        [aarch64] "dsb ishst"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
 // Forget every EL1 translation this core has cached, wait for that, and refetch.
 flush_tlb()
     asm
@@ -234,6 +241,15 @@ invalidate_dcache_line(addr: u64)
     asm
         [aarch64]
             "dc ivac, {addr}"
+            in addr : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// Write the data cache line holding `addr` back to memory and discard it, so neither a stale copy nor
+// a later eviction can disagree with what a core whose caches are off writes there.
+clean_invalidate_dcache_line(addr: u64)
+    asm
+        [aarch64]
+            "dc civac, {addr}"
             in addr : reg
         [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
 

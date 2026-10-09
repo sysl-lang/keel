@@ -1,0 +1,163 @@
+module keel.selftest
+
+// What milestone 5 is for, run by kmain once the secondary cores are up: threads spread over the cores,
+// a mutex that holds when its holders run at the same time, and a heap that four cores allocate from
+// at once and give everything back to.
+
+import keel.cpu
+import keel.heap
+import keel.irq
+import keel.mm
+import keel.sched
+import keel.sched.{Mutex, Thread, join, mutex, spawn}
+import sysl.buf.{Buf, buf}
+import sysl.sync.{Atomic, Ordering}
+
+smp()
+    spread()
+    smp_counting()
+    smp_heap()
+
+// The number of bits set in `mask`.
+private popcount(mask: u64) -> u64
+    var n: u64 = 0
+    var m = mask
+    while m != 0
+        n += m & 1
+        m >>= 1
+    n
+
+// --- Spread ---------------------------------------------------------------------------------------
+//
+// Eight threads spin, each recording which core it finds itself on (MPIDR's Aff0, a bit each), until
+// every scheduling core has been seen or two seconds' worth of ticks have passed. Nothing pins a thread:
+// the one run queue sends each wherever a core comes free, and the reschedule interrupt wakes idle
+// cores for them.
+
+private const SPINNERS: u64 = 8
+private const SPREAD_PATIENCE: u64 = 800        // timer ticks, all cores together: two seconds at four
+
+private struct Seen
+    cores: Atomic[u64]
+
+private spread()
+    val want = sched.cores_up()
+    val s: &sync Seen = Seen(Atomic(0))
+    var threads: Buf[&sync Thread] = buf()
+    for _ in 0..<SPINNERS
+        threads.push(spawn(() -> record_cores(s, want)))
+    for t in threads
+        join(t)
+    print("keel: smp ran on", popcount(s.cores.load(Ordering.Acquire)), "cores")
+
+private record_cores(s: &sync Seen, want: u64)
+    val since = irq.ticks.load(Ordering.Relaxed)
+    loop
+        val seen = s.cores.or(u64(1) << cpu.core_id(), Ordering.Relaxed) | (u64(1) << cpu.core_id())
+        if popcount(seen) >= want || irq.ticks.load(Ordering.Relaxed) - since > SPREAD_PATIENCE then break
+        cpu.relax()
+
+// --- Mutex across cores ---------------------------------------------------------------------------
+//
+// Milestone 4's mutex test at the size SMP needs: four threads, a hundred thousand additions each, a
+// read, a short wait and a write each. With four cores the threads run at the same moment, so without
+// the lock the total comes out short at once; with it, the four hundred thousand must all be there.
+// The test also records which cores the additions ran on, and needs at least two.
+
+private const SMP_WORKERS: u64 = 4
+private const SMP_ADDS: u64 = 100_000
+private const SMP_HOLD: u64 = 20                // spin steps between the read and the write
+
+private struct Counted
+    m: Mutex[u64]
+    cores: Atomic[u64]
+
+private smp_counting()
+    val c: &sync Counted = Counted(mutex(0), Atomic(0))
+    var workers: Buf[&sync Thread] = buf()
+    for _ in 0..<SMP_WORKERS
+        workers.push(spawn(() -> smp_add_many(c)))
+    for w in workers
+        join(w)
+
+    val total = *c.m.lock()
+    c.m.unlock()
+    val cores = popcount(c.cores.load(Ordering.Acquire))
+    if total == SMP_WORKERS * SMP_ADDS && cores >= 2
+        print("keel: smp mutex ok")
+    else
+        print("keel: smp mutex wrong: total", total, "cores", cores, "contended", c.m.contentions())
+
+private smp_add_many(c: &sync Counted)
+    for i in 0..<SMP_ADDS
+        if i % 1024 == 0 then c.cores.or(u64(1) << cpu.core_id(), Ordering.Relaxed)
+        val p = c.m.lock()
+        defer c.m.unlock()
+        val v = *p
+        for _ in 0..<SMP_HOLD
+            cpu.relax()
+        *p = v + 1
+
+// --- Heap across cores ----------------------------------------------------------------------------
+//
+// Four threads each make ten thousand `Buf[u64]`s of 1 to 400 elements — every slab class and runs of
+// frames above them — keeping the last eight alive, so blocks are freed in a different order from
+// their allocation and by a thread on whatever core it is on by then. Each `Buf` is summed before it
+// goes. Afterwards every block and every frame must be back.
+
+private const HEAP_WORKERS: u64 = 4
+private const HEAP_BUFS: u64 = 10_000
+private const HEAP_KEEP: usize = 8
+
+private struct HeapRun
+    wrong: Atomic[u64]
+    cores: Atomic[u64]
+
+private smp_heap()
+    val frames = mm.frames_free()
+    val blocks = heap.live()
+    val (wrong, cores) = heap_workers()
+    if wrong == 0 && cores >= 2 && mm.frames_free() == frames && heap.live() == blocks
+        print("keel: smp heap ok")
+    else
+        print("keel: smp heap wrong: bad sums", wrong, "cores", cores, "frames free", mm.frames_free(), "of",
+            frames, "blocks live", heap.live(), "of", blocks)
+
+// Run the four churners and answer how many `Buf`s came back wrong and on how many cores they ran.
+// Everything this allocates — the threads, the closures, the shared record — is gone when it returns.
+private heap_workers() -> (u64, u64)
+    val r: &sync HeapRun = HeapRun(Atomic(0), Atomic(0))
+    var workers: Buf[&sync Thread] = buf()
+    for w in 0..<HEAP_WORKERS
+        workers.push(spawn(() -> churn(r, w)))
+    for t in workers
+        join(t)
+    (r.wrong.load(Ordering.Acquire), popcount(r.cores.load(Ordering.Acquire)))
+
+private churn(r: &sync HeapRun, seed: u64)
+    var kept: Buf[Buf[u64]] = buf()
+    for i in 0..<HEAP_BUFS
+        if i % 256 == 0 then r.cores.or(u64(1) << cpu.core_id(), Ordering.Relaxed)
+        val n = 1 + (i * 37 + seed * 101) % 400
+        var b: Buf[u64] = buf()
+        for j in 0..<n
+            b.push(j + seed)
+        if kept.len() == HEAP_KEEP
+            val slot = usize(i) % HEAP_KEEP
+            if !sums_right(kept[slot]) then r.wrong.add(1, Ordering.Relaxed)
+            kept[slot] = b
+        else
+            kept.push(b)
+    for b in kept
+        if !sums_right(b) then r.wrong.add(1, Ordering.Relaxed)
+
+// Whether `b` still holds `base, base + 1, ...`: what `churn` wrote, so another core's block written
+// over it would show.
+private sums_right(b: Buf[u64]) -> bool
+    if b.len() == 0 then return false
+    val base = b[0]
+    var k: u64 = 0
+    for x in b
+        if x != base + k then return false
+        k += 1
+    true

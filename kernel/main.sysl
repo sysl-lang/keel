@@ -12,6 +12,7 @@ import keel.psci.system_off
 import keel.rt
 import keel.sched
 import keel.selftest
+import keel.smp
 import keel.timer
 import keel.trap
 import sysl.buf.{Buf, buf}
@@ -102,6 +103,11 @@ kmain(dtb_pa: u64) -> never
 
     sched.init()
     selftest.threads()
+
+    // Milestone 4's tests ran on the boot core alone, which is what makes their preemption checks mean
+    // something; now the others.
+    print("keel: cores", smp.start())
+    selftest.smp()
     system_off()
 
 // Give the frame allocator every frame of RAM that the image and the device tree do not occupy. RAM's
