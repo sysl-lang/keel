@@ -1990,6 +1990,131 @@ Clean form: a `sysl.net` whose addresses are sysl values (an `Ipv4`/`Ipv6` addre
 `__posix__` on a hosted target and by the program on one without a C library, under the same
 compile-time check that names a missing `sysl.fs` hook.
 
+## Milestone 14 survey: a C library written in sysl
+
+keel's libc (for ports only) exports the C names over keel's system calls; clang compiles C against
+our headers and links `libc.a`. Every element was probed against prerelease 7e2a32d396 at
+`aarch64-freestanding`; the C and the sysl archive were linked with ld.lld and run under QEMU. What
+works directly: C-named `@export`s that clang-built C links, the `v*` family over `*va_list`, struct
+layouts `@assert`ed against `c const offsetof`, `setjmp`/`longjmp` as module asm, `malloc` & co as
+the program's allocator pair, `qsort` comparators and `atexit` tables.
+
+## 55. `va_arg` reads only the stack on AAPCS64 targets other than Darwin (bug)
+
+```
+sum(n: int, ...) -> int
+    var ap = va_start()
+    var total = 0
+    for _ in 0..<n
+        total += va_arg(ap)
+    total
+```
+
+`sum(3, 10, 20, 30)` answers **12** at `aarch64-freestanding`, with no diagnostic;
+`reference/ffi.md § Variadic functions` promises 60, which is true only on aarch64-macos. sysl emits
+LLVM's `va_arg` instruction, which the AArch64 back end lowers only for Darwin's `char *` va_list: on
+AAPCS64 it bumps `__stack` and never reads `__gr_offs`/`__vr_offs`. `va_start` builds the 32-byte
+struct correctly. Clang never emits the instruction for AArch64; it expands the walk itself. Almost
+certainly also wrong on aarch64-linux and android. The avoided workaround: a hand-written walker over
+`{__stack, __gr_top, __vr_top, __gr_offs, __vr_offs}` (ran green). Fix: expand `va_arg` in sysl's
+AAPCS64 lowering as clang does.
+
+## 56. An `@export` may not be variadic, so `printf`, `open`, `fcntl`, `execl` cannot be defined
+
+```
+@export("printf") c_printf(fmt: *u8, ...) -> int
+```
+```
+'c_printf' is variadic, and what a C caller promotes into the tail is decided by the prototype it
+compiled against rather than by this declaration — take a 'va_list' parameter instead, which states
+the same thing and is what C's own 'v' variants do
+```
+
+For a C library the promotion argument is moot: the library's own header is the prototype every
+caller compiles against. `reference/ffi.md § Variadic functions` itself names "a function that must
+be callable from C at a variadic signature" as a concrete case. The avoided workaround: ~20 lines of
+module asm per entry point saving x1–x7/q0–q7, building the `va_list` and branching to the `v` twin.
+(Depends on 55 for the body.)
+
+## 57. Module storage cannot be `@export`ed, so `errno`, `environ`, `stdin`/`stdout`/`stderr`, `optarg` cannot be defined
+
+```
+@export("errno")
+var errno: int = 0
+```
+```
+'@export' names what C sees — a function's symbol, or the name a struct's or a type's 'typedef'
+carries in a generated header — and this declares none of them …
+```
+
+The reference covers only the reading direction (`§ An extern also declares a variable`). The
+avoided workaround (ran): define the storage in module asm `.bss` and reach it through `extern`,
+every size a hand-copied number nothing checks against `sizeof`.
+
+## 58. The address of module storage is not constant data (`FILE *stdout = &files[1]`)
+
+```
+var files: [3]File = …
+val stdout_ptr: *File = &files[1]      // reached from an export
+```
+```
+… reaches 'keel.libc.stdout_ptr', which is module storage an initializer fills before the program's
+own statements run. This artifact has no entry point to fill it in, and 'aarch64-freestanding' is
+freestanding …
+```
+
+In C this is a link-time constant (a relocation). `reference/ffi.md § What constant data is` lists
+scalars and `ptr_cast` of an integer and is silent on the address of a module binding. Avoided
+workaround: compute it in a function, or lay it out in asm as in 57.
+
+## 59. A C runtime written in sysl cannot call the C program's `main`
+
+```
+extern "main" program_main(argc: int, argv: **u8) -> int      // in a build-c archive
+```
+```
+an 'extern' may name 'main' only on an image that starts somewhere else, whose entry calls it — and
+this archive has no entry of its own, so 'main' is the C program's
+```
+
+`reference/packages.md` refuses it because "its `main` being the C program's" — but calling the C
+program's `main` is exactly a crt0's job. Avoided workaround (ran): `_start` in asm doing
+`bl __libc_start; bl main; bl exit`. Wanted: a way for an archive to declare itself the C runtime
+(for instance a manifest `entry` on a `build-c` target), after which the extern is allowed.
+
+## 60. Float ↔ text leans on C's `snprintf`/`strtod`, so a libc written in sysl has nothing for `printf("%f")` or `strtod`
+
+```
+f"${x}%.3f"            // x: f64, at aarch64-freestanding
+```
+```
+'%.3f' is applied by C's 'snprintf', and 'aarch64-freestanding' has no C library under it to supply
+one — only an integer specifier is rendered without C …
+```
+
+`library/sysl/print.sysl:132` and `library/sysl/text/parse.sysl:202` say float formatting and parsing
+go to C. The libc *is* the `snprintf` sysl wants. Avoided workaround: Ryu/Grisu plus a correctly
+rounded `strtod` hand-written inside keel's libc — several hundred lines that belong in
+`sysl.fmt`/`sysl.text`, where integer formatting already moved. (keel must also save FP state per
+process before C code may use floats: a keel item, not sysl's.)
+
+## 61. `long double` has no sysl type (minor)
+
+`ld_id(x: f128) -> f128 = x` → *"'f128' is not lowered yet — the widest float is 'f64'"*, as
+`reference/types.md` says. The libc leaves `strtold`, `%Lf` and `<math.h>`'s `l` variants out.
+
+## 62. Three diagnostic defects on the way (bugs, minor)
+
+- 56's refusal advises "take a 'va_list' parameter"; `ap: va_list` is refused twice, and what works
+  is `*va_list`. The advice should say `*va_list`.
+- Some `@export` refusals end "… or a struct built out of those. " with an empty advice half.
+- After `'f128' is not lowered`, the export check reports the same parameter again as "is ?, which
+  C has no way to spell"; an unknown type should be silent.
+
+Also seen, keel's side: a libc cannot depend on `rt` (both export `exit`, and `rt`'s `extern "main"`
+is refused in an archive), so the svc wrappers move to a `user/sys` package; and an unnamed root
+module's functions get bare global C names, so all libc code lives in module `keel.libc`.
+
 ## What worked in milestone 11
 
 - **A value parameter made the virtqueue shareable.** `struct Avail[const N: usize]` and
