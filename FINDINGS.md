@@ -1460,6 +1460,10 @@ scratch copy of its library with the one change below.
 
 ## 43. `sysl.fs`'s path for a target with no C library calls C's `snprintf`, and nothing says so until the link
 
+**FIXED (sysl branch `fs-no-snprintf`, census-35 87ec6b74; prerelease `87ec6b7437`):** integer format
+specs are rendered by sysl (`sysl.fmt.format_int`) on every target, and a reached float spec or `%s`
+on a target with no C library is refused at compile time. Milestone 9's boot test passes unpatched.
+
 **A defect, not a gap.** `sysl.fs.sys` is built so a target with system calls and no libc gets all of
 `sysl.fs` by answering its hooks, and the compiler checks exactly that — a program missing a hook is
 refused, naming it. `cp` supplies all of them and still does not link:
