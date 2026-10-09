@@ -810,6 +810,191 @@ the module's public surface carries three functions nothing in sysl may call.
 Clean form: an `@export` may stay `private` (the symbol is for the linker, not for sysl), or the
 module's own asm may name a private function's symbol.
 
+## Milestone 5: multi-core
+
+Findings 27-30 are against the same prerelease (`census-34` at `7a59452170`), found while starting
+QEMU `virt`'s three secondary cores with PSCI `CPU_ON` (`keel.smp`), giving each its redistributor,
+timer and `Cpu` record, sending reschedule IPIs, and auditing the milestone-4 locks for four cores.
+Ranked: 29 is a miscompile (sizes and offsets the generated code does not use); 27 is a class of
+silent per-core bug the language cannot mark, one of which milestone 4's code had; 28 is what the
+`Atomic` orderings cannot say on aarch64, most of it addressed by the system-register and barrier
+built-ins in flight; 30 is a missing spelling with a hand-padding workaround. None was fixed here.
+
+## 27. Per-core data has no storage class, and nothing marks the window in which reading it is right
+
+Milestone 5, `keel.sched`. A core's record is reached through TPIDR_EL1, which the kernel writes, so
+"this core's data" is a pointer the program keeps rather than storage the compiler knows anything
+about (`@thread_local` is refused on the target, finding 25, and would be per *thread* anyway). That
+is workable, but the read has a property sysl has no way to state: it is right only while the thread
+cannot move to another core. Milestone 4's ownership-runtime hook was written the natural way:
+
+    @export("keel_arc_reaper")
+    arc_reaper() -> *Reaper
+        val c = cpu.tpidr()                         // core A's record
+        ...
+        &p.current.reaper                           // preempted in between: resumed on core B,
+                                                    // this is now core A's *next* thread's list
+
+It is called on every release that reaches zero, from any thread, with IRQs on. With one core it was
+correct; with four, a preemption between the `mrs` and the load hands a thread another thread's drain
+list — the corruption finding 21 exists to prevent, reintroduced by migration, with no diagnostic and
+no failing test (the window is two instructions). `sched.current()` and `trap.probe` had the same
+shape. Every function reaching per-core data is suspect in the same way, and nothing distinguishes
+`this_cpu().slice` (right: only called in IRQ context) from `this_cpu().current` read in a thread.
+
+The `&sync` check (finding 22) cannot help either: the record is reached from a register, through a
+raw pointer, so it is outside every check by construction.
+
+Workaround (used): every read of TPIDR_EL1 outside IRQ context is bracketed by `irq_save` /
+`irq_restore` (`arc_reaper`, `current`, `trap.probe`), with a comment on `this_cpu` saying so; the
+`Cpu` records are written only by their own core or under the scheduler's lock. Linux's answer is the
+same discipline plus `this_cpu_*` accessors that are one instruction; keel's costs two `msr`s per
+release-to-zero.
+
+Clean form: a per-core storage class (`@per_core var`, the program naming the register and where each
+core's block is, as finding 25 asks for threads), whose accesses the compiler either makes single
+instructions or refuses outside a scope that has disabled preemption (`with no_preempt` or a function
+attribute the IRQ path and the scheduler carry) — the same shape as `@no_alloc`: a property of a call
+tree, checked.
+
+## 28. The `Atomic` orderings are C11's, and three things an aarch64 kernel needs are outside them
+
+Milestone 5, the memory-ordering audit. What the orderings say, read off the image (`-O1`, no LSE):
+
+| sysl | aarch64 |
+|---|---|
+| `SpinLock.lock` (`swap`, `Acquire`) | `ldaxr` / `stxr` loop, then a relaxed `ldr` spin |
+| `SpinLock.unlock` (`store`, `Release`) | `stlr` |
+| `load(Acquire)` / `load(SeqCst)` | `ldar` |
+| `add(Relaxed)` | `ldxr` / `stxr` |
+| ARC release-to-zero (acquire fence) | `dmb ishld` |
+
+All of that is right, and it was enough for every lock in keel: `IrqLock`, `Mutex` (its value is
+reached between two guard acquisitions, so the guard's release/acquire pair orders it), `WaitQueue`,
+the run queue's handover (the switched-from thread's saved context is published by the next thread's
+`stlr` on the lock), the frame allocator and the heap. What they cannot say:
+
+1. **Memory against a system register write.** A reschedule IPI is `msr icc_sgi1r_el1`, which is not
+   a memory access; no C11 ordering, fence included, orders the run-queue store before it. It takes a
+   `dsb ishst` (Linux's `gic_ipi_send_mask` has the same one). keel happens not to need it — the woken
+   core takes the run-queue lock, whose acquire pairs with the sender's release — but the language gave
+   no way to say it, so it is in the asm block beside the `msr`. Translation-table writes before a walk
+   (`dsb ishst; isb`) and TLB maintenance (`tlbi …is; dsb ish`) are the same: memory ordered against
+   the MMU, not against another load.
+2. **The shareability domain.** `atomic_fence` is always `dmb ish`/`ishld`. Ordering a store to Normal
+   memory against a device write wants `dmb osh` (or `dsb`), which no ordering expresses.
+3. **Which instructions.** No `codegen` key selects LSE (`'codegen.lse' is not a code generation
+   setting — the settings are 'general_regs_only' and 'strict_align'`), so every RMW is an LL/SC loop
+   even on a host core that has `swpa`/`ldadd`; and `SpinLock`'s spin is a bare `ldr; cbnz` — no
+   `wfe`/`sevl` (the aarch64 idiom, woken by the holder's `stlr` clearing the monitor) and no `yield`.
+   `sysl.sync` has no spin-wait hint for a library lock to use.
+
+Items 1 and 2 are finding 14's (barriers have no spelling), and the prerelease in flight adds
+`dsb(opt)`, `dmb(opt)` and `isb()` built-ins; this records *why* the orderings alone are not enough,
+so that the built-ins are documented as the answer rather than as a lower tier.
+
+Workaround (used): `gic.send_sgi` is one asm block, `dsb ishst; msr icc_sgi1r_el1; isb`; the TLB and
+table barriers stay keel's asm wrappers.
+
+Clean form: the barrier built-ins (in flight), with `sysl.sync`'s page saying which orderings C11
+leaves to them; a `codegen` key for the target's atomic instructions; a spin-wait hint in `sysl.sync`
+that `SpinLock` uses.
+
+## 29. `@align(n)` on a struct changes `sizeof` and `offsetof` but not the generated layout
+
+Milestone 5, the per-core records. Each core's `Cpu` should own a cache line, so the type says so:
+
+    @align(64)
+    struct Cpu
+        id: u64
+        slice: u64
+
+    struct Pair
+        a: Cpu
+        b: Cpu
+
+    @align(64)
+    var cpus: [4]Cpu
+
+    probe()
+        var local: [4]Cpu
+        print("sizeof", sizeof(Cpu), "alignof", alignof(Cpu), "sizeof [4]Cpu", sizeof([4]Cpu))
+        print("module stride", usize(&cpus[1]) - usize(&cpus[0]), "base mod 64", usize(&cpus[0]) % 64)
+        print("local stride", usize(&local[1]) - usize(&local[0]))
+        print("Pair: sizeof", sizeof(Pair), "offsetof b", offsetof(Pair, b))
+        var p = Pair(Cpu(1, 2), Cpu(3, 4))
+        print("Pair field distance", usize(&p.b) - usize(&p.a))
+
+prints (host, `sysl run`):
+
+    sizeof 64 alignof 64 sizeof [4]Cpu 256
+    module stride 16 base mod 64 0
+    local stride 16
+    Pair: sizeof 128 offsetof b 64
+    Pair field distance 16
+
+The compile-time layout pads `Cpu` to 64 bytes; the emitted code lays it out at 16. `sizeof`,
+`offsetof` and `@assert`s about them describe a struct the program does not have — a `memcpy` of
+`sizeof(Cpu)` bytes copies four elements, an asm offset taken from `offsetof` (finding 7's pattern)
+reads the wrong field, and every element after the first shares a line with its neighbours, which is
+what the annotation was written to prevent. Nothing diagnoses it. This is not finding 12 (the
+alignment of storage): there the size already equalled the alignment, so only the base address was
+wrong; here the size itself disagrees between the analysis and the code.
+
+Workaround (used): no `@align` on `Cpu`. Its fields happen to add up to 64 bytes, an
+`@assert(sizeof(Cpu) == 64, …)` holds them to it, and the `cpus` binding carries `@align(64)` (which
+works, finding 12). A field added later needs hand padding.
+
+Clean form: a struct's alignment padded into its LLVM type (a trailing `[N x i8]`), so the IR's
+size and stride are the ones `sizeof` reports.
+
+## 30. A field cannot ask for alignment, so a lock word cannot be given a cache line of its own (minor)
+
+Milestone 5, false sharing. `Mutex[T]`'s guard word sits beside the value it protects and the fields
+of whatever struct holds the mutex; on four cores, the spinning waiters' loads share the line with
+the holder's writes. The C answer is an aligned member:
+
+    struct Guarded
+        lock: u32
+        @align(64)
+        value: u64
+
+    error: the only annotations a member may carry are the ones about a parameter — '@crossing',
+    '@borrows', '@reads' and '@writes' — and the three about the function it lowers to, '@noinline',
+    '@inline' and '@cold'. ... A member is neither, so it goes above a free function instead ('06')
+
+(The field is read as a member and refused with a member's rule — the message is about functions.)
+With finding 29, the only way left is a `pad: [60]u8` field sized by hand, which a change of a field's
+width silently breaks.
+
+Workaround: none needed yet — the scheduler's lock and the run queue share a line on purpose (both
+are taken together), and keel's `Mutex` is not hot. Recorded for when it is.
+
+Clean form: `@align(n)` on a field (C's `_Alignas` on a member), and finding 29 fixed so the struct's
+size follows.
+
+## What worked in milestone 5
+
+- **Starting a core is one PSCI call and six instructions of module-level asm.** `psci.cpu_on`
+  pins four inputs and an output to `x0`-`x3` (`in id : "x0"`, …, `out status : "x0"`), the same
+  register in and out as two variables, which the asm form accepts. `keel_secondary_start` zeroes
+  TPIDR_EL1, takes the boot stack from x0, calls `keel_secondary_boot` (sysl, MMU off, PC-relative
+  only — finding 13's rule, which held) and jumps to `keel_secondary_main` in the high half. Both
+  sysl halves are `@export`s that cannot be `private` (finding 26).
+- **Per-core setup is sysl**: the redistributor found by matching GICR_TYPER's affinity against
+  MPIDR, its wake-up, the CPU interface, the timer PPI, the reschedule SGI, the timer, the `Cpu`
+  record, and an idle thread made of the code already running on the boot stack.
+- **The milestone-4 locks needed no change for four cores.** The run-queue handover, the
+  wait-queue lock order and the `Mutex` handoff were already written as multi-core arguments; the
+  boot tests pass under HVF and TCG with 4 cores, and the controls fail: a `Mutex` that does not
+  lock totals 399,779 of 400,000 across cores; the heap without its lock takes translation faults
+  during the four-core churn; without reschedule IPIs the 400,000 additions finish on one
+  core (`cores 1`) before any idle core's tick notices the work.
+- **Dropping acquire/release does not show under HVF.** The `Mutex` guard rewritten with `Relaxed`
+  swaps and stores passed five runs out of five, total 400,000 each: the critical section is long
+  next to the window, and the `msr daif` asm blocks around it are compiler barriers. The orderings
+  are right by argument, not by this test.
+
 ## What worked in milestone 4
 
 - **`&sync Fn() -> unit` is the right type for a thread's body, and its capture check is exact.**

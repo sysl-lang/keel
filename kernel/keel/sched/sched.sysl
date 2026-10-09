@@ -1,13 +1,20 @@
 module keel.sched
 
-// The scheduler: round robin over one run queue, preempted by the timer.
+// The scheduler: round robin over one run queue shared by every core, preempted by each core's timer.
 //
-// One run queue for the whole machine, under one spinlock (`lock`), taken with IRQs masked. Per-core
-// queues would scale further, and need balancing between them; a global queue is right for the handful
-// of cores QEMU's `virt` has, and makes a woken thread runnable on whichever core frees up first. What
-// is per core is in `Cpu`: the running thread, the idle thread, the time slice, and the flag the timer
-// interrupt raises. A core finds its own `Cpu` through TPIDR_EL1, so nothing here asks which core it is
-// running on after `init`, and nothing assumes there is only one.
+// One run queue for the whole machine, under one spinlock (`lock`), taken with IRQs masked — decided
+// for SMP too, over per-core queues with stealing. With four cores and a hold of a few dozen
+// instructions the lock is not the bottleneck; one queue needs no balancing (a ready thread runs on
+// whichever core comes free first, which per-core queues only approximate by stealing), keeps the
+// lock-handover argument below a single-lock argument, and has no second lock order to get wrong.
+// Per-core queues are what to move to when a core count or a profile says the lock is contended, and
+// what they would cost is a steal path and an affinity policy.
+//
+// What is per core is in `Cpu`: the running thread, the idle thread, the time slice, and the flag that
+// asks for a switch. A core finds its own `Cpu` through TPIDR_EL1, read only with IRQs masked (see
+// `this_cpu`). Every core runs the scheduler; each has an idle thread that sleeps in `wfi` while the
+// queue is empty, and a thread made ready sends the reschedule interrupt (an SGI) to one idle core, so
+// new work starts at once rather than at that core's next tick.
 //
 // The lock is handed over with the processor: a thread calls `switch_locked` holding it, and the thread
 // that resumes is the one that releases it — after `finish_switch`, once the previous thread is no
@@ -31,8 +38,13 @@ private const SLICE: u64 = 1
 private const PREEMPTION: bool = true
 
 // One core's record. Only that core writes `last`, `slice`, `need_resched` and `reaper`; `current` is
-// written with `lock` held, so another core holding it may read which cores are idle. The records sit
-// side by side in `cpus`, a cache line apart only by luck of size (FINDINGS.md 31).
+// written with `lock` held, so another core holding it may read which cores are idle.
+//
+// Each record is one 64-byte cache line, so one core's writes never take a line another core's record
+// is in. That is done by hand: the fields happen to add up to 64 bytes, the `@assert` holds them to it,
+// and the binding below is aligned. `@align(64)` on the struct would say it directly and is wrong today:
+// `sizeof` answers 64 while the code lays elements at their unpadded size apart (FINDINGS.md 29). A field added here
+// has to come with padding to the next 64.
 struct Cpu
     id: u64
     current: *Thread
@@ -42,6 +54,9 @@ struct Cpu
     need_resched: bool          // the slice ran out, or another core asked; switch on the way out
     reaper: Reaper              // the drain list for releases made before this core has a thread
 
+@assert(sizeof(Cpu) == 64, "a Cpu record is one cache line")
+
+@align(64)
 private var cpus: [MAX_CPUS]Cpu
 
 private[sched] var lock: SpinLock = SpinLock(0)

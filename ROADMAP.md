@@ -22,7 +22,7 @@ the language rather than worked around here.
 | 2 | MMU: page tables, kernel mapped high, device memory mapped as such | the kernel runs with the MMU on; `Atomic` works ✅ |
 | 3 | Physical page allocator, kernel heap | `&T`, `Buf`, `string` work in the kernel ✅ |
 | 4 | Kernel threads, preemptive scheduler, locks | two threads interleave on the timer; a mutex and a wait queue ✅ |
-| 5 | Multi-core: secondary cores via PSCI `CPU_ON`, per-core data, SMP scheduler | threads run on all cores |
+| 5 | Multi-core: secondary cores via PSCI `CPU_ON`, per-core data, SMP scheduler | threads run on all cores ✅ |
 | 6 | User mode: EL0, system calls, per-process address spaces, ELF loading | a user program prints through a system call and exits |
 | 7 | virtio-blk driver | sectors read and written from a disk image |
 | 8 | A simple filesystem; `open`/`read`/`write`/`close`, directories | files survive a reboot |
