@@ -341,19 +341,9 @@ private inside(st: *State, dir: u32, ancestor: u32) -> Result[bool, Errno]
 private path_in(p: *Process, va: u64, len: u64, room: []u8) -> Result[[]const u8, Errno]
     if len == 0 then return Err(ENOENT)
     if len > u64(room.len) then return Err(ENAMETOOLONG)
-    if !mm.copy_from_user(&p.space, va, room[0..<usize(len)]) then return Err(EFAULT)
-    if room[0] == u8('/') then return Ok(room[0..<usize(len)])
-    val n = usize(len)
-    val total = p.cwd_len + 1 + n
-    if total > room.len then return Err(ENAMETOOLONG)
-    var k = n
-    while k > 0
-        k -= 1
-        room[p.cwd_len + 1 + k] = room[k]
-    for j in 0..<p.cwd_len
-        room[j] = p.cwd[j]
-    room[p.cwd_len] = u8('/')
-    Ok(room[0..<total])
+    var given: [MAX_PATH]u8 = [0; MAX_PATH]
+    if !mm.copy_from_user(&p.space, va, given[0..<usize(len)]) then return Err(EFAULT)
+    joined(p.cwd[0..<p.cwd_len], given[0..<usize(len)], room)
 
 // getcwd(buf, len) -> bytes of the path; ERANGE when it does not fit.
 sys_getcwd(p: *Process, regs: *u64) -> Result[i64, Errno]

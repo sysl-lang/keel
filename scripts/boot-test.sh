@@ -50,7 +50,12 @@ before_user_line=(
     "keel: smp ran on "     # threads ran on more than one core (the count is checked below)
     "keel: smp mutex ok"    # 4 threads x 100,000 additions under the Mutex, on >= 2 cores at once
     "keel: smp heap ok"     # 4 threads x 10,000 Bufs on the heap at once; every block and frame back
-    "user: hello from EL0"  # a sysl program at EL0, in its own address space, printing through `write`
+    "keel: virtio-blk found, capacity 8192 sectors"   # the 4 MiB image, found in a virtio-mmio slot
+    "keel: disk read ok"    # sector 1 read back the bytes this script put there
+    "keel: disk write ok"   # a pattern written to sector 2 read back the same
+    "keel: disk smp ok"     # 4 threads x 100 reads at once, on >= 2 cores, every byte right
+    "keel: fs mounted, 1024 blocks"   # the superblock mkfs wrote, checked against the disk's size
+    "user: hello from EL0"  # a sysl program read from /bin, at EL0 in its own address space, printing through `write`
     "keel: process 1 exited 0"   # ...and ending with `exit(0)`
     "keel: process 2 killed: permission fault"   # a program reading kernel memory is killed, alone
     "keel: preempt user ok" # one spinner per core never yields; a worker still ran, and each was preempted
@@ -58,11 +63,6 @@ before_user_line=(
     "user: echo one two"    # a program started with arguments got them, through sysl's main(args)
     "keel: argv ok"         # ...and 600 of them, more than fit at the top of the stack, were refused
     "keel: processes reclaimed"    # every frame, table and ASID the processes had came back
-    "keel: virtio-blk found, capacity 8192 sectors"   # the 4 MiB image, found in a virtio-mmio slot
-    "keel: disk read ok"    # sector 1 read back the bytes this script put there
-    "keel: disk write ok"   # a pattern written to sector 2 read back the same
-    "keel: disk smp ok"     # 4 threads x 100 reads at once, on >= 2 cores, every byte right
-    "keel: fs mounted, 1024 blocks"   # the superblock mkfs wrote, checked against the disk's size
     "keel: fs smp ok"       # one process per core wrote, read back, removed a file of its own, synced
     "user: hello.txt says hello from the disk"   # a sysl program read a file mkfs put on the disk
     "user: write ok"        # ...wrote /out.txt (12 blocks, the indirect one too), reopened it, read it back
@@ -73,7 +73,7 @@ after_user_line=(
     "keel: cp big ok"       # ...and the 200 KiB /m9/big.bin, through the indirect block (checked on the host too)
     "cp: /missing.txt: no such file or directory"   # cp of a missing file says sysl.fs's error...
     "keel: cp missing ok"   # ...and exits 1 (cmp of it exits 2)
-    $'\ndir\nhello.txt\nm9\nout.txt\n'   # ls /, sorted, one name to a line
+    $'\nbin\ndir\nhello.txt\nm9\nout.txt\n'   # ls /, sorted, one name to a line
     "keel: ls ok"
     "inside a directory"    # cat /dir/inner.txt
     "keel: cat ok"
@@ -89,9 +89,8 @@ not_expected=("keel: bounds failure was not fatal" "user: FAILED")
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck)
 
-# 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take several hundred —
-# the image most, carrying every user program (~100 KiB each for the ones built on sysl.fs).
-frames_min=64500
+# 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
+frames_min=65000
 frames_max=65536
 
 elf=$out/keel.elf
@@ -107,19 +106,20 @@ fsroot=$out/fsroot
 sector() { perl -e 'my ($m, $a) = @ARGV; print map { chr(($_ * $m + $a) & 0xff) } 0..511' $1 $2 }
 sector 13 90 > $out/sector2.expected
 
-# The host's mkfs, then the user programs: the kernel embeds their images with `.incbin`, whose path the
-# assembler resolves against the directory the build runs in, so the kernel is built from the
-# repository's root.
+# The host's mkfs, the user programs and the kernel. The programs are not in the kernel's image: they
+# go into the filesystem's /bin, and the kernel reads each from there when it starts one.
 $compiler build -o $mkfs $root/tools/mkfs
 mkdir -p $out/user
 for prog in $user_programs; do
     $compiler build --target aarch64-freestanding ${opt:+$opt} -o $out/user/$prog.elf $root/user/$prog
 done
-cd $root
 $compiler build --target aarch64-freestanding ${opt:+$opt} -o $elf $root/kernel
 
 rm -rf $fsroot
-mkdir -p $fsroot/dir
+mkdir -p $fsroot/dir $fsroot/bin
+for prog in $user_programs; do
+    cp $out/user/$prog.elf $fsroot/bin/$prog
+done
 print -n "hello from the disk" > $fsroot/hello.txt
 print "inside a directory" > $fsroot/dir/inner.txt
 mkdir -p $fsroot/m9

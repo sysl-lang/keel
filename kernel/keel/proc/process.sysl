@@ -18,11 +18,18 @@ import sysl.sync.{Atomic, Ordering}
 
 private var next_pid: Atomic[u64] = Atomic(1)
 
-// Load `image` and start it running with no arguments. The process gets the next pid.
-start(image: []const u8) -> Result[&sync Process, LoadError] = start_with(image, [])
+// Start the program at `path` on the filesystem with no arguments. The process gets the next pid.
+start(path: string) -> Result[&sync Process, LoadError] = start_with(path, [])
 
-// Load `image` and start it running with `args` — its argv, the program's name first by convention.
-start_with(image: []const u8, args: []const string) -> Result[&sync Process, LoadError]
+// Start the program at `path` with `args` — its argv, the program's name first by convention.
+start_with(path: string, args: []const string) -> Result[&sync Process, LoadError]
+    val image = fs.read_file("/".bytes, path.bytes) match
+        Ok(b) -> b
+        Err(e) -> return Err(Unreadable(e))
+    start_image(image.view(), args)
+
+// Load `image`, an executable already in kernel memory, and start it running with `args`.
+private start_image(image: []const u8, args: []const string) -> Result[&sync Process, LoadError]
     var l = load(image)?
     val sp = lay_out_args(&l.space, args) match
         Some(sp) -> sp

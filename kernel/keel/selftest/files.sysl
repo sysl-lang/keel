@@ -11,15 +11,20 @@ import keel.sched
 import keel.sched.Process
 import sysl.buf.{Buf, buf}
 
-files()
+// The filesystem is mounted before any process runs: every program is read from its /bin. Answers
+// whether it was.
+mount() -> bool
     val blocks = fs.mount() match
         Ok(n) -> n
         Err(e) ->
             print("keel: no filesystem on the disk, errno", i64(e))
-            return
+            return false
     print("keel: fs mounted,", blocks, "blocks")
+    true
+
+files()
     fs_smp()
-    proc.start(proc.files()) match
+    proc.start("/bin/files") match
         Ok(p) ->
             proc.wait(p)
             if !proc.exited(p) || proc.exit_code(p) != 0 then print("keel: files", outcome(p))
@@ -34,20 +39,21 @@ files()
 private utilities()
     if copied("/hello.txt", "/m9/copy.txt") then print("keel: cp ok")
     if copied("/m9/big.bin", "/m9/big.copy") then print("keel: cp big ok")
-    val refused = exit_of(proc.cp(), ["cp", "/missing.txt", "/m9/nowhere.txt"])
-    if refused == 1 && exit_of(proc.cmp(), ["cmp", "/missing.txt", "/m9/nowhere.txt"]) == 2
+    val refused = exit_of(["cp", "/missing.txt", "/m9/nowhere.txt"])
+    if refused == 1 && exit_of(["cmp", "/missing.txt", "/m9/nowhere.txt"]) == 2
         print("keel: cp missing ok")
-    if exit_of(proc.ls(), ["ls", "/"]) == 0 then print("keel: ls ok")
-    if exit_of(proc.cat(), ["cat", "/dir/inner.txt"]) == 0 then print("keel: cat ok")
-    val _ = exit_of(proc.fscheck(), ["fscheck"])
+    if exit_of(["ls", "/"]) == 0 then print("keel: ls ok")
+    if exit_of(["cat", "/dir/inner.txt"]) == 0 then print("keel: cat ok")
+    val _ = exit_of(["fscheck"])
 
 // `cp from to`, then `cmp from to`: both exited 0.
 private copied(from: string, to: string) -> bool =
-    exit_of(proc.cp(), ["cp", from, to]) == 0 && exit_of(proc.cmp(), ["cmp", from, to]) == 0
+    exit_of(["cp", from, to]) == 0 && exit_of(["cmp", from, to]) == 0
 
-// Run a program with `args` and wait for it: its exit code, or -1 (said) if it did not exit by itself.
-private exit_of(image: []const u8, args: []const string) -> i64
-    proc.start_with(image, args) match
+// Run /bin/<args[0]> with `args` and wait for it: its exit code, or -1 (said) if it did not exit by
+// itself.
+private exit_of(args: []const string) -> i64
+    proc.start_with(s"/bin/${args[0]}", args) match
         Ok(p) ->
             proc.wait(p)
             if proc.exited(p) then return proc.exit_code(p)
@@ -72,7 +78,7 @@ fs_shutdown()
 private fs_smp()
     var loads: Buf[&sync Process] = buf()
     for _ in 0..<sched.cores_up()
-        proc.start(proc.fsload()) match
+        proc.start("/bin/fsload") match
             Ok(p) -> loads.push(p)
             Err(_) -> print("keel: fsload did not load")
     var good: u64 = 0

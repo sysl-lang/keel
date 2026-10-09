@@ -1,6 +1,7 @@
 module keel.selftest
 
-// What milestone 6 is for, run by kmain after the SMP tests: user programs, each in an address space of
+// What milestone 6 is for, run by kmain once the filesystem is mounted (the programs are read from its
+// /bin): user programs, each in an address space of
 // its own at EL0, reaching the kernel only through system calls — and a program that misbehaves ending
 // alone, with the kernel carrying on. Every line is printed by the boot core, after the process it is
 // about has ended; the programs' own lines come from whichever core ran them.
@@ -18,8 +19,8 @@ user()
     val frames_before = mm.frames_free()
     val blocks_before = heap.live()
 
-    run_one("hello", proc.hello())          // pid 1: prints, grows its heap, exits 0
-    run_one("fault", proc.fault())          // pid 2: reads kernel memory, is killed
+    run_one("/bin/hello")                   // pid 1: prints, grows its heap, exits 0
+    run_one("/bin/fault")                   // pid 2: reads kernel memory, is killed
     preempt_user()
     bad_pointers()
     arguments()
@@ -33,17 +34,18 @@ user()
             mm.asids_in_use(), "blocks live", heap.live(), "of", blocks_before)
 
 // Start a program, wait for it, and say how it ended.
-private run_one(name: string, image: []const u8)
-    proc.start(image) match
+private run_one(path: string)
+    proc.start(path) match
         Ok(p) ->
             proc.wait(p)
             report(p)
-        Err(_) -> print(s"keel: $name did not load")
+        Err(_) -> print(s"keel: $path did not load")
 
-// A program started with arguments gets them: `echo` prints "user: echo one two" — and a second
-// start, whose arguments do not fit the room at the top of the stack, is refused before it runs.
+// A program started with arguments gets them: `echo` prints them, "user: echo one two" — and a
+// second start, whose arguments do not fit the room at the top of the stack, is refused before it
+// runs.
 private arguments()
-    proc.start_with(proc.echo(), ["echo", "one", "two"]) match
+    proc.start_with("/bin/echo", ["echo", "user:", "echo", "one", "two"]) match
         Ok(p) ->
             proc.wait(p)
             if !proc.exited(p) || proc.exit_code(p) != 0 then report(p)
@@ -51,7 +53,7 @@ private arguments()
     var many: Buf[string] = buf()
     for _ in 0..<600
         many.push("argument")
-    proc.start_with(proc.echo(), many.view()) match
+    proc.start_with("/bin/echo", many.view()) match
         Ok(p) ->
             proc.wait(p)
             print("keel: 600 arguments were not refused")
@@ -76,11 +78,11 @@ private preempt_user()
     val irqs_before = trap.user_irqs.load(Ordering.Acquire)
     var spinners: Buf[&sync Process] = buf()
     for _ in 0..<sched.cores_up()
-        proc.start(proc.spin()) match
+        proc.start("/bin/spin") match
             Ok(p) -> spinners.push(p)
             Err(_) -> print("keel: spin did not load")
 
-    val worker = proc.start(proc.worker()) match
+    val worker = proc.start("/bin/worker") match
         Ok(p) -> p
         Err(_) ->
             print("keel: worker did not load")
@@ -112,7 +114,7 @@ private preempt_user()
 // EFAULT; that the kernel is still here to print the line is the other half.
 
 private bad_pointers()
-    proc.start(proc.badptr()) match
+    proc.start("/bin/badptr") match
         Ok(p) ->
             proc.wait(p)
             if proc.exited(p) && proc.exit_code(p) == 0

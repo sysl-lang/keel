@@ -108,8 +108,13 @@ kmain(dtb_pa: u64) -> never
     // something; now the others.
     print("keel: cores", smp.start())
     selftest.smp()
-    selftest.user()
+
+    // Every program is read from the filesystem's /bin, so the disk and the filesystem come before the
+    // first process.
     selftest.disk()
+    if !selftest.mount()
+        system_off()
+    selftest.user()
     selftest.files()
 
     // Shutting down: what the filesystem holds in its cache is written back before the power goes.

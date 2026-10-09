@@ -1,5 +1,6 @@
 module keel.proc
 
+import abi.keel.abi.Errno
 import keel.cpu
 import keel.mm
 
@@ -54,6 +55,7 @@ enum LoadError
     BadEntry                    // the entry point is in no executable segment
     NoMemory                    // no frame, or no ASID
     TooManyArgs                 // the arguments do not fit the room at the top of the stack
+    Unreadable(why: Errno)      // the file could not be read: not there, a directory, too big
 
 // What loading made: the address space, where to start, and where the heap begins.
 struct Loaded
