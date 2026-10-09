@@ -1,0 +1,111 @@
+module keel.selftest
+
+// What milestone 7 is for: the virtio-blk disk the boot test attaches. scripts/boot-test.sh makes a
+// fresh 1 MiB image whose sector 1 holds `sector1_byte(i)` at byte i, and after QEMU exits checks that
+// sector 2 holds `sector2_byte(i)`, which this test writes. Keep the two formulas in step with the
+// script's.
+
+import keel.cpu
+import keel.sched.{Thread, join, spawn}
+import keel.virtio
+import keel.virtio.DiskError
+import sysl.buf.{Buf, buf}
+import sysl.sync.{Atomic, Ordering}
+
+private const SECTOR: usize = 512
+
+private sector1_byte(i: usize) -> u8 = u8((i * 7 + 3) & 0xff)
+private sector2_byte(i: usize) -> u8 = u8((i * 13 + 0x5a) & 0xff)
+
+disk()
+    val capacity = virtio.init() match
+        Some(n) -> n
+        None ->
+            print("keel: no virtio-blk disk")
+            return
+    print("keel: virtio-blk found, capacity", capacity, "sectors")
+    disk_read()
+    disk_write()
+    disk_smp()
+
+private error_name(e: DiskError) -> string = e match
+    NoDisk -> "no disk"
+    WrongLength -> "wrong length"
+    PastEnd -> "past the end"
+    Device(_) -> "device error"
+
+// Whether `b` holds sector `n`'s known contents (1 from the image, 2 once `disk_write` has run).
+private holds(b: []const u8, n: u64) -> bool
+    for i in 0..<SECTOR
+        val want = if n == 1 then sector1_byte(i) else sector2_byte(i)
+        if b[i] != want then return false
+    true
+
+private disk_read()
+    var b: [SECTOR]u8 = [0; SECTOR]
+    virtio.read_sector(1, b[..]) match
+        Ok(_) ->
+            if holds(b[..], 1) then print("keel: disk read ok") else print("keel: disk read wrong bytes")
+        Err(e) -> print("keel: disk read failed:", error_name(e))
+
+private disk_write()
+    var b: [SECTOR]u8 = [0; SECTOR]
+    for i in 0..<SECTOR
+        b[i] = sector2_byte(i)
+    virtio.write_sector(2, b[..]) match
+        Ok(_) -> ()
+        Err(e) ->
+            print("keel: disk write failed:", error_name(e))
+            return
+    for i in 0..<SECTOR
+        b[i] = 0
+    virtio.read_sector(2, b[..]) match
+        Ok(_) ->
+            if holds(b[..], 2) then print("keel: disk write ok") else print("keel: disk write read back wrong")
+        Err(e) -> print("keel: disk read back failed:", error_name(e))
+
+// --- Four readers at once -------------------------------------------------------------------------
+//
+// Four threads read 100 sectors each, alternating sectors 1 and 2, and check every byte. They run on
+// whichever cores the run queue sends them to; the test needs at least two, and reports how many
+// requests the queue held at once and how many interrupts carried the completions.
+
+private const DISK_READERS: u64 = 4
+private const DISK_READS: u64 = 100
+
+private struct Readers
+    good: Atomic[u64]
+    bad: Atomic[u64]
+    cores: Atomic[u64]
+
+private disk_smp()
+    val (irqs_before, done_before, _) = virtio.stats()
+    val r: &sync Readers = Readers(Atomic(0), Atomic(0), Atomic(0))
+    var threads: Buf[&sync Thread] = buf()
+    for _ in 0..<DISK_READERS
+        threads.push(spawn(() -> read_many(r)))
+    for t in threads
+        join(t)
+
+    val (irqs, done, most) = virtio.stats()
+    val good = r.good.load(Ordering.Acquire)
+    val bad = r.bad.load(Ordering.Acquire)
+    val cores = popcount(r.cores.load(Ordering.Acquire))
+    print("keel: disk", done - done_before, "requests,", irqs - irqs_before, "interrupts, at most", most,
+          "in flight, on", cores, "cores")
+    if good == DISK_READERS * DISK_READS && bad == 0 && cores >= 2
+        print("keel: disk smp ok")
+    else
+        print("keel: disk smp wrong: good", good, "bad", bad, "cores", cores)
+
+private read_many(r: &sync Readers)
+    var b: [SECTOR]u8 = [0; SECTOR]
+    for k in 0..<DISK_READS
+        val n: u64 = 1 + (k & 1)
+        r.cores.or(u64(1) << cpu.core_id(), Ordering.Relaxed)
+        val ok = virtio.read_sector(n, b[..]) match
+            Ok(_) -> holds(b[..], n)
+            Err(_) -> false
+        if ok then r.good.add(1, Ordering.Relaxed) else r.bad.add(1, Ordering.Relaxed)
+        for i in 0..<SECTOR
+            b[i] = 0

@@ -19,7 +19,7 @@ smp()
     smp_heap()
 
 // The number of bits set in `mask`.
-private popcount(mask: u64) -> u64
+private[selftest] popcount(mask: u64) -> u64
     var n: u64 = 0
     var m = mask
     while m != 0

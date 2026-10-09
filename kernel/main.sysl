@@ -109,6 +109,7 @@ kmain(dtb_pa: u64) -> never
     print("keel: cores", smp.start())
     selftest.smp()
     selftest.user()
+    selftest.disk()
 
     // Last, because it ends the run: a failed bounds check halts the machine.
     selftest.bounds_failure_halts()

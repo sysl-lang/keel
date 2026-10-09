@@ -10,10 +10,27 @@ import keel.mm
 // processor's redistributor at 0x080A_0000 (its private interrupts: SGIs and PPIs, the timer's
 // among them), and the CPU interface, which in GICv3 is system registers rather than memory.
 
-// The distributor's control register is the only one keel needs: shared peripheral interrupts
-// (32 and up) are not used yet.
+// The distributor: the global enable, and the configuration of the shared peripheral interrupts (SPIs,
+// 32 and up), a bit, two bits or a byte per interrupt in banks of 32-bit registers, and a 64-bit
+// routing register each. The banks are sized for INTIDs below 128, which covers every device `virt`
+// wires (its virtio-mmio slots are SPIs 16-47, INTIDs 48-79).
 private struct Distributor
     ctlr: volatile u32                  // 0x000
+    reserved0: [31]u32                  // 0x004 .. 0x07f
+    igroupr: [32]volatile u32           // 0x080 group, a bit per interrupt
+    isenabler: [32]volatile u32         // 0x100 set-enable, a bit per interrupt
+    reserved1: [160]u32                 // 0x180 .. 0x3ff
+    ipriorityr: [256]volatile u32       // 0x400 priority, a byte per interrupt
+    reserved2: [256]u32                 // 0x800 .. 0xbff
+    icfgr: [64]volatile u32             // 0xc00 trigger, two bits per interrupt (0b10 = edge)
+    reserved3: [5312]u32                // 0xd00 .. 0x5fff
+    irouter: [128]volatile u64          // 0x6000 routing, one register per interrupt
+
+@assert(offsetof(Distributor, igroupr) == 0x080, "GICD_IGROUPR is at 0x080")
+@assert(offsetof(Distributor, isenabler) == 0x100, "GICD_ISENABLER is at 0x100")
+@assert(offsetof(Distributor, ipriorityr) == 0x400, "GICD_IPRIORITYR is at 0x400")
+@assert(offsetof(Distributor, icfgr) == 0xc00, "GICD_ICFGR is at 0xc00")
+@assert(offsetof(Distributor, irouter) == 0x6000, "GICD_IROUTER is at 0x6000")
 
 private const CTLR_ENABLE_GRP1: u32 = 1 << 1
 private const CTLR_ARE: u32 = 1 << 4         // affinity routing, which GICv3 private interrupts need
@@ -128,6 +145,23 @@ enable(id: u32)
     r.ipriorityr[word] = (r.ipriorityr[word] & ~(u32(0xff) << shift)) | (u32(0x80) << shift)
     r.igroupr0 = r.igroupr0 | (u32(1) << id)
     r.isenabler0 = u32(1) << id
+
+// Enable shared interrupt `id` (32 and up), level-triggered, in group 1 at the middle priority, and
+// route it to the core whose MPIDR affinity is `core` (Aff0; every `virt` core is in cluster 0). Called
+// once, from the core that sets the device up; the distributor is shared, so no redistributor is
+// involved.
+enable_spi(id: u32, core: u64)
+    val d = dist()
+    val bank = usize(id / 32)
+    val bit = u32(1) << (id % 32)
+    val word = usize(id / 4)
+    val shift = (id % 4) * 8
+    d.ipriorityr[word] = (d.ipriorityr[word] & ~(u32(0xff) << shift)) | (u32(0x80) << shift)
+    val cfg = usize(id / 16)
+    d.icfgr[cfg] = d.icfgr[cfg] & ~(u32(3) << ((id % 16) * 2))      // 0b00: level-sensitive
+    d.irouter[usize(id)] = core                                       // IRM = 0: that core alone
+    d.igroupr[bank] = d.igroupr[bank] | bit
+    d.isenabler[bank] = bit
 
 // Take the highest-priority pending interrupt, answering its ID. Its source then waits for
 // `complete` before it can be delivered again.

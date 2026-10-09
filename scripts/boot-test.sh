@@ -53,6 +53,10 @@ expected=(
     "keel: preempt user ok" # one spinner per core never yields; a worker still ran, and each was preempted
     "keel: bad pointer rejected"   # write() with four bad buffers answered EFAULT, and the kernel lives
     "keel: processes reclaimed"    # every frame, table and ASID the processes had came back
+    "keel: virtio-blk found, capacity 2048 sectors"   # the 1 MiB image, found in a virtio-mmio slot
+    "keel: disk read ok"    # sector 1 read back the bytes this script put there
+    "keel: disk write ok"   # a pattern written to sector 2 read back the same
+    "keel: disk smp ok"     # 4 threads x 100 reads at once, on >= 2 cores, every byte right
     "keel: bounds check failed: index"   # the last step: a kernel bounds failure is reported...
     "keel: halted"                 # ...and stops the machine (checked below: nothing ran after it)
 )
@@ -69,6 +73,14 @@ frames_max=65536
 elf=$out/keel.elf
 log=$out/boot.log
 
+# The disk: a fresh 1 MiB raw image, zero but for sector 1, whose byte i is (7i + 3) mod 256. The kernel
+# writes sector 2 with byte i = (13i + 0x5a) mod 256; after QEMU exits the script reads it back from the
+# file. keel.selftest's disk.sysl has the same two formulas.
+disk=$out/disk.img
+sector() { perl -e 'my ($m, $a) = @ARGV; print map { chr(($_ * $m + $a) & 0xff) } 0..511' $1 $2 }
+{ head -c 512 /dev/zero; sector 7 3; head -c $((1048576 - 1024)) /dev/zero } > $disk
+sector 13 90 > $out/sector2.expected
+
 # The user programs first: the kernel embeds their images with `.incbin`, whose path the assembler
 # resolves against the directory the build runs in, so the kernel is built from the repository's root.
 mkdir -p $out/user
@@ -84,7 +96,12 @@ else
     machine=(-cpu cortex-a72)
 fi
 
-qemu-system-aarch64 -M virt,gic-version=3 $machine -smp ${KEEL_SMP:-4} -m 256M -nographic -kernel $elf > $log 2>&1 < /dev/null &
+# QEMU's virtio-mmio transport is the legacy (version 1) interface unless told otherwise; keel drives
+# the modern one.
+drive=(-drive file=$disk,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0
+       -global virtio-mmio.force-legacy=false)
+
+qemu-system-aarch64 -M virt,gic-version=3 $machine -smp ${KEEL_SMP:-4} -m 256M -nographic $drive -kernel $elf > $log 2>&1 < /dev/null &
 qpid=$!
 
 waited=0
@@ -139,4 +156,11 @@ if (( qemu_exit != 0 )); then
     print -r -- "FAIL: QEMU exited with status $qemu_exit"
     return 1
 fi
+# The kernel's write reached the image file: sector 2, read on the host once QEMU has gone.
+if [[ $(od -An -tx1 -v -j 1024 -N 512 $disk) != $(od -An -tx1 -v $out/sector2.expected) ]]; then
+    print -r -- "FAIL: sector 2 of $disk does not hold what the kernel wrote:"
+    od -An -tx1 -v -j 1024 -N 32 $disk
+    return 1
+fi
+print -r -- "keel: disk persisted"
 print -r -- "PASS:$seen in order, and QEMU exited by itself (status 0) after $((waited / 10)).$((waited % 10))s"

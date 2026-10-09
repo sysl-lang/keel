@@ -1,0 +1,105 @@
+module keel.virtio
+
+// virtio over memory-mapped I/O, version 2 (virtio 1.x, "modern"), as QEMU's `virt` machine provides it.
+//
+// `virt` has 32 virtio-mmio transports, 0x200 bytes apart from 0x0a00_0000, and wires transport i to
+// SPI 16 + i (INTID 48 + i). Every slot answers the magic value; an empty one has device ID 0. keel finds
+// its disk by scanning the slots for device ID 2 rather than by reading the device tree: the slots and
+// their interrupts are fixed by the machine, as the GIC's and the UART's addresses are, and keel.dtb is
+// not a parser.
+//
+// QEMU's transport presents the legacy interface (version 1) unless told otherwise, so the boot test
+// runs QEMU with `-global virtio-mmio.force-legacy=false`; a version-1 device is refused here.
+
+import keel.mm
+
+// The transport's registers (virtio 1.2 § 4.2.2). Everything is little-endian, which is aarch64's own
+// order, so the fields are plain integers.
+struct Regs
+    magic: volatile u32                 // 0x000 "virt"
+    version: volatile u32               // 0x004 2 for the modern interface
+    device_id: volatile u32             // 0x008 2 is a block device; 0 an empty slot
+    vendor_id: volatile u32             // 0x00c
+    device_features: volatile u32       // 0x010 32 feature bits, the bank `device_features_sel` picks
+    device_features_sel: volatile u32   // 0x014
+    reserved0: [2]u32
+    driver_features: volatile u32       // 0x020
+    driver_features_sel: volatile u32   // 0x024
+    reserved1: [2]u32
+    queue_sel: volatile u32             // 0x030 which queue the queue_* registers below are about
+    queue_num_max: volatile u32         // 0x034
+    queue_num: volatile u32             // 0x038
+    reserved2: [2]u32
+    queue_ready: volatile u32           // 0x044
+    reserved3: [2]u32
+    queue_notify: volatile u32          // 0x050 write a queue's index: it has new requests
+    reserved4: [3]u32
+    interrupt_status: volatile u32      // 0x060 bit 0: the used ring moved; bit 1: the configuration
+    interrupt_ack: volatile u32         // 0x064
+    reserved5: [2]u32
+    status: volatile u32                // 0x070 the device status bits below; 0 resets
+    reserved6: [3]u32
+    queue_desc_low: volatile u32        // 0x080 physical address of the descriptor table
+    queue_desc_high: volatile u32
+    reserved7: [2]u32
+    queue_driver_low: volatile u32      // 0x090 ... of the available ring
+    queue_driver_high: volatile u32
+    reserved8: [2]u32
+    queue_device_low: volatile u32      // 0x0a0 ... of the used ring
+    queue_device_high: volatile u32
+    reserved9: [21]u32
+    config_generation: volatile u32     // 0x0fc changes while the configuration is being changed
+    config: [64]volatile u32            // 0x100 the device type's own configuration
+
+@assert(offsetof(Regs, queue_sel) == 0x030, "QueueSel is at 0x030")
+@assert(offsetof(Regs, queue_ready) == 0x044, "QueueReady is at 0x044")
+@assert(offsetof(Regs, queue_notify) == 0x050, "QueueNotify is at 0x050")
+@assert(offsetof(Regs, interrupt_status) == 0x060, "InterruptStatus is at 0x060")
+@assert(offsetof(Regs, status) == 0x070, "Status is at 0x070")
+@assert(offsetof(Regs, queue_desc_low) == 0x080, "QueueDescLow is at 0x080")
+@assert(offsetof(Regs, queue_driver_low) == 0x090, "QueueDriverLow is at 0x090")
+@assert(offsetof(Regs, queue_device_low) == 0x0a0, "QueueDeviceLow is at 0x0a0")
+@assert(offsetof(Regs, config_generation) == 0x0fc, "ConfigGeneration is at 0x0fc")
+@assert(offsetof(Regs, config) == 0x100, "the configuration space is at 0x100")
+
+const MAGIC: u32 = 0x7472_6976                  // "virt", little-endian
+const DEVICE_BLOCK: u32 = 2
+
+// Device status bits (§ 2.1).
+const ACKNOWLEDGE: u32 = 1
+const DRIVER: u32 = 2
+const DRIVER_OK: u32 = 4
+const FEATURES_OK: u32 = 8
+const FAILED: u32 = 128
+
+// Feature bit 32, VIRTIO_F_VERSION_1: bit 0 of the second bank. A modern device offers it and a modern
+// driver must accept it.
+const F_VERSION_1_BANK1: u32 = 1
+
+private const SLOTS_BASE: u64 = 0x0a00_0000
+private const SLOT_SIZE: u64 = 0x200
+private const SLOT_COUNT: u64 = 32
+private const FIRST_SPI: u32 = 32 + 16             // INTID of slot 0's interrupt
+
+// A transport found by `find`: its registers and its interrupt.
+struct Transport
+    regs: *Regs
+    irq: u32
+    slot: u64
+
+// The first transport holding a device of type `device`.
+find(device: u32) -> Option[Transport]
+    for i in 0..<SLOT_COUNT
+        val r: *Regs = mm.io(mm.PhysAddr(SLOTS_BASE + i * SLOT_SIZE))
+        if r.magic == MAGIC && r.device_id == device
+            return Some(Transport(r, FIRST_SPI + u32(i), i))
+    None
+
+// A configuration field of 64 bits, read as two 32-bit halves (QEMU's transport answers no wider
+// access), again if the configuration changed in between (§ 4.2.2.2).
+config_u64(r: *Regs, word: usize) -> u64
+    loop
+        val before = r.config_generation
+        val low = r.config[word]
+        val high = r.config[word + 1]
+        if r.config_generation == before then return (u64(high) << 32) | u64(low)

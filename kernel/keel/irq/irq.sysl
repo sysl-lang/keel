@@ -6,6 +6,7 @@ module keel.irq
 import keel.gic
 import keel.sched
 import keel.timer
+import keel.virtio
 import keel.pl011.{put_hex, put_str}
 import sysl.sync.{Atomic, Ordering}
 
@@ -25,6 +26,8 @@ dispatch()
         sched.tick()
     else if id == gic.RESCHEDULE
         sched.reschedule_requested()
+    else if id == virtio.irq()
+        virtio.interrupt()
     else
         put_str("keel: unexpected interrupt ")
         put_hex(u64(id))
