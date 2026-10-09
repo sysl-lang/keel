@@ -58,10 +58,10 @@ to_virt(p: PhysAddr) -> VirtAddr = VirtAddr(u64(p) + KERNEL_BASE)
 // The physical address behind a kernel virtual address.
 to_phys(v: VirtAddr) -> PhysAddr = PhysAddr(u64(v) - KERNEL_BASE)
 
-// The physical address of something in the kernel image, from a pointer to it. Before the MMU is on
-// the code runs at physical addresses, and `&x` answers the physical address for a module variable
-// (reached PC-relative) but the link address for an `extern` (reached through the GOT); after, both
-// are virtual. Masking off the top sixteen bits is right for all three (FINDINGS.md 13).
+// The physical address of something in the kernel image, from a pointer to it. `&x` answers where `x`
+// is now — a module variable and an `extern` alike are reached PC-relative — so before the MMU is on
+// that is already physical, and after it is virtual. Masking off the top sixteen bits is right for
+// both, which is why code that runs either side of the switch uses this rather than `to_phys`.
 phys_of(addr: usize) -> PhysAddr = PhysAddr(u64(addr) & PA_MASK)
 
 // A pointer to device registers at a physical address, through the kernel's device mapping.

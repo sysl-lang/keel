@@ -359,6 +359,12 @@ Clean form: the type's alignment on every global, stack slot and heap allocation
 
 ## 13. A function that runs before the MMU cannot know which of two addresses `&x` gives it
 
+**FIXED (externs are `dso_local`, since prerelease `1a7aee7358`; checked on `8619de6609`):**
+`keel_boot` now reaches `__bss_start` with `adr`, the run address, like a module variable. `phys_of`
+stays: it is also how code after the switch turns an image address into a physical one (the
+secondaries' entry, the table pool), so its mask is the conversion rather than a workaround; only its
+comment changed.
+
 Milestone 2, `keel_boot`. The image is linked at 0xFFFF_0000_4008_0000 and runs at 0x4008_0000 until
 the MMU is on, so the boot code must take physical addresses of linker symbols and of its own module
 storage. `&` gives it two different kinds of address, and the source cannot tell them apart:
