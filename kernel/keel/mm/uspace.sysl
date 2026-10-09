@@ -13,10 +13,11 @@ import sysl.sync.SpinLock
 //   stack_bottom .. USER_STACK_TOP     the stack, USER_STACK_PAGES pages, mapped from the start
 //   USER_STACK_TOP .. 2^48             unmapped
 //
-// Every page is mapped from a frame of its own, with user access, never executable at EL1, and
+// Every page is mapped from a frame (its own, until a fork shares it), with user access, never executable at EL1, and
 // not-global: its translations are tagged with the space's ASID, so a switch between processes changes
 // TTBR0 and nothing has to be flushed. The tables themselves are frames too, reached through the
-// kernel's linear map of RAM (to_virt), and a space's every frame goes back when it is freed.
+// kernel's linear map of RAM (to_virt), and a space's every frame goes back when it is freed — a page
+// frame shared with a forked relative (cow.sysl) only once its last sharer lets it go.
 //
 // Kernel threads run with TTBR0 at `empty_root`, a table with nothing in it, and ASID 0, which no
 // process is given: the low half faults for them exactly as it did before there were processes.

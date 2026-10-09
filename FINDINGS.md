@@ -2248,6 +2248,92 @@ reading), a `sysl.process.pipe() -> Result[(File, File), IoError]` over a `sysl_
 `Status` without reading any file — the shape `posix_spawn` with file actions and Rust's
 `Command::spawn` both have.
 
+## Milestone 15a: fork and execve
+
+## 67. A tuple of literals in a `match` arm does not take its type from a sibling arm (bug, minor)
+
+Milestone 15a, `/bin/forktest`'s fallback when `pipe` fails. A scalar literal in one arm takes the
+type a sibling arm gives (`Ok((a, _)) -> a` / `Err(_) -> 0` is a `u64`), and so does a tuple of
+literals once the declaration names the type — but not a tuple of literals with nothing but the
+sibling arm to go on:
+
+    pair(ok: bool) -> Result[(u64, u64), int] = if ok then Ok((u64(3), u64(4))) else Err(1)
+
+    val (r, w) = pair(true) match
+        Ok(ends) -> ends
+        Err(_) -> (0, 0)
+
+    $ sysl build -o p1 .
+    error: match arms have different types: (ulong, ulong) and (int, int)
+     --> main.sysl:3:14
+
+`val t: (u64, u64) = … match …` compiles and runs (`(3, 4)`), but a destructuring `val` cannot carry
+the annotation (`val (r, w): (u64, u64) = …` is refused at the colon, "'=' expected"), so the stopgap
+is a whole-tuple binding and a second `val` to take it apart — or `(u64(0), u64(0))` in the arm. The
+org's rule ("a `match` takes its type from a sibling arm") says nothing about the arm being a scalar.
+
+Stopgap (used, 0 lines): forktest cannot go on without its pipe, so the arm became `Err(e) ->
+stop(…)`, a `-> never` that prints the failure and exits — which unifies with anything, and is what
+the test should do anyway.
+
+Clean form: a literal inside a tuple (or array, or constructor) arm is inferred against the sibling
+arm's element types, as a bare literal arm already is.
+
+## 68. `sysl.process` has no way to express `fork` or replacing the program (`exec`)
+
+Milestone 15a. keel now has `fork` (39) and `execve` (40), and a sysl program can call them only
+through keel's own runtime (`user.fork()`, `user.execve(path, args, env)`). `sysl.process` offers
+`run`, `capture` and `start` — each makes a *new* child from a program on disk, over the
+`sysl_proc_spawn` hook (finding 49) — and nothing that copies the calling process or replaces its
+image:
+
+    import sysl.process
+
+    process.fork()
+    process.exec("/bin/echo", ["hi"])
+
+    $ sysl build -o p1 .
+    error: undefined function 'sysl.process.fork'
+    error: undefined function 'sysl.process.exec'
+
+(the hooks in `sysl.process.sys` are `sysl_proc_spawn`/`_wait`/`_kill`/`_temp_path`; there is no
+`sysl_proc_fork` or `sysl_proc_exec` for a target to answer). On a hosted target the library's own
+spawn is fork + execvp in a C shim, so the primitives exist underneath and are not exposed.
+
+Whether the library should have them is a design question rather than an obvious gap: `fork` hands
+a program a copy of every piece of runtime state (open `Buf`s, half-written output buffers, threads
+that do not come along) and is famously hard to use safely in a language runtime — Rust's standard
+library has no fork (`CommandExt::exec` replaces the image, on Unix only), and Go offers only
+`syscall.ForkExec`, its runtime's threads not surviving a bare fork. `exec` alone (replace the image, keep the pid and the
+descriptors) has none of fork's hazards and is what a shell's `exec` builtin, a login program and a
+wrapper that sets up and then becomes its target need.
+
+Stopgap (used): `rt.keel.user.fork()` and `execve(path, args, env: Option[[]const string])`, ~45
+lines beside `spawn`, with a six-argument `svc` wrapper.
+
+Shapes to choose between: `exec(program, args, env) -> IoError` (answers only on failure) over a
+`sysl_proc_exec` hook, with `fork` left out; or both, `fork` documented as for programs that own
+their whole runtime; or neither, with a target's own runtime the place for them, as now.
+
+## What worked in milestone 15a
+
+- **One assembly entry serves both a new program and a forked child**: `keel_enter_user` now takes
+  a whole register frame (`UserRegs`, keel.trap's `Frame` layout pinned by `@assert`s, since keel.proc
+  cannot import keel.trap), so a new process enters with a frame that is all zero but ELR, SP_EL0 and
+  x0, and a forked child with a copy of its parent's `svc` frame, x0 = 0. A `&sync Fn` closure
+  captured the 272-byte struct by value, as the language says it may.
+- **`LeafDesc.software: u4` made the copy-on-write mark a field**, not a mask: bit 55 is
+  `leaf.software = 1`, and a `@packed` struct read and written through `cpu.from_word`/`to_word`.
+- **Share counts beside the bitmap**: a `*u16` table placed in the frames after the bitmap, under
+  the allocator's own lock, so "lower the count or free the frame" is one step; 32 more frames used.
+- **Every control failed its test**, the stale-TLB one included, under HVF *and* TCG: with no
+  `tlbi aside1is` after write-protecting the parent, the parent's write right after `fork` went
+  through its still-cached writable translation into the frame its child shared, and the child saw
+  it (`user: FAILED: the child saw the parent's writes after the fork`). Without copy-on-write the
+  child's writes reached the parent; with share counts never lowered, 379 frames leaked per run.
+- No change to the 16 KiB kernel stack was needed: `sys_fork` and `sys_execve` pass at -O0 with
+  their copying split into functions of their own, as `sys_spawn`'s is.
+
 ## What worked in milestone 13
 
 - **The descriptor table generalised with one enum**: `keel.sched.Holds` (`Free` first, so a zeroed
