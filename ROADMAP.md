@@ -15,6 +15,8 @@ the language rather than worked around here.
 
 ## The mini-Unix (decided 2026-10-09)
 
+- **A basic level of POSIX compliance** (user 2026-10-09): `fork`/`exec`, signals, job control,
+  pthreads, `poll`, `termios` — enough that small POSIX C programs port.
 - **Users and logins**, a shell with pipes and redirection, and the usual small utilities.
 - **A C library written in sysl**, exporting the C names (`open`, `read`, `printf`, `malloc`, …)
   over keel's system calls, so C programs can be **ported** to keel with clang. It exists for
@@ -37,5 +39,8 @@ the language rather than worked around here.
 | 10 | Processes and a shell: `fork`/`exec`/`wait` (or `spawn`), a serial shell, `ls`/`cat`/`cp` | a session at the shell ✅ |
 | 11 | Networking: virtio-net, ARP, IPv4, ICMP, UDP | the host pings keel and gets a UDP echo ✅ (slirp cannot forward ICMP to the guest, so keel pings the gateway; the host gets UDP echoes from the kernel and from a sysl program at EL0) |
 | 12 | Users: uid/gid per process, owner and mode bits on disk, permission checks, `/etc/passwd`, `login`, `su`, `id`, `chmod`/`chown` | a user logs in, is refused another user's file, `su`s to root and reads it ✅ (passwords are PBKDF2-HMAC-SHA-256 salted with the name; `su` is set-user-ID root, since a process has one uid) |
-| 13 | Shell plumbing: `pipe`, `dup2`, `\|`, `<`, `>>`, `&`, environment variables, `$?`; `ps`, `kill`, `wc`, `grep`, `head` | `ls -l / \| grep bin \| wc -l` at the shell |
-| 14 | A C library in sysl: `crt0`, headers, `stdio`/`stdlib`/`string`/`unistd` over keel's calls; clang builds C for keel | a ported C program runs at the shell |
+| 13 | Shell plumbing: `pipe`, `dup2`, `\|`, `<`, `>>`, environment variables, `$?`; `wc`, `grep`, `head` | `ls -l / \| grep bin \| wc -l` at the shell |
+| 14 | A C library in sysl: `crt0`, headers, `stdio`/`stdlib`/`string`/`unistd` over keel's calls; clang builds C for keel; FP state saved per process | a ported C program runs at the shell (waits on FINDINGS 55–60 in sysl) |
+| 15 | POSIX processes: `fork` (copy-on-write) + `execve`, signals (`kill`, `sigaction`, SIGINT on Ctrl-C, SIGCHLD, default actions), process groups and job control (`&`, `jobs`, `fg`); `ps`, `kill` | Ctrl-C stops a spinner; a C program forks, execs and waits |
+| 16 | Threads in a process: `clone`-style thread creation, futex waits, TLS; pthreads in the libc | a ported threaded C program runs on all four cores |
+| 17 | The rest of a basic POSIX surface: `poll`/`select`, `termios` basics, `clock_gettime`/`nanosleep`, `getcwd`/`opendir` in the libc | a small POSIX-only C program ports unchanged |
