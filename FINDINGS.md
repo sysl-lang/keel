@@ -1990,6 +1990,89 @@ Clean form: a `sysl.net` whose addresses are sysl values (an `Ipv4`/`Ipv6` addre
 `__posix__` on a hosted target and by the program on one without a C library, under the same
 compile-time check that names a missing `sysl.fs` hook.
 
+## 63. The standard library has no notion of a process's user, and `sysl.fs` reads an owner but cannot change one
+
+Milestone 12, `/bin/id`, `/bin/whoami`, `/bin/chown`, `/bin/login`, `/bin/su`. `sysl.fs` carries the
+permission half of ownership portably and completely — `Meta.mode`/`permissions()` to read,
+`set_permissions` (the `sysl_fs_chmod` hook) to write — and keel.fsys now answers both. The owner half
+is read-only: `Meta.owner` and `Meta.group` are filled from the `stat` hook's `uid`/`gid`, but there is
+no `chown` hook and no call that changes either:
+
+    import sysl.fs
+
+    val _: unit = fs.set_owner("/tmp/x", 1000, 100) match
+        Ok(_) -> ()
+        Err(_) -> ()
+
+    $ sysl build -o own .
+    error: undefined function 'sysl.fs.set_owner'
+
+And nothing in the library names the *process's* identity: no `getuid`/`getgid` (or `setuid`/
+`setgid`) in `sysl.process`, `sysl.env` or `sysl.posix` (a grep of the 7e2a32d3 library for `getuid`
+and `chown` finds nothing). So `Meta.owner` is a number a program cannot compare with "me" without
+going around the library.
+
+Workaround (used, small): keel's own calls in the user runtime — `user.getuid()`, `getgid()`,
+`setuid(uid)`, `setgid(gid)`, `chown(path, uid, gid)` over system calls 30-33 and 35; `chown` reads the
+group it keeps with `fs.metadata(path)?.group`. Mapping a number to a name (/etc/passwd) is keel's own
+module `keel.passwd`, which is right: that is a system database, not the standard library's.
+
+Clean form: a `set_owner(path, owner, group)` beside `set_permissions`, over a `sysl_fs_chown` hook
+(POSIX `chown`, `UNSUPPORTED` where a filesystem has no owners), and `sysl.process.user()`/`group()`
+(and a privileged `set_user`/`set_group`) over a `sysl.process.sys` hook pair, so `id` and `su` are
+portable programs and `Meta.owner == process.user()` is the "is it mine" test.
+
+## 64. A width on a string hole needs C's `snprintf` on a freestanding target — but only when the string is not a constant
+
+Milestone 12, `/bin/ls -l`, padding the owner's name to a column:
+
+    show(s: string) = print(f"[${s}%-6s]")
+
+    show("ab")
+
+    $ sysl build --target aarch64-freestanding -o pad .
+    error: '%-6s' is applied by C's 'snprintf', and 'aarch64-freestanding' has no C library under it
+    to supply one — only an integer specifier is rendered without C. Render the value another way: a
+    plain hole of a string needs no C; or, if 'aarch64-freestanding' does have a C library under it
+    (newlib under a Pico SDK build, Zephyr, FreeRTOS), grant it in package.hocon: 'targets {
+    aarch64-freestanding { capabilities { libc = true } } }'
+
+The same specifier on a module-level `val s = "ab"` builds and prints `[ab    ]` (the value folds), and
+`${n}%8d` on a runtime integer is rendered without C. The library already has the C-free renderer for
+this: `sysl/render.sysl`'s `display_pad` ("Width and precision count **bytes**, as C's do, so a
+`string` renders the same width whether it went through `snprintf` or through here"). Padding a string
+is a loop of spaces; nothing about it needs a C library, so the refusal is a gap in the lowering (or a
+bug, given that the folded case and the library's own comment both say it can be done here).
+
+Workaround (used, 8 lines): `ls`'s `padded(text, width)` appends spaces in a loop, and the line is
+`f"${mode_string(m)} ${padded(owner, 6)} ${m.size}%8d $name"`.
+
+Clean form: lower `%s` with a width, a precision or `-` through `display_str`/`display_pad` on every
+target, as `%d` already is, so `%-6s` means the same with or without a C library.
+
+## What worked in milestone 12
+
+- **The permission model is 30 lines** (`kernel/keel/fs/perm.sysl`): one `permits(inode, cred, want)`
+  with Unix's owner-then-group-then-other choice, called from `resolve` (search on every directory a
+  path walks), `open`, `create`, `unlink`/`rmdir`/`rename` (w+x on the directory), `chdir`, `truncate`,
+  `access` and the loader (x, and set-user-ID). `Cred` is a two-field struct in `keel.sched` beside
+  `Process`, so keel.fs needs no new import cycle.
+- **The format grew without moving a field**: `uid` took the old `reserved` at 6, `gid` half of
+  `reserved2` at 60, and the `@assert(offsetof(...))`s pin both; `mode` became POSIX's `st_mode`, so
+  keel.fsys's `converted` lost its kind-to-type-bits step and `Meta.kind()`/`permissions()` read it
+  directly.
+- **`sysl.crypto.pbkdf2_hmac256` runs on keel unchanged** (freestanding, general registers only) and on
+  the host in mkfs: one `keel.passwd` module hashes for both. 1,000 iterations cost no visible time
+  under TCG. Its output for `alice`/`wonderland` matches Python's `hashlib.pbkdf2_hmac`.
+- **`sysl.io`'s `Lines.getline()` read a line at a time across processes**: login, its shell, `su` and
+  su's shell each read standard input through their own reader and none swallowed another's line,
+  because keel's console answers one cooked line per `read`.
+- **`sysl.fs.set_permissions` worked the moment the hook did**, and `copy_dir_all` now carries the mode
+  (`cp -r` in session 1 passes through the real `chmod`).
+- Controls: `CHECK_PERMISSIONS = false` in perm.sysl — alice's `cat /etc/secret` prints the secret and
+  the transcript fails there; `may_change_ids` answering `true` in syscall.sysl — alice's `login` as
+  root succeeds, gives her a `#` shell, and the boot never finishes.
+
 ## What worked in milestone 11
 
 - **A value parameter made the virtqueue shareable.** `struct Avail[const N: usize]` and
