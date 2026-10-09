@@ -1,0 +1,16 @@
+module keel.selftest
+
+// The boot test's last step: a failed bounds check in the kernel stops the machine. The index is the
+// tick count, which is in the hundreds by now and which the compiler cannot know, so the check is made
+// at run time. `keel.trap.bounds_fail` reports it and powers off; the line after the access is never
+// printed, and the boot test fails if it is.
+
+import keel.irq
+import sysl.sync.Ordering
+
+bounds_failure_halts()
+    val xs: [3]u64 = [1, 2, 3]
+    val i = usize(irq.ticks.load(Ordering.Relaxed))
+    print("keel: reading element", i, "of 3")
+    val x = xs[i]
+    print("keel: bounds failure was not fatal: read", x)

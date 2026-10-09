@@ -53,7 +53,12 @@ expected=(
     "keel: preempt user ok" # one spinner per core never yields; a worker still ran, and each was preempted
     "keel: bad pointer rejected"   # write() with four bad buffers answered EFAULT, and the kernel lives
     "keel: processes reclaimed"    # every frame, table and ASID the processes had came back
+    "keel: bounds check failed: index"   # the last step: a kernel bounds failure is reported...
+    "keel: halted"                 # ...and stops the machine (checked below: nothing ran after it)
 )
+
+# Printed only if the access after a failed bounds check went ahead.
+not_expected="keel: bounds failure was not fatal"
 
 user_programs=(hello fault spin worker badptr)
 
@@ -115,6 +120,10 @@ for line in $expected; do
     text=$rest
     seen="$seen '$line'"
 done
+if [[ $(<$log) == *"$not_expected"* ]]; then
+    print -r -- "FAIL: '$not_expected' — the kernel carried on after a failed bounds check"
+    return 1
+fi
 frames=${${(M)${(f)"$(<$log)"}:#keel: frames *}#keel: frames }
 if [[ $frames != <-> ]] || (( frames < frames_min || frames > frames_max )); then
     print -r -- "FAIL: 'keel: frames $frames' is not a free count between $frames_min and $frames_max"

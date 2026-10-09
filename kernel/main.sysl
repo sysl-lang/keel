@@ -109,6 +109,9 @@ kmain(dtb_pa: u64) -> never
     print("keel: cores", smp.start())
     selftest.smp()
     selftest.user()
+
+    // Last, because it ends the run: a failed bounds check halts the machine.
+    selftest.bounds_failure_halts()
     system_off()
 
 // Give the frame allocator every frame of RAM that the image and the device tree do not occupy. RAM's
@@ -177,8 +180,9 @@ private closure_result() -> u64
     val add_one = () -> c.value + 1
     add_one()
 
-// Stop at a `brk`, which the trap handler reports and steps over.
+// Stop at a `brk`, which the trap handler reports and steps over: this immediate only
+// (`trap.RESUMABLE_BRK`).
 breakpoint()
     asm
-        [aarch64] "brk #0"
+        [aarch64] "brk #0x4b"
         [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"

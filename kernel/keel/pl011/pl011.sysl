@@ -36,6 +36,19 @@ put_hex(v: u64)
         val d = u8((v >> (60 - 4 * i)) & 0xf)
         put_byte(if d < 10 then u8('0') + d else u8('a') + d - 10)
 
+// Write `v` in decimal, allocating nothing: for paths (a trap, a failed bounds check) that may not.
+put_dec(v: u64)
+    var digits: [20]u8 = [0; 20]
+    var n = v
+    var i: usize = 20
+    loop
+        i -= 1
+        digits[i] = u8('0') + u8(n % 10)
+        n /= 10
+        if n == 0 then break
+    for j in i..<20
+        put_byte(digits[j])
+
 // The standard library's `print` writes through C's `putchar`, and a freestanding image has no C
 // library to supply it, so the console is the supplier.
 @export("putchar")

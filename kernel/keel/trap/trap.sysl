@@ -191,8 +191,13 @@ keel_trap(frame: *Frame, slot: u64)
         details(esr(), frame)
         system_off()
 
-// A synchronous exception: an instruction that trapped. `brk` is a deliberate stop and resumes at the
-// next instruction; anything else is a fault keel cannot recover from yet.
+// The immediate of the one `brk` keel executes on purpose (main.sysl's `breakpoint`), the only one it
+// resumes after. Every other `brk` is the compiler's: the trap after a failed check (bounds, overflow,
+// an unreachable arm), where carrying on would run past the failure.
+const RESUMABLE_BRK: u64 = 0x4b
+
+// A synchronous exception: an instruction that trapped. keel's own `brk` is a deliberate stop and
+// resumes at the next instruction; anything else is a fault keel cannot recover from yet.
 private synchronous(frame: *Frame)
     val raw = esr()
     val s = syndrome(raw)
@@ -201,7 +206,12 @@ private synchronous(frame: *Frame)
         Some(Brk) ->
             put_str("keel: trap brk")
             details(raw, frame)
-            frame.elr += 4
+            // A `brk`'s syndrome holds its 16-bit immediate in ISS[15:0].
+            if (u64(s.iss) & 0xffff) == RESUMABLE_BRK
+                frame.elr += 4
+            else
+                put_str("keel: not keel's breakpoint, halted\n")
+                system_off()
         Some(DataAbort) ->
             data_abort(s, raw, frame)
         Some(c) ->

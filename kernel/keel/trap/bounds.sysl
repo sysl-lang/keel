@@ -1,0 +1,63 @@
+module keel.trap
+@no_alloc
+
+// A failed bounds check anywhere in the kernel, the standard library's code included.
+//
+// Every check the compiler emits hands what failed to one function, `sysl_bounds_fail`, and then
+// executes a `brk`. On a freestanding target the compiler's own definition of that function is weak
+// and empty, so without this one the `brk` is all that happens — and a trap handler that resumed after
+// every `brk` would carry on past the failure as if the access had been fine. keel supplies the
+// function, says what failed, and powers the machine off; `synchronous` resumes only after keel's own
+// deliberate `brk` (`RESUMABLE_BRK`), so the trap that follows a check stops the machine too, should
+// this ever return.
+//
+// The arguments are the compiler's C surface: the form that failed (the low byte; bit 8 and bit 9 say
+// `a` and `b` came from signed integers), the two values compared, the length, and `file:line:column`,
+// NUL-terminated, or null where the build left the locations out.
+
+import keel.pl011.{put_byte, put_dec, put_str}
+import keel.psci.system_off
+
+private const SIGNED_A: u32 = 1 << 8
+private const SIGNED_B: u32 = 1 << 9
+
+@export("sysl_bounds_fail")
+bounds_fail(kind: u32, a: usize, b: usize, length: usize, at: *u8) -> never
+    put_str("keel: bounds check failed: ")
+    put_str(bounds_form(kind & 0xff))
+    put_str(" a=")
+    put_signed(u64(a), (kind & SIGNED_A) != 0)
+    put_str(" b=")
+    put_signed(u64(b), (kind & SIGNED_B) != 0)
+    put_str(" length=")
+    put_dec(u64(length))
+    if at != null
+        put_str(" at ")
+        var i: usize = 0
+        while at[i] != 0
+            put_byte(at[i])
+            i += 1
+    put_str("\nkeel: halted\n")
+    system_off()
+
+private put_signed(v: u64, signed: bool)
+    if signed && i64(v) < 0
+        put_byte(u8('-'))
+        put_dec(0 - v)
+    else
+        put_dec(v)
+
+// The forms, by the number the compiler hands over (sysl's `bounds_fail.sysl`).
+private bounds_form(kind: u32) -> string = kind match
+    0 -> "index"
+    1 -> "range"
+    2 -> "inclusive range"
+    3 -> "start past end"
+    4 -> "start past inclusive end"
+    5 -> "start past length"
+    6 -> "start splits a character"
+    7 -> "end splits a character"
+    8 -> "too wide"
+    9 -> "run"
+    10 -> "count too wide"
+    else "form"
