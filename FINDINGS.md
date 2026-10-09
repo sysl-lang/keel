@@ -559,6 +559,10 @@ such as `@no_builtin` for any function that has to be written without the librar
 
 ## 19. Naming a sysl function as the program's allocating pair declares and defines one symbol twice
 
+**FIXED in sysl census-35 8619de66 (prerelease `8619de6609`):** both manifests now name the exported
+functions themselves (`keel_alloc`/`keel_free`, `keel_user_alloc`/`keel_user_free`) and the aliases
+are gone from `link.ld` and `user/user.ld` (branch `lsrm`).
+
 Milestone 3, `keel.heap`. packages.md § "One heap, and the package that names it" says the project's
 own manifest may name the pair ("an application with its own arena"), and a freestanding target has
 to. keel's heap is sysl, exported under the names the manifest gives:

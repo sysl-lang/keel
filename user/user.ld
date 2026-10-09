@@ -6,11 +6,6 @@
 
 ENTRY(_start)
 
-/* The allocating pair user/rt/package.hocon names, as aliases of keel.user's exported functions
-   (FINDINGS.md 19). */
-keel_user_heap_alloc = keel_user_alloc;
-keel_user_heap_free  = keel_user_free;
-
 SECTIONS
 {
     . = 0x400000;

@@ -13,11 +13,6 @@
 
 ENTRY(_start)
 
-/* The allocating pair package.hocon names, as aliases of keel.heap's exported functions
-   (FINDINGS.md 19). */
-keel_heap_alloc = keel_alloc;
-keel_heap_free  = keel_free;
-
 /* The ownership runtime's per-thread drain list. The runtime carries a weak `__sysl_arc_reaper` in the
    program's own module, so a sysl function exported under that name is a second definition clang
    refuses (FINDINGS.md 21); keel.sched exports `keel_arc_reaper` and this assignment wins over the

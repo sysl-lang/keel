@@ -11,10 +11,8 @@ dependencies {
   abi { workspace = true }
 }
 
-// The program's allocating pair: a heap grown with `brk`. The names are aliases user/user.ld defines
-// for `keel_user_alloc` and `keel_user_free` (naming an exported sysl function here declares and
-// defines one symbol twice, FINDINGS.md 19).
+// The program's allocating pair: a heap grown with `brk`, keel.user's exported functions.
 allocator {
-  alloc = "keel_user_heap_alloc"
-  free  = "keel_user_heap_free"
+  alloc = "keel_user_alloc"
+  free  = "keel_user_free"
 }
