@@ -1,0 +1,176 @@
+module keel.fs
+
+// keel's filesystem (FORMAT.md beside this file has the format; keel.ondisk the structs).
+//
+//   cache.sysl   the state, its lock, the buffer cache, mount and sync
+//   inode.sysl   inodes, the block bitmap, a file's blocks, reading and writing its bytes
+//   dir.sysl     directory entries and path lookup
+//   calls.sysl   the system calls, and each process's descriptors
+//
+// **One lock for the whole filesystem.** Everything — the buffer cache, the superblock, the count of
+// descriptors open on each inode — lives in `State`, and `State` lives inside a sleeping `Mutex`: a
+// system call takes it once, does all of its work, and gives it back. A holder may sleep in the disk
+// driver, which is why it is a `Mutex` and not a spinlock. Calls from every core are serialised, which
+// is correct before it is fast; finer locks (per buffer, per inode) are the obvious next step and
+// change nothing on the disk.
+//
+// **The buffer cache** holds NBUF blocks of 4 KiB, one frame each. A block is read from the disk the
+// first time it is wanted and stays until its buffer is needed for another; a change marks the buffer
+// dirty, and dirty buffers reach the disk only when `sync` runs (the system call, or kmain at
+// shutdown) or when the buffer is reused. A buffer is pinned while a caller holds its bytes, and only an
+// unpinned one is reused — the least recently used.
+
+import abi.keel.abi.{EINVAL, EIO, ENOMEM, Errno}
+import keel.mm
+import keel.sched.Mutex
+import keel.virtio
+import ondisk.keel.ondisk
+import ondisk.keel.ondisk.{BLOCK_SIZE, SECTOR_SIZE, SECTORS_PER_BLOCK, Super}
+
+private const NBUF: usize = 32
+
+// The most inodes a mounted filesystem may have: the open-descriptor counts are a fixed table.
+private const MAX_INODES: usize = 1024
+
+// Off only to show what it is for: with it off, `sync` writes nothing, and nothing a program wrote
+// survives a reboot (blocks evicted from the cache still are written).
+private const WRITE_BACK: bool = true
+
+private[fs] struct Buffer
+    block: u32
+    valid: bool                 // `data` holds `block`
+    dirty: bool                 // ...changed since it was read
+    pins: u32                   // callers holding its bytes
+    used: u64                   // `State.clock` when it was last wanted
+    data: *u8                   // its frame, through the linear map
+
+private[fs] struct State
+    mounted: bool
+    sb: Super
+    bufs: [NBUF]Buffer
+    clock: u64
+    opens: [MAX_INODES]u16      // per inode: descriptors open on it, in every process
+    disk_reads: u64             // blocks
+    disk_writes: u64
+
+// Zero until `mount`: not mounted, the lock free.
+private var fs: Mutex[State]
+
+private[fs] lock() -> *State = fs.lock()
+private[fs] unlock() = fs.unlock()
+
+// Mount the filesystem on the virtio disk: give the cache its frames, read the superblock and check it
+// against the disk. Answers the filesystem's size in blocks.
+mount() -> Result[u32, Errno]
+    val st = lock()
+    defer unlock()
+    if st.mounted then return Ok(st.sb.blocks)
+    for i in 0..<NBUF
+        if st.bufs[i].data != null then continue
+        val frame = mm.alloc_frame() match
+            Some(f) -> f
+            None -> return Err(ENOMEM)
+        st.bufs[i].data = ptr_cast(usize(u64(mm.to_virt(mm.frame_addr(frame)))))
+    val slot = get(st, ondisk.SUPER_BLOCK)?
+    val sb: *Super = ondisk.at(bytes(st, slot), 0)
+    val found = *sb
+    put(st, slot)
+    if !ondisk.valid(found, virtio.capacity() / SECTORS_PER_BLOCK) || usize(found.inodes) > MAX_INODES
+        return Err(EINVAL)
+    st.sb = found
+    st.mounted = true
+    Ok(found.blocks)
+
+// Write every changed block to the disk.
+sync() -> Result[unit, Errno]
+    val st = lock()
+    defer unlock()
+    flush(st)
+
+private[fs] flush(st: *State) -> Result[unit, Errno]
+    if !WRITE_BACK then return Ok(())
+    for i in 0..<NBUF
+        if st.bufs[i].valid && st.bufs[i].dirty then write_out(st, i)?
+    Ok(())
+
+// Blocks read from and written to the disk since boot.
+stats() -> (u64, u64)
+    val st = lock()
+    defer unlock()
+    (st.disk_reads, st.disk_writes)
+
+// The buffer holding block `b`, read from the disk if no buffer has it, and pinned: the caller `put`s
+// it back. Panics if every buffer is pinned, which no call here can reach (none pins more than three).
+private[fs] get(st: *State, b: u32) -> Result[usize, Errno]
+    if st.mounted && b >= st.sb.blocks then return Err(EIO)
+    val i = claim(st, b)
+    if st.bufs[i].valid then return Ok(i)
+    var data = bytes(st, i)
+    for k in 0..<SECTORS_PER_BLOCK
+        val at = usize(k) * SECTOR_SIZE
+        virtio.read_sector(u64(b) * SECTORS_PER_BLOCK + k, data[at..<at + SECTOR_SIZE]) match
+            Ok(_) -> ()
+            Err(_) ->
+                st.bufs[i].pins = 0
+                return Err(EIO)
+    st.bufs[i].valid = true
+    st.disk_reads += 1
+    Ok(i)
+
+// The buffer for block `b`, pinned, filled with zeros and dirty, without reading the disk: for a block
+// just allocated, whose old contents mean nothing.
+private[fs] get_zeroed(st: *State, b: u32) -> Result[usize, Errno]
+    val i = claim(st, b)
+    var data = bytes(st, i)
+    for k in 0..<BLOCK_SIZE
+        data[k] = 0
+    st.bufs[i].valid = true
+    st.bufs[i].dirty = true
+    Ok(i)
+
+// A pinned buffer for block `b`: the one holding it, or the least recently used unpinned one, written
+// out first if it is dirty and left invalid for the caller to fill.
+private claim(st: *State, b: u32) -> usize
+    st.clock += 1
+    var victim = NBUF
+    for i in 0..<NBUF
+        val buf = &st.bufs[i]
+        if buf.valid && buf.block == b
+            buf.pins += 1
+            buf.used = st.clock
+            return i
+        if buf.pins == 0 && (victim == NBUF || age(buf) < age(&st.bufs[victim])) then victim = i
+    if victim == NBUF then panic("keel.fs: every buffer is pinned")
+    if st.bufs[victim].valid && st.bufs[victim].dirty
+        write_out(st, victim) match
+            Ok(_) -> ()
+            Err(_) -> print("keel: fs: block", st.bufs[victim].block, "could not be written back")
+    val buf = &st.bufs[victim]
+    buf.block = b
+    buf.valid = false
+    buf.dirty = false
+    buf.pins = 1
+    buf.used = st.clock
+    victim
+
+// An invalid buffer is the first to reuse.
+private age(b: *Buffer) -> u64 = if b.valid then b.used else 0
+
+private write_out(st: *State, i: usize) -> Result[unit, Errno]
+    val data = bytes(st, i)
+    val b = st.bufs[i].block
+    for k in 0..<SECTORS_PER_BLOCK
+        val at = usize(k) * SECTOR_SIZE
+        virtio.write_sector(u64(b) * SECTORS_PER_BLOCK + k, data[at..<at + SECTOR_SIZE]) match
+            Ok(_) -> ()
+            Err(_) -> return Err(EIO)
+    st.bufs[i].dirty = false
+    st.disk_writes += 1
+    Ok(())
+
+// A pinned buffer's bytes.
+private[fs] bytes(st: *State, i: usize) -> []u8 = st.bufs[i].data[0..<BLOCK_SIZE]
+
+private[fs] mark_dirty(st: *State, i: usize) = st.bufs[i].dirty = true
+
+private[fs] put(st: *State, i: usize) = st.bufs[i].pins -= 1

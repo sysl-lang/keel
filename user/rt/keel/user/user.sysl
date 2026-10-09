@@ -6,8 +6,9 @@ module keel.user
 // every other register zero. `_start` calls the program — sysl's `main`, which fills the module storage
 // and runs the entry file's statements — and ends the process with whatever `main` answered.
 
-import abi.keel.abi.{STDOUT, SYS_BRK, SYS_EXIT, SYS_GETPID, SYS_WRITE}
-import sysl.slices.as_ptr
+import abi.keel.abi.{Errno, STDOUT, SYS_BRK, SYS_CLOSE, SYS_EXIT, SYS_FSTAT, SYS_GETDENTS, SYS_GETPID, SYS_LSEEK,
+    SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_STAT, SYS_SYNC, SYS_UNLINK, SYS_WRITE, Stat}
+import sysl.slices.{as_mut_ptr, as_ptr}
 
 @section(".text.start")
 asm
@@ -76,6 +77,69 @@ sys_exit(code: u64) -> never
         asm
             [aarch64] "brk #1"
             [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// --- Files ---------------------------------------------------------------------------------------
+//
+// Every call below answers a `Result`: the kernel's negative answer is the error's number.
+
+// A system call of up to four arguments.
+private call(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
+    var r: i64 = 0
+    asm
+        [aarch64]
+            "svc #0"
+            in nr : "x8"
+            in a0 : "x0"
+            in a1 : "x1"
+            in a2 : "x2"
+            in a3 : "x3"
+            out r : "x0"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    r
+
+private answer(r: i64) -> Result[u64, Errno] = if r < 0 then Err(Errno(-r)) else Ok(u64(r))
+
+private done(r: i64) -> Result[unit, Errno] = if r < 0 then Err(Errno(-r)) else Ok(())
+
+private addr(b: []const u8) -> u64 = u64(usize(as_ptr(b)))
+
+private len(b: []const u8) -> u64 = u64(b.len)
+
+open(path: string, flags: u64) -> Result[u64, Errno] = answer(call(SYS_OPEN, addr(path.bytes), len(path.bytes), flags, 0))
+
+read(fd: u64, into: []u8) -> Result[u64, Errno] = answer(call(SYS_READ, fd, u64(usize(as_mut_ptr(into))), u64(into.len), 0))
+
+// `write` to a file: how many bytes went, or why none did.
+write_file(fd: u64, bytes: []const u8) -> Result[u64, Errno] = answer(call(SYS_WRITE, fd, addr(bytes), len(bytes), 0))
+
+close(fd: u64) -> Result[unit, Errno] = done(call(SYS_CLOSE, fd, 0, 0, 0))
+
+lseek(fd: u64, offset: i64, whence: u64) -> Result[u64, Errno] = answer(call(SYS_LSEEK, fd, u64(offset), whence, 0))
+
+fstat(fd: u64) -> Result[Stat, Errno]
+    var s = Stat(0, 0, 0, 0, 0)
+    done(call(SYS_FSTAT, fd, u64(usize(&s)), 0, 0))?
+    Ok(s)
+
+stat(path: string) -> Result[Stat, Errno]
+    var s = Stat(0, 0, 0, 0, 0)
+    done(call(SYS_STAT, addr(path.bytes), len(path.bytes), u64(usize(&s)), 0))?
+    Ok(s)
+
+mkdir(path: string) -> Result[unit, Errno] = done(call(SYS_MKDIR, addr(path.bytes), len(path.bytes), 0, 0))
+
+// As many whole directory entries (keel.abi's `Dirent`) as fit in `into`; 0 bytes at the end.
+getdents(fd: u64, into: []u8) -> Result[u64, Errno] =
+    answer(call(SYS_GETDENTS, fd, u64(usize(as_mut_ptr(into))), u64(into.len), 0))
+
+unlink(path: string) -> Result[unit, Errno] = done(call(SYS_UNLINK, addr(path.bytes), len(path.bytes), 0, 0))
+
+rmdir(path: string) -> Result[unit, Errno] = done(call(SYS_RMDIR, addr(path.bytes), len(path.bytes), 0, 0))
+
+rename(from: string, to: string) -> Result[unit, Errno] =
+    done(call(SYS_RENAME, addr(from.bytes), len(from.bytes), addr(to.bytes), len(to.bytes)))
+
+sync() -> Result[unit, Errno] = done(call(SYS_SYNC, 0, 0, 0, 0))
 
 // Write a string to standard output, all of it unless the kernel refuses.
 put(s: string) -> i64 = write_bytes(STDOUT, s.bytes)

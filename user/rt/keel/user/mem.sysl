@@ -1,0 +1,39 @@
+module keel.user
+
+// The C symbols a freestanding program has to define for itself, as the kernel's keel.rt does: LLVM
+// turns a loop that zeroes or copies memory (a `[0; 1000]` local, a structure assignment) into calls to
+// these. Every store goes through a `*volatile u8`, or LLVM recognises the loop as a `memset` and makes
+// the function call itself (FINDINGS.md 18).
+
+@export("memset")
+mem_set(dst: *u8, c: int, n: usize) -> *u8
+    val d: *volatile u8 = ptr_cast(dst)
+    for i in 0..<n
+        d[i] = u8(c)
+    dst
+
+@export("memcpy")
+mem_copy(dst: *u8, src: *u8, n: usize) -> *u8
+    val d: *volatile u8 = ptr_cast(dst)
+    for i in 0..<n
+        d[i] = src[i]
+    dst
+
+@export("memmove")
+mem_move(dst: *u8, src: *u8, n: usize) -> *u8
+    val d: *volatile u8 = ptr_cast(dst)
+    if usize(dst) < usize(src)
+        for i in 0..<n
+            d[i] = src[i]
+    else
+        var i = n
+        while i > 0
+            i -= 1
+            d[i] = src[i]
+    dst
+
+@export("memcmp")
+mem_compare(a: *u8, b: *u8, n: usize) -> int
+    for i in 0..<n
+        if a[i] != b[i] then return int(a[i]) - int(b[i])
+    0

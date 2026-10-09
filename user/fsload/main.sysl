@@ -1,0 +1,45 @@
+// One of several copies run at once, one per core: write a file of its own a kilobyte at a time, read it
+// back and check every byte, remove it, and ask for everything to reach the disk. Exits 0 only if all
+// of that worked; the kernel runs four and counts.
+
+import abi.keel.abi.{Errno, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY}
+import rt.keel.user
+
+const SIZE: usize = 20_000
+
+val pid = user.getpid()
+val name = s"/load$pid"
+
+byte_at(i: usize) -> u8 = u8((i * 7 + usize(pid)) & 0xff)
+
+run() -> Result[bool, Errno]
+    val out = user.open(name, O_WRONLY | O_CREAT | O_TRUNC)?
+    var chunk: [1000]u8 = [0; 1000]
+    var i: usize = 0
+    while i < SIZE
+        for k in 0..<chunk.len
+            chunk[k] = byte_at(i + k)
+        if user.write_file(out, chunk[..])? != 1000 then return Ok(false)
+        i += 1000
+    user.close(out)?
+
+    val back = user.open(name, O_RDONLY)?
+    var good = user.fstat(back)?.size == u64(SIZE)
+    var at: usize = 0
+    loop
+        val n = usize(user.read(back, chunk[..])?)
+        if n == 0 then break
+        for k in 0..<n
+            if chunk[k] != byte_at(at + k) then good = false
+        at += n
+    user.close(back)?
+    user.unlink(name)?
+    user.sync()?
+    Ok(good && at == SIZE)
+
+val ok = run() match
+    Ok(good) -> good
+    Err(e) ->
+        print(s"user: fsload $pid: errno ${i64(e)}")
+        false
+user.exit(if ok then 0 else 1)

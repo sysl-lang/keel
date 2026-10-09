@@ -1,0 +1,58 @@
+module keel.selftest
+
+// What milestone 8 is for: a filesystem on the virtio disk, built on the host by tools/mkfs, used by
+// programs through system calls, and still there on the next boot. scripts/boot-test.sh boots twice on
+// one image; the `files` program prints its own lines, and says on the second boot that it found what
+// the first one wrote.
+
+import keel.fs
+import keel.proc
+import keel.sched
+import keel.sched.Process
+import sysl.buf.{Buf, buf}
+
+files()
+    val blocks = fs.mount() match
+        Ok(n) -> n
+        Err(e) ->
+            print("keel: no filesystem on the disk, errno", i64(e))
+            return
+    print("keel: fs mounted,", blocks, "blocks")
+    fs_smp()
+    proc.start(proc.files()) match
+        Ok(p) ->
+            proc.wait(p)
+            if !proc.exited(p) || proc.exit_code(p) != 0 then print("keel: files", outcome(p))
+        Err(_) -> print("keel: files did not load")
+
+// The write-back kmain asks for before it powers off: every block still dirty in the cache goes to the
+// disk, which is all that makes what the programs wrote survive the reboot.
+fs_shutdown()
+    val (_, before) = fs.stats()
+    fs.sync() match
+        Ok(_) ->
+            val (_, after) = fs.stats()
+            print("keel: fs synced at shutdown,", after - before, "blocks written")
+        Err(e) -> print("keel: fs sync failed, errno", i64(e))
+
+// One `fsload` per core, all at once: each writes, reads back, removes a file of its own and syncs.
+// The filesystem's one lock is what keeps them apart.
+private fs_smp()
+    var loads: Buf[&sync Process] = buf()
+    for _ in 0..<sched.cores_up()
+        proc.start(proc.fsload()) match
+            Ok(p) -> loads.push(p)
+            Err(_) -> print("keel: fsload did not load")
+    var good: u64 = 0
+    for p in loads
+        proc.wait(p)
+        if proc.exited(p) && proc.exit_code(p) == 0 then good += 1 else print("keel: fsload", outcome(p))
+    val (reads, writes) = fs.stats()
+    if good == u64(loads.len()) && good >= 2
+        print("keel: fs smp ok:", good, "processes; disk blocks read", reads, "written", writes)
+    else
+        print("keel: fs smp wrong:", good, "of", loads.len(), "processes passed")
+
+private outcome(p: &sync Process) -> string =
+    if proc.exited(p) then s"process ${proc.pid(p)} exited ${proc.exit_code(p)}"
+    else s"process ${proc.pid(p)} killed: ${proc.why(p)}"

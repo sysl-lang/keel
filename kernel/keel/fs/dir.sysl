@@ -1,0 +1,123 @@
+module keel.fs
+
+// Directories and paths. A directory is a file of 32-byte entries (keel.ondisk's `Dirent`), `.` and
+// `..` first; an entry whose inode is 0 is a free slot, reused before the directory grows. A path is
+// bytes: components between `/`s, looked up from the root whether or not it starts with one (there is
+// no current directory yet), `.` and `..` found as the entries they are.
+
+import abi.keel.abi.{EINVAL, EIO, ENAMETOOLONG, ENOENT, ENOTDIR, Errno}
+import ondisk.keel.ondisk
+import ondisk.keel.ondisk.{BLOCK_SIZE, DIRENT_SIZE, Dirent, Inode, KIND_DIR, NAME_MAX, ROOT_INO}
+
+private const ENTRIES_PER_BLOCK: usize = BLOCK_SIZE / DIRENT_SIZE
+
+// An entry found in a directory: the inode it names, its kind, and its slot.
+private[fs] struct Found
+    ino: u32
+    kind: u16
+    slot: usize
+
+// The entry called `name` in directory `dir`, if there is one.
+private[fs] find(st: *State, dir: *Inode, name: []const u8) -> Result[Option[Found], Errno]
+    if dir.kind != KIND_DIR then return Err(ENOTDIR)
+    val count = usize(dir.size) / DIRENT_SIZE
+    var slot: usize = 0
+    while slot < count
+        val b = block_of(st, dir, slot / ENTRIES_PER_BLOCK, false)?
+        if b == 0 then return Err(EIO)
+        val s = get(st, b)?
+        val data = bytes(st, s)
+        val last = min_usize(count, (slot / ENTRIES_PER_BLOCK + 1) * ENTRIES_PER_BLOCK)
+        for k in slot..<last
+            val e: *Dirent = ondisk.at(data, (k % ENTRIES_PER_BLOCK) * DIRENT_SIZE)
+            if e.ino != 0 && ondisk.name_of(e) == name
+                val f = Found(e.ino, u16(e.kind), k)
+                put(st, s)
+                return Ok(Some(f))
+        put(st, s)
+        slot = last
+    Ok(None)
+
+// The entry in `slot` of a directory, copied out; a free slot has inode 0.
+private[fs] entry_at(st: *State, dir: *Inode, slot: usize) -> Result[Dirent, Errno]
+    val b = block_of(st, dir, slot / ENTRIES_PER_BLOCK, false)?
+    if b == 0 then return Err(EIO)
+    val s = get(st, b)?
+    val e: *Dirent = ondisk.at(bytes(st, s), (slot % ENTRIES_PER_BLOCK) * DIRENT_SIZE)
+    val copy = *e
+    put(st, s)
+    Ok(copy)
+
+// Add an entry naming `ino` to directory `dir`, in its first free slot or at its end. The caller has
+// checked the name is not there, and writes the directory's inode back.
+private[fs] add_entry(st: *State, dir: *Inode, name: []const u8, ino: u32, kind: u16) -> Result[unit, Errno]
+    val count = usize(dir.size) / DIRENT_SIZE
+    var slot = count
+    for k in 0..<count
+        if entry_at(st, dir, k)?.ino == 0
+            slot = k
+            break
+    set_slot(st, dir, slot, ino, kind, name)?
+    if slot == count then dir.size += u64(DIRENT_SIZE)
+    Ok(())
+
+// Write the entry in `slot`, giving the directory a block for it if it has none yet.
+private[fs] set_slot(st: *State, dir: *Inode, slot: usize, ino: u32, kind: u16, name: []const u8) -> Result[unit, Errno]
+    val b = block_of(st, dir, slot / ENTRIES_PER_BLOCK, true)?
+    val s = get(st, b)?
+    val e: *Dirent = ondisk.at(bytes(st, s), (slot % ENTRIES_PER_BLOCK) * DIRENT_SIZE)
+    ondisk.set_entry(e, ino, kind, name)
+    mark_dirty(st, s)
+    put(st, s)
+    Ok(())
+
+private[fs] clear_slot(st: *State, dir: *Inode, slot: usize) -> Result[unit, Errno] = set_slot(st, dir, slot, 0, 0, [])
+
+// Whether a directory holds nothing but `.` and `..`.
+private[fs] is_empty(st: *State, dir: *Inode) -> Result[bool, Errno]
+    for k in 0..<usize(dir.size) / DIRENT_SIZE
+        var e = entry_at(st, dir, k)?
+        if e.ino == 0 then continue
+        val name = ondisk.name_of(&e)
+        if name != ".".bytes && name != "..".bytes then return Ok(false)
+    Ok(true)
+
+// The inode a path names.
+private[fs] resolve(st: *State, path: []const u8) -> Result[u32, Errno]
+    var ino = ROOT_INO
+    var at: usize = 0
+    while at < path.len
+        val (start, end) = component(path, at)
+        at = end
+        if start == end then continue
+        if end - start > NAME_MAX then return Err(ENAMETOOLONG)
+        var dir = read_inode(st, ino)?
+        ino = find(st, &dir, path[start..<end])? match
+            Some(f) -> f.ino
+            None -> return Err(ENOENT)
+    Ok(ino)
+
+// The directory holding a path's last component, and that component: `/a/b/c` is `/a/b`'s inode and
+// `c`. A path with no last component (`/`, or nothing) is EINVAL.
+private[fs] parent_of(st: *State, path: []const u8) -> Result[(u32, []const u8), Errno]
+    var end = path.len
+    while end > 0 && path[end - 1] == u8('/')
+        end -= 1
+    var start = end
+    while start > 0 && path[start - 1] != u8('/')
+        start -= 1
+    if start == end then return Err(EINVAL)
+    if end - start > NAME_MAX then return Err(ENAMETOOLONG)
+    val dir = resolve(st, path[0..<start])?
+    Ok((dir, path[start..<end]))
+
+// The component of `path` starting at `at`: where it starts and ends. At a `/` it is the empty one
+// after it, so the caller steps over the slash.
+private component(path: []const u8, at: usize) -> (usize, usize)
+    var end = at
+    while end < path.len && path[end] != u8('/')
+        end += 1
+    if end == at then return (at + 1, at + 1)
+    (at, end)
+
+private min_usize(a: usize, b: usize) -> usize = if a < b then a else b

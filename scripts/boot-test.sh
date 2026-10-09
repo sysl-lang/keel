@@ -1,6 +1,7 @@
 #!/bin/zsh
 # keel's boot test: build the kernel, boot it under QEMU, and pass only if it prints the `expected`
 # lines below in order and QEMU exits by itself (the kernel powered the machine off through PSCI).
+# It boots twice on one disk: the filesystem the first boot writes is what the second one reads.
 #
 # The machine is `virt` with a GICv3: HVF refuses a GICv2 ("HVF does not support GICv2 emulation"),
 # and asking for 3 explicitly gives TCG the same controller.
@@ -25,7 +26,9 @@ opt=${KEEL_OPT:-}
 accel=${KEEL_ACCEL:-hvf}
 compiler=${KEEL_SYSL:-sysl}
 
-expected=(
+# Every boot prints these, in order. `user_line` is where each boot's own line goes: what the `files`
+# program says about the previous boot's /out.txt.
+before_user_line=(
     "keel: hello"           # kmain runs
     "keel: mmu on, kmain at 0xffff"   # ...in the high half, with the MMU on
     "keel: uart is Device-nGnRE"      # the MMU's own translation of the UART's address says so
@@ -53,42 +56,62 @@ expected=(
     "keel: preempt user ok" # one spinner per core never yields; a worker still ran, and each was preempted
     "keel: bad pointer rejected"   # write() with four bad buffers answered EFAULT, and the kernel lives
     "keel: processes reclaimed"    # every frame, table and ASID the processes had came back
-    "keel: virtio-blk found, capacity 2048 sectors"   # the 1 MiB image, found in a virtio-mmio slot
+    "keel: virtio-blk found, capacity 8192 sectors"   # the 4 MiB image, found in a virtio-mmio slot
     "keel: disk read ok"    # sector 1 read back the bytes this script put there
     "keel: disk write ok"   # a pattern written to sector 2 read back the same
     "keel: disk smp ok"     # 4 threads x 100 reads at once, on >= 2 cores, every byte right
+    "keel: fs mounted, 1024 blocks"   # the superblock mkfs wrote, checked against the disk's size
+    "keel: fs smp ok"       # one process per core wrote, read back, removed a file of its own, synced
+    "user: hello.txt says hello from the disk"   # a sysl program read a file mkfs put on the disk
+    "user: write ok"        # ...wrote /out.txt (12 blocks, the indirect one too), reopened it, read it back
+    "user: dirs ok"         # mkdir, getdents, rename (into and out of directories), unlink, rmdir, errors
+)
+after_user_line=(
+    "keel: fs synced at shutdown"   # the dirty blocks went to the disk before the power did
     "keel: bounds check failed: index"   # the last step: a kernel bounds failure is reported...
     "keel: halted"                 # ...and stops the machine (checked below: nothing ran after it)
 )
 
-# Printed only if the access after a failed bounds check went ahead.
-not_expected="keel: bounds failure was not fatal"
+# Printed only if something went wrong: the access after a failed bounds check went ahead, or a check
+# in the `files` program failed.
+not_expected=("keel: bounds failure was not fatal" "user: FAILED")
 
-user_programs=(hello fault spin worker badptr)
+user_programs=(hello fault spin worker badptr files fsload)
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
 frames_min=65000
 frames_max=65536
 
 elf=$out/keel.elf
-log=$out/boot.log
+mkfs=$out/mkfs
 
-# The disk: a fresh 1 MiB raw image, zero but for sector 1, whose byte i is (7i + 3) mod 256. The kernel
-# writes sector 2 with byte i = (13i + 0x5a) mod 256; after QEMU exits the script reads it back from the
-# file. keel.selftest's disk.sysl has the same two formulas.
+# The disk: a 4 MiB keel filesystem (1024 blocks) that mkfs builds from a directory holding
+# /hello.txt and /dir/inner.txt. Its block 0 is a boot block the filesystem never uses, which is where
+# milestone 7's test lives: sector 1 gets byte i = (7i + 3) mod 256 here, the kernel writes sector 2
+# with byte i = (13i + 0x5a) mod 256, and after the first boot the script reads it back from the file.
+# keel.selftest's disk.sysl has the same two formulas.
 disk=$out/disk.img
+fsroot=$out/fsroot
 sector() { perl -e 'my ($m, $a) = @ARGV; print map { chr(($_ * $m + $a) & 0xff) } 0..511' $1 $2 }
-{ head -c 512 /dev/zero; sector 7 3; head -c $((1048576 - 1024)) /dev/zero } > $disk
 sector 13 90 > $out/sector2.expected
 
-# The user programs first: the kernel embeds their images with `.incbin`, whose path the assembler
-# resolves against the directory the build runs in, so the kernel is built from the repository's root.
+# The host's mkfs, then the user programs: the kernel embeds their images with `.incbin`, whose path the
+# assembler resolves against the directory the build runs in, so the kernel is built from the
+# repository's root.
+$compiler build -o $mkfs $root/tools/mkfs
 mkdir -p $out/user
 for prog in $user_programs; do
     $compiler build --target aarch64-freestanding ${opt:+$opt} -o $out/user/$prog.elf $root/user/$prog
 done
 cd $root
 $compiler build --target aarch64-freestanding ${opt:+$opt} -o $elf $root/kernel
+
+rm -rf $fsroot
+mkdir -p $fsroot/dir
+print -n "hello from the disk" > $fsroot/hello.txt
+print "inside a directory" > $fsroot/dir/inner.txt
+$mkfs build $disk 1024 $fsroot
+sector 7 3 | perl -e 'open(my $f, "+<", $ARGV[0]) or die; seek($f, 512, 0); local $/; print $f <STDIN>' $disk
 
 if [[ $accel == hvf ]]; then
     machine=(-accel hvf -cpu host)
@@ -101,61 +124,82 @@ fi
 drive=(-drive file=$disk,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0
        -global virtio-mmio.force-legacy=false)
 
-qemu-system-aarch64 -M virt,gic-version=3 $machine -smp ${KEEL_SMP:-4} -m 256M -nographic $drive -kernel $elf > $log 2>&1 < /dev/null &
-qpid=$!
+# One boot on the disk as it stands, passing only if every line of `before_user_line`, then $2, then
+# `after_user_line` is printed in order and QEMU powers off by itself. $1 names the boot in the log.
+boot() {
+    local name=$1 user_line=$2
+    local log=$out/boot$name.log
+    local expected=($before_user_line "$user_line" $after_user_line)
 
-waited=0
-while kill -0 $qpid 2> /dev/null && (( waited < limit * 10 )); do
-    sleep 0.1
-    waited=$((waited + 1))
-done
+    qemu-system-aarch64 -M virt,gic-version=3 $machine -smp ${KEEL_SMP:-4} -m 256M -nographic $drive -kernel $elf > $log 2>&1 < /dev/null &
+    local qpid=$!
 
-exited=yes
-if kill -0 $qpid 2> /dev/null; then
-    exited=no
-    kill -9 $qpid 2> /dev/null
-fi
-qemu_exit=0
-wait $qpid 2> /dev/null || qemu_exit=$?
+    waited=0
+    while kill -0 $qpid 2> /dev/null && (( waited < limit * 10 )); do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
 
-print -r -- "--- QEMU output ($accel${opt:+, $opt}) ---"
-cat $log
-print -r -- "---"
+    local exited=yes
+    if kill -0 $qpid 2> /dev/null; then
+        exited=no
+        kill -9 $qpid 2> /dev/null
+    fi
+    local qemu_exit=0
+    wait $qpid 2> /dev/null || qemu_exit=$?
 
-if [[ $exited == no ]]; then
-    print -r -- "FAIL: QEMU did not exit within ${limit}s; the kernel did not power off"
-    return 1
-fi
-text=$(<$log)
-seen=""
-for line in $expected; do
-    rest=${text#*$line}
-    if [[ $rest == $text ]]; then
-        print -r -- "FAIL: QEMU exited (status $qemu_exit); expected '$line'${seen:+ after$seen}, and it is not there"
+    print -r -- "--- QEMU output, boot $name ($accel${opt:+, $opt}) ---"
+    cat $log
+    print -r -- "---"
+
+    if [[ $exited == no ]]; then
+        print -r -- "FAIL: boot $name: QEMU did not exit within ${limit}s; the kernel did not power off"
         return 1
     fi
-    text=$rest
-    seen="$seen '$line'"
-done
-if [[ $(<$log) == *"$not_expected"* ]]; then
-    print -r -- "FAIL: '$not_expected' — the kernel carried on after a failed bounds check"
-    return 1
-fi
-frames=${${(M)${(f)"$(<$log)"}:#keel: frames *}#keel: frames }
-if [[ $frames != <-> ]] || (( frames < frames_min || frames > frames_max )); then
-    print -r -- "FAIL: 'keel: frames $frames' is not a free count between $frames_min and $frames_max"
-    return 1
-fi
-spread=${${(M)${(f)"$(<$log)"}:#keel: smp ran on *}#keel: smp ran on }
-spread=${spread% cores}
-if [[ $spread != <-> ]] || (( spread < 2 )); then
-    print -r -- "FAIL: 'keel: smp ran on $spread cores' — threads have to have run on at least 2 cores"
-    return 1
-fi
-if (( qemu_exit != 0 )); then
-    print -r -- "FAIL: QEMU exited with status $qemu_exit"
-    return 1
-fi
+    local text=$(<$log) seen="" line rest
+    for line in $expected; do
+        rest=${text#*$line}
+        if [[ $rest == $text ]]; then
+            print -r -- "FAIL: boot $name: QEMU exited (status $qemu_exit); expected '$line'${seen:+ after$seen}, and it is not there"
+            return 1
+        fi
+        text=$rest
+        seen="$seen '$line'"
+    done
+    for line in $not_expected; do
+        if [[ $(<$log) == *"$line"* ]]; then
+            print -r -- "FAIL: boot $name: '$line' was printed"
+            return 1
+        fi
+    done
+    local frames=${${(M)${(f)"$(<$log)"}:#keel: frames *}#keel: frames }
+    if [[ $frames != <-> ]] || (( frames < frames_min || frames > frames_max )); then
+        print -r -- "FAIL: boot $name: 'keel: frames $frames' is not a free count between $frames_min and $frames_max"
+        return 1
+    fi
+    local spread=${${(M)${(f)"$(<$log)"}:#keel: smp ran on *}#keel: smp ran on }
+    spread=${spread% cores}
+    if [[ $spread != <-> ]] || (( spread < 2 )); then
+        print -r -- "FAIL: boot $name: 'keel: smp ran on $spread cores' — threads have to have run on at least 2 cores"
+        return 1
+    fi
+    if (( qemu_exit != 0 )); then
+        print -r -- "FAIL: boot $name: QEMU exited with status $qemu_exit"
+        return 1
+    fi
+}
+
+# The image is well-formed after a boot: mkfs's check reads every directory, inode and bitmap bit.
+fsck() {
+    if ! $mkfs check $disk; then
+        print -r -- "FAIL: after boot $1, the filesystem on $disk is damaged"
+        return 1
+    fi
+}
+
+boot 1 "user: first boot, no /out.txt yet"
+first=$waited
+
 # The kernel's write reached the image file: sector 2, read on the host once QEMU has gone.
 if [[ $(od -An -tx1 -v -j 1024 -N 512 $disk) != $(od -An -tx1 -v $out/sector2.expected) ]]; then
     print -r -- "FAIL: sector 2 of $disk does not hold what the kernel wrote:"
@@ -163,4 +207,18 @@ if [[ $(od -An -tx1 -v -j 1024 -N 512 $disk) != $(od -An -tx1 -v $out/sector2.ex
     return 1
 fi
 print -r -- "keel: disk persisted"
-print -r -- "PASS:$seen in order, and QEMU exited by itself (status 0) after $((waited / 10)).$((waited % 10))s"
+fsck 1
+
+boot 2 "user: persisted across reboot"
+second=$waited
+fsck 2
+
+# And the host reads what the second boot wrote, through the same format.
+$mkfs get $disk /out.txt $out/out.txt
+header=$(head -1 $out/out.txt)
+if [[ $header != "keel was here, boot 2" ]]; then
+    print -r -- "FAIL: /out.txt on the host begins '$header', not 'keel was here, boot 2'"
+    return 1
+fi
+print -r -- "host: /out.txt says $header"
+print -r -- "PASS: two boots on one disk, every line in order each time, and QEMU exited by itself (status 0) after $((first / 10)).$((first % 10))s and $((second / 10)).$((second % 10))s"

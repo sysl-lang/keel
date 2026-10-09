@@ -105,6 +105,55 @@ user_translate(s: *Space, va: u64) -> Option[(PhysAddr, bool)]
     val leaf: LeafDesc = cpu.from_word(*slot)
     Some((frame_addr(leaf.oa) + (va & (PAGE_SIZE - 1)), leaf.ap == UserRw))
 
+// Copy `dst.len` bytes in from user address `va` of space `s`, or answer false and copy nothing when
+// any of them is not user memory of the space. The bytes are read through the kernel's linear map at the
+// physical address the space's own tables give: a user address is never dereferenced.
+copy_from_user(s: *Space, va: u64, dst: []u8) -> bool
+    if !user_range(s, va, u64(dst.len), false) then return false
+    var done: usize = 0
+    while done < dst.len
+        val a = va + u64(done)
+        val chunk = min_usize(dst.len - done, usize(PAGE_SIZE - (a & (PAGE_SIZE - 1))))
+        val src: *u8 = ptr_cast(usize(u64(to_virt(translated(s, a)))))
+        for i in 0..<chunk
+            dst[done + i] = src[i]
+        done += chunk
+    true
+
+// Copy `src` out to user address `va` of space `s`, or answer false and copy nothing when any byte of
+// the destination is not user memory the program may write.
+copy_to_user(s: *Space, va: u64, src: []const u8) -> bool
+    if !user_range(s, va, u64(src.len), true) then return false
+    var done: usize = 0
+    while done < src.len
+        val a = va + u64(done)
+        val chunk = min_usize(src.len - done, usize(PAGE_SIZE - (a & (PAGE_SIZE - 1))))
+        val dst: *u8 = ptr_cast(usize(u64(to_virt(translated(s, a)))))
+        for i in 0..<chunk
+            dst[i] = src[done + i]
+        done += chunk
+    true
+
+// Whether all of `len` bytes from `va` are user memory of this space — inside the user range with no
+// wrap around, every page mapped, and writable where `write` asks.
+user_range(s: *Space, va: u64, len: u64, write: bool) -> bool
+    if len == 0 then return true
+    if va >= USER_STACK_TOP || len > USER_STACK_TOP - va then return false
+    var page = va & ~(PAGE_SIZE - 1)
+    while page < va + len
+        val ok = user_translate(s, page) match
+            Some((_, writable)) -> writable || !write
+            None -> false
+        if !ok then return false
+        page += PAGE_SIZE
+    true
+
+private translated(s: *Space, va: u64) -> PhysAddr = user_translate(s, va) match
+    Some((pa, _)) -> pa
+    None -> panic("keel.mm: a user page went away under a copy")
+
+private min_usize(a: usize, b: usize) -> usize = if a < b then a else b
+
 // Give every frame of the space back — its pages, its tables, its root — and its ASID, after flushing
 // whatever translations any core still caches under it. No core may be running the space.
 free_space(s: *Space)

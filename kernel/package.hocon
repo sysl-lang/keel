@@ -25,6 +25,7 @@ allocator {
 // The system call numbers and error codes, which user programs build against too.
 dependencies {
   abi { workspace = true }
+  ondisk { workspace = true }
 }
 
 targets {

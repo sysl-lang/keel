@@ -1,0 +1,182 @@
+module keel.fs
+
+// Inodes, the block bitmap, and a file's bytes. Every function here is called holding the filesystem's
+// lock (`st`). An inode is read out of its block as a value and written back whole.
+//
+// A file never has a hole: writing past the end gives every block in between a zeroed block first, so a
+// block pointer is 0 exactly past the end of the file — which is what mkfs's check holds a disk to.
+
+import abi.keel.abi.{EFBIG, EIO, ENOSPC, Errno}
+import ondisk.keel.ondisk
+import ondisk.keel.ondisk.{BITS_PER_BLOCK, BLOCK_SIZE, INODES_PER_BLOCK, Inode, KIND_DIR, KIND_FREE, NDIRECT,
+    NINDIRECT}
+
+private[fs] read_inode(st: *State, ino: u32) -> Result[Inode, Errno]
+    if ino == 0 || ino >= st.sb.inodes then return Err(EIO)
+    val slot = get(st, ondisk.inode_block(st.sb, ino))?
+    val i: *Inode = ondisk.at(bytes(st, slot), ondisk.inode_offset(ino))
+    val copy = *i
+    put(st, slot)
+    Ok(copy)
+
+private[fs] write_inode(st: *State, ino: u32, value: Inode) -> Result[unit, Errno]
+    val slot = get(st, ondisk.inode_block(st.sb, ino))?
+    val i: *Inode = ondisk.at(bytes(st, slot), ondisk.inode_offset(ino))
+    *i = value
+    mark_dirty(st, slot)
+    put(st, slot)
+    Ok(())
+
+// A free inode, made a `kind` with nothing in it and one link; ENOSPC when there is none.
+private[fs] new_inode(st: *State, kind: u16) -> Result[u32, Errno]
+    var first: u32 = 1
+    while first < st.sb.inodes
+        val block = ondisk.inode_block(st.sb, first)
+        val slot = get(st, block)?
+        val last = (first / INODES_PER_BLOCK + 1) * INODES_PER_BLOCK
+        for ino in first..<last
+            val i: *Inode = ondisk.at(bytes(st, slot), ondisk.inode_offset(ino))
+            if i.kind == KIND_FREE
+                *i = Inode(kind, if kind == KIND_DIR then 0o755 else 0o644, 1, 0, 0, [0; NDIRECT], 0, 0)
+                mark_dirty(st, slot)
+                put(st, slot)
+                return Ok(ino)
+        put(st, slot)
+        first = last
+    Err(ENOSPC)
+
+// Give inode `ino` back, and every block it holds.
+private[fs] free_inode(st: *State, ino: u32) -> Result[unit, Errno]
+    var i = read_inode(st, ino)?
+    truncate(st, &i)?
+    i.kind = KIND_FREE
+    i.links = 0
+    write_inode(st, ino, i)
+
+// A free data block, marked used and zeroed; ENOSPC when there is none.
+private[fs] new_block(st: *State) -> Result[u32, Errno]
+    for m in 0..<st.sb.bitmap_blocks
+        val slot = get(st, st.sb.bitmap_start + m)?
+        var bits = bytes(st, slot)
+        for k in 0..<BLOCK_SIZE
+            if bits[k] == 0xff then continue
+            for bit in 0..<8
+                val b = m * BITS_PER_BLOCK + u32(k) * 8 + u32(bit)
+                if b < st.sb.data_start || b >= st.sb.blocks then continue
+                val mask = ondisk.bitmap_mask(b)
+                if (bits[k] & mask) == 0
+                    bits[k] = bits[k] | mask
+                    mark_dirty(st, slot)
+                    put(st, slot)
+                    put(st, get_zeroed(st, b)?)
+                    return Ok(b)
+        put(st, slot)
+    Err(ENOSPC)
+
+private free_block(st: *State, b: u32) -> Result[unit, Errno]
+    if b < st.sb.data_start || b >= st.sb.blocks then return Err(EIO)
+    val slot = get(st, ondisk.bitmap_block(st.sb, b))?
+    var bits = bytes(st, slot)
+    val k = ondisk.bitmap_byte(b)
+    bits[k] = bits[k] & ~ondisk.bitmap_mask(b)
+    mark_dirty(st, slot)
+    put(st, slot)
+    Ok(())
+
+// The block holding byte `n * BLOCK_SIZE` of the file, given a new one if it has none and `grow` says
+// so (the caller writes the inode back); 0 for none.
+private[fs] block_of(st: *State, i: *Inode, n: usize, grow: bool) -> Result[u32, Errno]
+    if n < NDIRECT
+        if i.direct[n] == 0 && grow then i.direct[n] = new_block(st)?
+        return Ok(i.direct[n])
+    if n - NDIRECT >= NINDIRECT then return Err(EFBIG)
+    if i.indirect == 0
+        if !grow then return Ok(0)
+        i.indirect = new_block(st)?
+    val slot = get(st, i.indirect)?
+    val entry: *u32 = ondisk.at(bytes(st, slot), (n - NDIRECT) * 4)
+    if *entry == 0 && grow
+        new_block(st) match
+            Ok(b) ->
+                *entry = b
+                mark_dirty(st, slot)
+            Err(e) ->
+                put(st, slot)
+                return Err(e)
+    val b = *entry
+    put(st, slot)
+    Ok(b)
+
+// Copy bytes of the file from `offset` into `dst`, as many as there are; answers how many.
+private[fs] read_bytes(st: *State, i: *Inode, offset: u64, dst: []u8) -> Result[usize, Errno]
+    if offset >= i.size then return Ok(0)
+    val n = if u64(dst.len) < i.size - offset then dst.len else usize(i.size - offset)
+    var done: usize = 0
+    while done < n
+        val at = offset + u64(done)
+        val inside = usize(at % u64(BLOCK_SIZE))
+        val chunk = if n - done < BLOCK_SIZE - inside then n - done else BLOCK_SIZE - inside
+        val b = block_of(st, i, usize(at / u64(BLOCK_SIZE)), false)?
+        if b == 0 then return Err(EIO)
+        val slot = get(st, b)?
+        val src = bytes(st, slot)
+        for k in 0..<chunk
+            dst[done + k] = src[inside + k]
+        put(st, slot)
+        done += chunk
+    Ok(n)
+
+// Copy `src` into the file at `offset`, growing it — and giving it zeroed blocks up to `offset` first —
+// as needed. Answers how many bytes were written, all of them unless the disk filled up. The caller
+// writes the inode back.
+private[fs] write_bytes(st: *State, i: *Inode, offset: u64, src: []const u8) -> Result[usize, Errno]
+    if src.len == 0 then return Ok(0)
+    val end = offset + u64(src.len)
+    if (end + u64(BLOCK_SIZE) - 1) / u64(BLOCK_SIZE) > ondisk.MAX_FILE_BLOCKS then return Err(EFBIG)
+    var gap = (i.size + u64(BLOCK_SIZE) - 1) / u64(BLOCK_SIZE)
+    while gap < offset / u64(BLOCK_SIZE)
+        val _ = block_of(st, i, usize(gap), true)?
+        gap += 1
+    if offset > i.size then i.size = offset
+    var done: usize = 0
+    while done < src.len
+        val at = offset + u64(done)
+        val inside = usize(at % u64(BLOCK_SIZE))
+        val chunk = if src.len - done < BLOCK_SIZE - inside then src.len - done else BLOCK_SIZE - inside
+        val b = block_of(st, i, usize(at / u64(BLOCK_SIZE)), true) match
+            Ok(b) -> b
+            Err(e) ->
+                if done > 0 then break
+                return Err(e)
+        val slot = get(st, b)?
+        var dst = bytes(st, slot)
+        for k in 0..<chunk
+            dst[inside + k] = src[done + k]
+        mark_dirty(st, slot)
+        put(st, slot)
+        done += chunk
+        if at + u64(chunk) > i.size then i.size = at + u64(chunk)
+    Ok(done)
+
+// Give back every block the file holds and make it empty. The caller writes the inode back.
+private[fs] truncate(st: *State, i: *Inode) -> Result[unit, Errno]
+    for n in 0..<NDIRECT
+        if i.direct[n] != 0
+            free_block(st, i.direct[n])?
+            i.direct[n] = 0
+    if i.indirect != 0
+        val slot = get(st, i.indirect)?
+        val table = bytes(st, slot)
+        for n in 0..<NINDIRECT
+            val entry: *u32 = ondisk.at(table, n * 4)
+            if *entry != 0
+                free_block(st, *entry) match
+                    Ok(_) -> ()
+                    Err(e) ->
+                        put(st, slot)
+                        return Err(e)
+        put(st, slot)
+        free_block(st, i.indirect)?
+        i.indirect = 0
+    i.size = 0
+    Ok(())

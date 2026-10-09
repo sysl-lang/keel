@@ -21,3 +21,17 @@ struct Process
     fault: u64                  // why it was killed (keel.proc's encoding); 0 when it exited by itself
     thread: Option[&sync Thread]
     preemptions: u64            // times the timer took the processor from its thread, once it has ended
+    files: [OPEN_FILES]OpenFile // indexed by descriptor; 0 to 2 are the console and never used here
+
+// How many descriptors a process has, the console's three included (keel.abi's MAX_FDS).
+const OPEN_FILES: usize = 16
+
+// A descriptor's file: an inode of the filesystem (keel.fs), the flags it was opened with, and where
+// the next read or write starts. `ino` 0 is a free descriptor. Plain numbers, so a process can name its
+// files without this module importing the filesystem, which imports this one.
+struct OpenFile
+    ino: u32
+    flags: u32
+    offset: u64
+
+no_files() -> [OPEN_FILES]OpenFile = [OpenFile(0, 0, 0); OPEN_FILES]

@@ -214,6 +214,9 @@ private fail(r: *Regs, why: string) -> Option[u64]
 // The interrupt this disk raises; `gic.SPURIOUS` (no interrupt keel.irq will ever see) before `init`.
 irq() -> u32 = if disk.ready then disk.irq else gic.SPURIOUS
 
+// The disk's size in sectors; 0 before `init`.
+capacity() -> u64 = if disk.ready then disk.capacity else 0
+
 read_sector(n: u64, buf: []u8) -> Result[unit, DiskError]
     if buf.len != SECTOR_SIZE then return Err(WrongLength)
     transfer_in(n, buf)

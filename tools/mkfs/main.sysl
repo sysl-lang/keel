@@ -1,17 +1,17 @@
-// mkfs — keel's filesystem, built, checked and read on the host. The format is keel.ondisk, the module
+// mkfs — keel's filesystem, built, checked and read from on the host. The format is keel.ondisk, the module
 // the kernel mounts it with; kernel/keel/fs/FORMAT.md describes it.
 //
 //   mkfs build <image> <blocks> [<dir>]   a fresh filesystem of <blocks> 4 KiB blocks, holding a copy
 //                                         of <dir>'s files and directories
 //   mkfs check <image>                    fsck: "host: fsck ok …", or every problem found and exit 1
-//   mkfs cat <image> <path>               a file's contents, to standard output
+//   mkfs get <image> <path> <host file>   copy a file out of the image
 
 import ondisk.keel.ondisk
 import ondisk.keel.ondisk.{BLOCK_SIZE, DIRENT_SIZE, Dirent, Inode, KIND_DIR, KIND_FILE, KIND_FREE, NAME_MAX,
     NDIRECT, ROOT_INO, Super}
 import sysl.buf.{Buf, buf}
 import sysl.fs
-import sysl.text.{from_utf8, split}
+import sysl.text.split
 
 // Room for this many inodes in a fresh filesystem: four blocks of them.
 private const INODES: u32 = 256
@@ -30,8 +30,8 @@ main(args: []string)
         val blocks = parse_count(args[3])
         exit(build(args[2], blocks, if n >= 5 then Some(args[4]) else None))
     if n == 3 && args[1] == "check" then exit(check(args[2]))
-    if n == 4 && args[1] == "cat" then exit(cat(args[2], args[3]))
-    print("usage: mkfs build <image> <blocks> [<dir>] | mkfs check <image> | mkfs cat <image> <path>")
+    if n == 5 && args[1] == "get" then exit(get(args[2], args[3], args[4]))
+    print("usage: mkfs build <image> <blocks> [<dir>] | mkfs check <image> | mkfs get <image> <path> <host file>")
     exit(2)
 
 private parse_count(s: string) -> u32
@@ -308,9 +308,9 @@ private claim(img: *Image, k: *Fsck, ino: u32, b: u32)
         return
     k.owner[usize(b)] = ino
 
-// --- cat -----------------------------------------------------------------------------------------
+// --- get -----------------------------------------------------------------------------------------
 
-private cat(path: string, file: string) -> int
+private get(path: string, file: string, host: string) -> int
     var img = opened(path)
     var ino = ROOT_INO
     for part in split(file, "/")
@@ -325,7 +325,6 @@ private cat(path: string, file: string) -> int
         val b = block(&img, block_at(&img, i, n))
         val end = if usize(i.size) - n * BLOCK_SIZE < BLOCK_SIZE then usize(i.size) - n * BLOCK_SIZE else BLOCK_SIZE
         out.extend(b[0..<end])
-    from_utf8(out.view()) match
-        Ok(text) -> prints(text)
-        Err(_) -> fail(s"mkfs: $file is not text")
-    0
+    fs.write_bytes(host, out.view()) match
+        Ok(_) -> 0
+        Err(_) -> fail(s"mkfs: cannot write $host")

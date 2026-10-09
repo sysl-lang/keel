@@ -110,6 +110,10 @@ kmain(dtb_pa: u64) -> never
     selftest.smp()
     selftest.user()
     selftest.disk()
+    selftest.files()
+
+    // Shutting down: what the filesystem holds in its cache is written back before the power goes.
+    selftest.fs_shutdown()
 
     // Last, because it ends the run: a failed bounds check halts the machine.
     selftest.bounds_failure_halts()

@@ -1,0 +1,364 @@
+module keel.fs
+
+// The filesystem's system calls (user/abi has the numbers and the flags), dispatched from keel.proc.
+// Each takes the process and its saved registers and answers a `Result`, which keel.proc turns into the
+// x0 the program sees: the value, or the error's negative number.
+//
+// Every user pointer is checked against the process's own tables before anything else happens, and
+// read or written only through the kernel's linear map (keel.mm's `copy_from_user`/`copy_to_user`).
+// Bytes move between a program and a file through a small buffer on the kernel stack, one chunk at a
+// time, all under the filesystem's lock.
+//
+// What is simplified: an inode open on a descriptor cannot be unlinked (EBUSY) rather than living on
+// until it is closed; `rename` does not replace a directory, or replace anything with one (EEXIST); and
+// an operation that fails half way through can leave a block or an inode allocated and unnamed, which
+// mkfs's check reports.
+
+import abi.keel.abi.{EBADF, EBUSY, EEXIST, EFAULT, EINVAL, EISDIR, EMFILE, ENAMETOOLONG, ENOENT, ENOTDIR,
+    ENOTEMPTY, Errno, FIRST_FILE_FD, MAX_FDS, O_ACCMODE, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY,
+    SEEK_CUR, SEEK_END, SEEK_SET, STDERR, STDIN, STDOUT, Stat}
+import keel.mm
+import keel.sched.{OPEN_FILES, OpenFile, Process}
+import ondisk.keel.ondisk
+import ondisk.keel.ondisk.{DIRENT_SIZE, Dirent, Inode, KIND_DIR, KIND_FILE, ROOT_INO}
+
+private const MAX_PATH: usize = 256
+private const CHUNK: usize = 512
+
+// open(path, path_len, flags) -> fd
+sys_open(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var room: [MAX_PATH]u8 = [0; MAX_PATH]
+    val path = path_in(p, regs[0], regs[1], room[..])?
+    val flags = regs[2]
+    val access = flags & O_ACCMODE
+    if access == O_ACCMODE then return Err(EINVAL)
+    var fd = FIRST_FILE_FD
+    while fd < MAX_FDS && p.files[usize(fd)].ino != 0
+        fd += 1
+    if fd == MAX_FDS then return Err(EMFILE)
+
+    val st = lock()
+    defer unlock()
+    val ino = resolve(st, path) match
+        Ok(ino) ->
+            if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 then return Err(EEXIST)
+            ino
+        Err(ENOENT) ->
+            if (flags & O_CREAT) == 0 then return Err(ENOENT)
+            create(st, path, KIND_FILE)?
+        Err(e) -> return Err(e)
+    var i = read_inode(st, ino)?
+    if i.kind == KIND_DIR && access != O_RDONLY then return Err(EISDIR)
+    if (flags & O_TRUNC) != 0 && access != O_RDONLY && i.kind == KIND_FILE && i.size != 0
+        truncate(st, &i)?
+        write_inode(st, ino, i)?
+    st.opens[usize(ino)] += 1
+    p.files[usize(fd)] = OpenFile(ino, u32(flags), 0)
+    Ok(i64(fd))
+
+// read(fd, buf, len) -> bytes read
+sys_read(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val fd = regs[0]
+    if fd == STDIN then return Ok(0)
+    val f = file_of(p, fd)?
+    if (u64(f.flags) & O_ACCMODE) == O_WRONLY then return Err(EBADF)
+    val va = regs[1]
+    val len = regs[2]
+    if !mm.user_range(&p.space, va, len, true) then return Err(EFAULT)
+
+    val st = lock()
+    defer unlock()
+    var i = read_inode(st, f.ino)?
+    if i.kind == KIND_DIR then return Err(EISDIR)
+    var chunk: [CHUNK]u8 = [0; CHUNK]
+    var done: u64 = 0
+    while done < len
+        val want = min(len - done, u64(CHUNK))
+        val n = read_bytes(st, &i, f.offset, chunk[0..<usize(want)])?
+        if n == 0 then break
+        if !mm.copy_to_user(&p.space, va + done, chunk[0..<n]) then return Err(EFAULT)
+        f.offset += u64(n)
+        done += u64(n)
+    Ok(i64(done))
+
+// write(fd, buf, len) -> bytes written, for a descriptor that is a file (keel.proc has the console's).
+sys_write(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val f = file_of(p, regs[0])?
+    if (u64(f.flags) & O_ACCMODE) == O_RDONLY then return Err(EBADF)
+    val va = regs[1]
+    val len = regs[2]
+    if !mm.user_range(&p.space, va, len, false) then return Err(EFAULT)
+
+    val st = lock()
+    defer unlock()
+    var i = read_inode(st, f.ino)?
+    if (u64(f.flags) & O_APPEND) != 0 then f.offset = i.size
+    var chunk: [CHUNK]u8 = [0; CHUNK]
+    var done: u64 = 0
+    var failed: Option[Errno] = None
+    while done < len
+        val want = usize(min(len - done, u64(CHUNK)))
+        if !mm.copy_from_user(&p.space, va + done, chunk[0..<want]) then return Err(EFAULT)
+        val n = write_bytes(st, &i, f.offset, chunk[0..<want]) match
+            Ok(n) -> n
+            Err(e) ->
+                failed = Some(e)
+                break
+        f.offset += u64(n)
+        done += u64(n)
+        if n < want then break
+    // The inode is written back whatever happened: blocks given to the file belong to it now.
+    write_inode(st, f.ino, i)?
+    failed match
+        Some(e) -> if done == 0 then return Err(e)
+        None -> ()
+    Ok(i64(done))
+
+// close(fd) -> 0
+sys_close(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val f = file_of(p, regs[0])?
+    val st = lock()
+    defer unlock()
+    st.opens[usize(f.ino)] -= 1
+    *f = OpenFile(0, 0, 0)
+    Ok(0)
+
+// Close every descriptor a process still has: it has ended.
+close_all(p: *Process)
+    val st = lock()
+    defer unlock()
+    for fd in usize(FIRST_FILE_FD)..<OPEN_FILES
+        val f = &p.files[fd]
+        if f.ino == 0 then continue
+        st.opens[usize(f.ino)] -= 1
+        *f = OpenFile(0, 0, 0)
+
+// lseek(fd, offset, whence) -> the new offset. Past the end is allowed: a write there fills the gap
+// with zeros.
+sys_lseek(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val f = file_of(p, regs[0])?
+    val base = regs[2] match
+        SEEK_SET -> 0
+        SEEK_CUR -> i64(f.offset)
+        SEEK_END ->
+            val st = lock()
+            defer unlock()
+            i64(read_inode(st, f.ino)?.size)
+        else return Err(EINVAL)
+    val at = base + i64(regs[1])
+    if at < 0 then return Err(EINVAL)
+    f.offset = u64(at)
+    Ok(at)
+
+// fstat(fd, *Stat) -> 0
+sys_fstat(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val f = file_of(p, regs[0])?
+    val st = lock()
+    defer unlock()
+    val s = stat_of(f.ino, read_inode(st, f.ino)?)
+    stat_out(p, regs[1], s)
+
+// stat(path, path_len, *Stat) -> 0
+sys_stat(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var room: [MAX_PATH]u8 = [0; MAX_PATH]
+    val path = path_in(p, regs[0], regs[1], room[..])?
+    val st = lock()
+    defer unlock()
+    val ino = resolve(st, path)?
+    val s = stat_of(ino, read_inode(st, ino)?)
+    stat_out(p, regs[2], s)
+
+// mkdir(path, path_len) -> 0
+sys_mkdir(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var room: [MAX_PATH]u8 = [0; MAX_PATH]
+    val path = path_in(p, regs[0], regs[1], room[..])?
+    val st = lock()
+    defer unlock()
+    val _ = create(st, path, KIND_DIR)?
+    Ok(0)
+
+// getdents(fd, buf, len) -> bytes: as many whole entries as fit, from where the last call stopped.
+sys_getdents(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val f = file_of(p, regs[0])?
+    val va = regs[1]
+    val len = regs[2]
+    if len < u64(DIRENT_SIZE) then return Err(EINVAL)
+    if !mm.user_range(&p.space, va, len, true) then return Err(EFAULT)
+    val st = lock()
+    defer unlock()
+    var d = read_inode(st, f.ino)?
+    if d.kind != KIND_DIR then return Err(ENOTDIR)
+    val count = usize(d.size) / DIRENT_SIZE
+    var slot = usize(f.offset) / DIRENT_SIZE
+    var done: u64 = 0
+    while slot < count && done + u64(DIRENT_SIZE) <= len
+        var e = entry_at(st, &d, slot)?
+        slot += 1
+        if e.ino == 0 then continue
+        if !mm.copy_to_user(&p.space, va + done, bytes_of(&e)) then return Err(EFAULT)
+        done += u64(DIRENT_SIZE)
+    f.offset = u64(slot * DIRENT_SIZE)
+    Ok(i64(done))
+
+// unlink(path, path_len) -> 0: a file.
+sys_unlink(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var room: [MAX_PATH]u8 = [0; MAX_PATH]
+    val path = path_in(p, regs[0], regs[1], room[..])?
+    val st = lock()
+    defer unlock()
+    val (dir_ino, name) = parent_of(st, path)?
+    var dir = read_inode(st, dir_ino)?
+    val f = named(st, &dir, name)?
+    if f.kind == KIND_DIR then return Err(EISDIR)
+    if st.opens[usize(f.ino)] != 0 then return Err(EBUSY)
+    clear_slot(st, &dir, f.slot)?
+    free_inode(st, f.ino)?
+    Ok(0)
+
+// rmdir(path, path_len) -> 0: an empty directory.
+sys_rmdir(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var room: [MAX_PATH]u8 = [0; MAX_PATH]
+    val path = path_in(p, regs[0], regs[1], room[..])?
+    val st = lock()
+    defer unlock()
+    val (dir_ino, name) = parent_of(st, path)?
+    var dir = read_inode(st, dir_ino)?
+    val f = named(st, &dir, name)?
+    if f.kind != KIND_DIR then return Err(ENOTDIR)
+    if st.opens[usize(f.ino)] != 0 then return Err(EBUSY)
+    var victim = read_inode(st, f.ino)?
+    if !is_empty(st, &victim)? then return Err(ENOTEMPTY)
+    clear_slot(st, &dir, f.slot)?
+    dir.links -= 1
+    write_inode(st, dir_ino, dir)?
+    free_inode(st, f.ino)?
+    Ok(0)
+
+// rename(from, from_len, to, to_len) -> 0. A file may replace a file; a directory moves only to a name
+// that is free, and never into itself.
+sys_rename(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var from_room: [MAX_PATH]u8 = [0; MAX_PATH]
+    var to_room: [MAX_PATH]u8 = [0; MAX_PATH]
+    val from = path_in(p, regs[0], regs[1], from_room[..])?
+    val to = path_in(p, regs[2], regs[3], to_room[..])?
+    val st = lock()
+    defer unlock()
+    val (src_ino, src_name) = parent_of(st, from)?
+    val (dst_ino, dst_name) = parent_of(st, to)?
+    if dots(dst_name) then return Err(EINVAL)
+    var src_dir = read_inode(st, src_ino)?
+    val src = named(st, &src_dir, src_name)?
+    var dst_dir = if dst_ino == src_ino then src_dir else read_inode(st, dst_ino)?
+    if dst_dir.kind != KIND_DIR then return Err(ENOTDIR)
+    val existing = find(st, &dst_dir, dst_name)?
+    existing match
+        Some(e) ->
+            if e.ino == src.ino then return Ok(0)
+            if e.kind == KIND_DIR || src.kind == KIND_DIR then return Err(EEXIST)
+            if st.opens[usize(e.ino)] != 0 then return Err(EBUSY)
+        None -> ()
+    if src.kind == KIND_DIR && inside(st, dst_ino, src.ino)? then return Err(EINVAL)
+
+    if dst_ino == src_ino
+        // One directory: the entry is renamed where it is, or takes the place of the one it replaces.
+        existing match
+            Some(e) ->
+                set_slot(st, &src_dir, e.slot, src.ino, src.kind, dst_name)?
+                clear_slot(st, &src_dir, src.slot)?
+                free_inode(st, e.ino)?
+            None -> set_slot(st, &src_dir, src.slot, src.ino, src.kind, dst_name)?
+        write_inode(st, src_ino, src_dir)?
+        return Ok(0)
+
+    existing match
+        Some(e) ->
+            set_slot(st, &dst_dir, e.slot, src.ino, src.kind, dst_name)?
+            free_inode(st, e.ino)?
+        None -> add_entry(st, &dst_dir, dst_name, src.ino, src.kind)?
+    clear_slot(st, &src_dir, src.slot)?
+    if src.kind == KIND_DIR
+        // A directory that moves names its new parent as `..`, and the parents' link counts follow.
+        var moved = read_inode(st, src.ino)?
+        val up = named(st, &moved, "..".bytes)?
+        set_slot(st, &moved, up.slot, dst_ino, KIND_DIR, "..".bytes)?
+        src_dir.links -= 1
+        dst_dir.links += 1
+    write_inode(st, src_ino, src_dir)?
+    write_inode(st, dst_ino, dst_dir)?
+    Ok(0)
+
+// sync() -> 0
+sys_sync() -> Result[i64, Errno]
+    val st = lock()
+    defer unlock()
+    flush(st)?
+    Ok(0)
+
+// --- Shared by the calls above --------------------------------------------------------------------
+
+// Make a file or a directory at `path`, which must not exist; its parent must.
+private create(st: *State, path: []const u8, kind: u16) -> Result[u32, Errno]
+    val (dir_ino, name) = parent_of(st, path)?
+    if dots(name) then return Err(EEXIST)
+    var dir = read_inode(st, dir_ino)?
+    if dir.kind != KIND_DIR then return Err(ENOTDIR)
+    find(st, &dir, name)? match
+        Some(_) -> return Err(EEXIST)
+        None -> ()
+    val ino = new_inode(st, kind)?
+    if kind == KIND_DIR
+        var d = read_inode(st, ino)?
+        add_entry(st, &d, ".".bytes, ino, KIND_DIR)?
+        add_entry(st, &d, "..".bytes, dir_ino, KIND_DIR)?
+        d.links = 2
+        write_inode(st, ino, d)?
+        dir.links += 1
+    add_entry(st, &dir, name, ino, kind)?
+    write_inode(st, dir_ino, dir)?
+    Ok(ino)
+
+// The entry `name` in `dir`, which must be there and must not be `.` or `..`.
+private named(st: *State, dir: *Inode, name: []const u8) -> Result[Found, Errno]
+    if dots(name) && name != "..".bytes then return Err(EINVAL)
+    find(st, dir, name)? match
+        Some(f) -> Ok(f)
+        None -> Err(ENOENT)
+
+private dots(name: []const u8) -> bool = name == ".".bytes || name == "..".bytes
+
+// Whether directory `dir` is `ancestor` or below it: a walk up the `..` entries to the root.
+private inside(st: *State, dir: u32, ancestor: u32) -> Result[bool, Errno]
+    var ino = dir
+    loop
+        if ino == ancestor then return Ok(true)
+        if ino == ROOT_INO then return Ok(false)
+        var d = read_inode(st, ino)?
+        ino = named(st, &d, "..".bytes)?.ino
+
+// A path argument, copied in.
+private path_in(p: *Process, va: u64, len: u64, room: []u8) -> Result[[]const u8, Errno]
+    if len == 0 then return Err(ENOENT)
+    if len > u64(room.len) then return Err(ENAMETOOLONG)
+    if !mm.copy_from_user(&p.space, va, room[0..<usize(len)]) then return Err(EFAULT)
+    Ok(room[0..<usize(len)])
+
+// The open file a descriptor names.
+private file_of(p: *Process, fd: u64) -> Result[*OpenFile, Errno]
+    if fd < FIRST_FILE_FD || fd >= MAX_FDS then return Err(EBADF)
+    val f = &p.files[usize(fd)]
+    if f.ino == 0 then return Err(EBADF)
+    Ok(f)
+
+private stat_of(ino: u32, i: Inode) -> Stat = Stat(ino, u32(i.kind), u32(i.mode), u32(i.links), i.size)
+
+private stat_out(p: *Process, va: u64, s: Stat) -> Result[i64, Errno]
+    if !mm.copy_to_user(&p.space, va, bytes_of(&s)) then return Err(EFAULT)
+    Ok(0)
+
+// A value's bytes, for copying out to a program whose struct has the same layout (keel.abi's `Stat`
+// and `Dirent`, whose sizes are `@assert`ed on both sides).
+private bytes_of[T](v: *T) -> []const u8
+    val b: *u8 = ptr_cast(v)
+    b[0..<sizeof(T)]
+
+private min(a: u64, b: u64) -> u64 = if a < b then a else b

@@ -15,5 +15,6 @@ val guard = attempt(0xfffe_f000, 16)
 print("user: write answered", unmapped, kernel, past_top, guard)
 
 val good = user.put("user: a good buffer still prints\n")
-val all_refused = unmapped == -EFAULT && kernel == -EFAULT && past_top == -EFAULT && guard == -EFAULT
+val efault = -i64(EFAULT)
+val all_refused = unmapped == efault && kernel == efault && past_top == efault && guard == efault
 user.exit(if all_refused && good > 0 then 0 else 1)

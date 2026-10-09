@@ -36,6 +36,16 @@ asm
         "keel_prog_badptr:"
         ".incbin \"scratch/user/badptr.elf\""
         "keel_prog_badptr_end:"
+        ".balign 8"
+        ".globl keel_prog_files, keel_prog_files_end"
+        "keel_prog_files:"
+        ".incbin \"scratch/user/files.elf\""
+        "keel_prog_files_end:"
+        ".balign 8"
+        ".globl keel_prog_fsload, keel_prog_fsload_end"
+        "keel_prog_fsload:"
+        ".incbin \"scratch/user/fsload.elf\""
+        "keel_prog_fsload_end:"
     [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
 
 extern keel_prog_hello: u8
@@ -48,6 +58,10 @@ extern keel_prog_worker: u8
 extern keel_prog_worker_end: u8
 extern keel_prog_badptr: u8
 extern keel_prog_badptr_end: u8
+extern keel_prog_files: u8
+extern keel_prog_files_end: u8
+extern keel_prog_fsload: u8
+extern keel_prog_fsload_end: u8
 
 private image(start: *u8, end: *u8) -> []const u8 = start[0..<usize(end) - usize(start)]
 
@@ -56,3 +70,5 @@ fault() -> []const u8 = image(&keel_prog_fault, &keel_prog_fault_end)
 spin() -> []const u8 = image(&keel_prog_spin, &keel_prog_spin_end)
 worker() -> []const u8 = image(&keel_prog_worker, &keel_prog_worker_end)
 badptr() -> []const u8 = image(&keel_prog_badptr, &keel_prog_badptr_end)
+files() -> []const u8 = image(&keel_prog_files, &keel_prog_files_end)
+fsload() -> []const u8 = image(&keel_prog_fsload, &keel_prog_fsload_end)

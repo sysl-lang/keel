@@ -1,6 +1,7 @@
 module keel.proc
 
 import keel.cpu
+import keel.fs
 import keel.mm
 import keel.sched
 import keel.sched.{Context, Process}
@@ -21,7 +22,7 @@ private var next_pid: Atomic[u64] = Atomic(1)
 start(image: []const u8) -> Result[&sync Process, LoadError]
     val l = load(image)?
     val p: &sync Process = Process(next_pid.add(1), l.space, l.heap_base, l.heap_base, Context([0; 12], 0, 0),
-        Atomic(0), 0, 0, None, 0)
+        Atomic(0), 0, 0, None, 0, sched.no_files())
     val raw: *Process = &*p
     val entry = l.entry
     p.thread = Some(sched.spawn(() -> run(raw, entry)))
@@ -43,6 +44,9 @@ private run(p: *Process, entry: u64)
     t.ttbr0 = 0
     sched.load_ttbr0(0)
     cpu.enable_irqs()
+
+    // Whatever the process left open is closed for it, however it ended.
+    fs.close_all(p)
 
 // Wait for the process to end, then give its address space back.
 wait(p: &sync Process)

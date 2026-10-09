@@ -1,0 +1,226 @@
+// The filesystem, from a program: read a file mkfs put on the disk, write one and read it back,
+// make, list, rename and remove directories and files — the error answers included — and say whether
+// the previous boot's /out.txt is still there. scripts/boot-test.sh boots twice on one disk image, so
+// the second boot finds the first one's file. Exits 0 only if every check passed.
+
+import abi.keel.abi.{Dirent, EEXIST, EINVAL, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, Errno, KIND_DIR, KIND_FILE,
+    O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY, SEEK_SET, Stat}
+import rt.keel.user
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8
+
+var failures: u64 = 0
+
+fail(what: string)
+    print(s"user: FAILED: $what")
+    failures += 1
+
+check(ok: bool, what: string)
+    if !ok then fail(what)
+
+// Whether a call failed with exactly `want`; it is handed the call's `.err()`. (Taking the `Result`
+// itself would make this generic, and a function in a program's entry file may not be — FINDINGS.md 43.)
+refused(r: Option[Errno], want: Errno, what: string)
+    r match
+        None -> fail(s"$what succeeded")
+        Some(e) -> check(e == want, s"$what answered errno ${i64(e)}, not ${i64(want)}")
+
+// A file's whole contents.
+read_all(path: string) -> Result[Buf[u8], Errno]
+    val fd = user.open(path, O_RDONLY)?
+    var out: Buf[u8] = buf()
+    var chunk: [700]u8 = [0; 700]
+    loop
+        val n = user.read(fd, chunk[..])?
+        if n == 0 then break
+        out.extend(chunk[0..<usize(n)])
+    user.close(fd)?
+    Ok(out)
+
+text(b: Buf[u8]) -> string = from_utf8(b.view()) match
+    Ok(s) -> s
+    Err(_) -> "(not text)"
+
+// Every name in a directory, `.` and `..` included, read a few entries at a time.
+names(path: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val fd = user.open(path, O_RDONLY) match
+        Ok(fd) -> fd
+        Err(_) ->
+            fail(s"open $path to list it")
+            return out
+    // Three entries at a time, into storage typed as entries; `getdents` takes it as bytes.
+    var room: [3]Dirent = [Dirent(0, 0, 0, 0, [0; 24]); 3]
+    var raw: *u8 = ptr_cast(&room[0])
+    loop
+        val n = user.getdents(fd, raw[0..<sizeof([3]Dirent)]) match
+            Ok(n) -> usize(n) / sizeof(Dirent)
+            Err(_) ->
+                fail(s"getdents $path")
+                break
+        if n == 0 then break
+        for k in 0..<n
+            val name = from_utf8(room[k].name[0..<usize(room[k].len)]) match
+                Ok(s) -> s
+                Err(_) -> "?"
+            out.push(name)
+    val _ = user.close(fd)
+    out
+
+has(names: Buf[string], name: string) -> bool
+    for n in names
+        if n == name then return true
+    false
+
+// --- 1. A file mkfs wrote --------------------------------------------------------------------------
+
+read_all("/hello.txt") match
+    Ok(b) -> print(s"user: hello.txt says ${text(b)}")
+    Err(e) -> fail(s"read /hello.txt: errno ${i64(e)}")
+
+// What the previous boot left, read before this boot replaces it.
+val previous: Option[Buf[u8]] = read_all("/out.txt") match
+    Ok(b) -> Some(b)
+    Err(ENOENT) -> None
+    Err(e) ->
+        fail(s"read /out.txt: errno ${i64(e)}")
+        None
+
+// --- 2. Write a file, close it, open it again and read it back --------------------------------------
+//
+// A header line naming the boot, then 45,000 bytes of a pattern: twelve blocks, so the indirect block is
+// used too.
+
+const BODY: usize = 45_000
+
+body_byte(i: usize) -> u8 = u8((i * 31 + 7) % 251)
+
+boot_of(b: Buf[u8]) -> u64
+    val prefix = "keel was here, boot ".bytes
+    val v = b.view()
+    if v.len < prefix.len || v[0..<prefix.len] != prefix then return 0
+    var n: u64 = 0
+    for c in v[prefix.len..]
+        if c < u8('0') || c > u8('9') then break
+        n = n * 10 + u64(c - u8('0'))
+    n
+
+// Whether a /out.txt's bytes are a header and the whole pattern after it.
+well_formed(b: Buf[u8]) -> bool
+    val v = b.view()
+    var nl: usize = 0
+    while nl < v.len && v[nl] != 10
+        nl += 1
+    if v.len != nl + 1 + BODY then return false
+    for i in 0..<BODY
+        if v[nl + 1 + i] != body_byte(i) then return false
+    true
+
+val boot = previous match
+    Some(b) -> boot_of(b) + 1
+    None -> 1
+val header = s"keel was here, boot $boot\n"
+
+write_out(header: string) -> Result[unit, Errno]
+    val fd = user.open("/out.txt", O_WRONLY | O_CREAT | O_TRUNC)?
+    check(user.write_file(fd, header.bytes)? == u64(header.bytes.len), "the header's write was short")
+    var chunk: [1000]u8 = [0; 1000]
+    var i: usize = 0
+    while i < BODY
+        for k in 0..<chunk.len
+            chunk[k] = body_byte(i + k)
+        check(user.write_file(fd, chunk[..])? == 1000, "a write was short")
+        i += 1000
+    user.close(fd)
+
+write_out(header) match
+    Ok(_) -> ()
+    Err(e) -> fail(s"write /out.txt: errno ${i64(e)}")
+
+reread(header: string) -> Result[bool, Errno]
+    val back = read_all("/out.txt")?
+    val fd = user.open("/out.txt", O_RDONLY)?
+    val st = user.fstat(fd)?
+    // Seek back into the middle of the body and read a little there.
+    val at = user.lseek(fd, i64(header.bytes.len + 20_000), SEEK_SET)?
+    var few: [8]u8 = [0; 8]
+    val n = user.read(fd, few[..])?
+    user.close(fd)?
+    var seek_ok = at == u64(header.bytes.len + 20_000) && n == 8
+    for k in 0..<few.len
+        if few[k] != body_byte(20_000 + k) then seek_ok = false
+    val whole = well_formed(back) && back.view()[0..<header.bytes.len] == header.bytes
+    val sized = st.size == u64(header.bytes.len + BODY) && st.kind == KIND_FILE
+    if !whole || !sized || !seek_ok
+        print("user: read back", back.len(), "bytes, whole", whole, "; fstat size", st.size, "kind", st.kind,
+            "; lseek to", at, "read", n, "ok", seek_ok)
+    Ok(whole && sized && seek_ok)
+
+reread(header) match
+    Ok(true) -> print("user: write ok")
+    Ok(false) -> fail("/out.txt read back wrong")
+    Err(e) -> fail(s"read /out.txt back: errno ${i64(e)}")
+
+// --- 3. Directories --------------------------------------------------------------------------------
+
+dirs() -> Result[unit, Errno]
+    val root = user.stat("/")?
+    check(root.kind == KIND_DIR, "/ is not a directory")
+    check(user.stat("/dir")?.kind == KIND_DIR, "mkfs's /dir is not a directory")
+    check(has(names("/dir"), "inner.txt"), "/dir does not list inner.txt")
+
+    user.mkdir("/d1")?
+    val fd = user.open("/d1/a", O_WRONLY | O_CREAT)?
+    val _ = user.write_file(fd, "a".bytes)?
+    user.close(fd)?
+    user.mkdir("/d1/sub")?
+    val listed = names("/d1")
+    check(listed.len() == 4 && has(listed, ".") && has(listed, "..") && has(listed, "a") && has(listed, "sub"),
+        "/d1 does not list exactly . .. a sub")
+    check(user.stat("/d1")?.links == 3, "/d1's link count is not 3 with one subdirectory")
+
+    // A file renamed into a subdirectory, then the subdirectory moved to the root.
+    user.rename("/d1/a", "/d1/sub/b")?
+    refused(user.stat("/d1/a").err(), ENOENT, "stat of the old name")
+    check(user.stat("/d1/sub/b")?.size == 1, "the renamed file lost its byte")
+    user.rename("/d1/sub", "/d2")?
+    check(user.stat("/d2/..")?.ino == root.ino, "/d2/.. is not the root after the move")
+    check(user.stat("/d1")?.links == 2, "/d1 still counts the subdirectory that left")
+    check(has(names("/"), "d2"), "/ does not list d2")
+
+    // The errors.
+    refused(user.mkdir("/d2").err(), EEXIST, "mkdir of an existing name")
+    refused(user.rmdir("/d2").err(), ENOTEMPTY, "rmdir of a directory with a file in it")
+    refused(user.unlink("/d2").err(), EISDIR, "unlink of a directory")
+    refused(user.rmdir("/d2/b").err(), ENOTDIR, "rmdir of a file")
+    refused(user.open("/nope", O_RDONLY).err(), ENOENT, "open of a missing file")
+    refused(user.open("/hello.txt/x", O_RDONLY).err(), ENOTDIR, "open through a file")
+    refused(user.open("/d2", O_WRONLY).err(), EISDIR, "open of a directory for writing")
+    refused(user.rename("/d1", "/d1/inside").err(), EINVAL, "rename of a directory into itself")
+    refused(user.open("/hello.txt", O_WRONLY | O_CREAT | O_EXCL).err(), EEXIST, "an exclusive create of an existing file")
+
+    // And everything made here removed, so the next boot starts from the same names.
+    user.unlink("/d2/b")?
+    user.rmdir("/d2")?
+    user.rmdir("/d1")?
+    val left = names("/")
+    check(left.len() == 5 && has(left, "hello.txt") && has(left, "dir") && has(left, "out.txt"),
+        "/ does not list exactly . .. hello.txt dir out.txt")
+    Ok(())
+
+val before = failures
+dirs() match
+    Ok(_) -> if failures == before then print("user: dirs ok")
+    Err(e) -> fail(s"directories: errno ${i64(e)}")
+
+// --- 4. What the previous boot wrote -----------------------------------------------------------------
+
+previous match
+    Some(b) ->
+        if well_formed(b) && boot_of(b) == boot - 1
+            print(s"user: persisted across reboot: boot ${boot - 1}'s /out.txt was there, whole")
+        else
+            fail("the previous boot's /out.txt is not what it wrote")
+    None -> print("user: first boot, no /out.txt yet")
+
+user.exit(if failures == 0 then 0 else 1)
