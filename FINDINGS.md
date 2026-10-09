@@ -641,6 +641,10 @@ reference counts once threads are preemptive; 23 and 24 are silent leaks or a lo
 
 ## 21. The per-thread drain list the runtime asks a scheduler for cannot be supplied from sysl
 
+**FIXED in sysl census-35 8619de66 (prerelease `8619de6609`):** keel.sched's `arc_reaper` is
+`@export("__sysl_arc_reaper")` and the `link.ld` assignment is gone (branch `lsrm`). The image holds
+one `__sysl_arc_reaper`, keel's body (the TPIDR_EL1 read with IRQs masked), and no weak default.
+
 Milestone 4, `keel.sched`. memory.md § "On a freestanding target the worklist is asked for rather
 than assumed" says a release that reaches zero fetches the running task's drain list through a weak
 `__sysl_arc_reaper`, and a port that schedules defines it ("Define it in an RTOS port and `&sync T`

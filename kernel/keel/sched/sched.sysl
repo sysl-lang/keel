@@ -262,14 +262,14 @@ preempt()
     switch_locked()
     lock.unlock()
 
-// The ownership runtime asks this for the running thread's drain list whenever a release reaches zero
-// (link.ld names it `__sysl_arc_reaper`, FINDINGS.md 21). Each thread needs its own: a thread preempted
+// The ownership runtime asks this for the running thread's drain list whenever a release reaches zero;
+// defining `__sysl_arc_reaper` replaces the runtime's one global list. Each thread needs its own: a thread preempted
 // half way through draining would otherwise have its list taken over by the next.
 //
 // It runs with IRQs on, from any thread, so the TPIDR_EL1 read and the `current` load are made with
 // IRQs masked: preempted between them, the thread could resume on another core and take that core's
 // thread's list.
-@export("keel_arc_reaper")
+@export("__sysl_arc_reaper")
 arc_reaper() -> *Reaper
     val flags = cpu.irq_save()
     val c = cpu.tpidr()
