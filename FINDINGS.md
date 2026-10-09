@@ -1334,6 +1334,14 @@ and a `[]const u8` of a `*T`. Optionally a byte order on the struct or the field
 
 ## 40. `sysl.fs` is bound to C's stdio and libc; a target with system calls and no libc has nothing to supply, and nothing says so until the link
 
+**ANSWERED (2026-10-09, prerelease `ab820b7bf1`), in the clean form proposed below.** `sysl.fs` now
+runs over `sysl.fs.sys`, twenty-five descriptor-level hooks (`sysl_fs_open` … `sysl_fs_realpath`, a
+path as a pointer and a length, an `int` status that is an `IoError` code or `-1` for unsupported);
+the hosted library supplies them over libc, and a freestanding program that reaches one without
+supplying it is refused at compile time, naming exactly the hooks it reached. keel's `user/fsys`
+supplies all twenty-five over its system calls (milestone 9). What is left of this finding is 43 (one
+libc call left on the no-libc path) and 44 (what is still gated on `posix`).
+
 Milestone 8, looking ahead to milestone 9 (a `cp` written with `sysl.fs`, running on keel). What the
 module calls, from `library/sysl/fs/` (sysl-keel-pre2):
 
@@ -1438,6 +1446,134 @@ capture (no `failures`) compiles and runs generic. The second diagnostic is a ca
 declared, above). Workaround (used): the helper takes `r.err()`, an `Option[Errno]`, instead of the
 `Result`. Clean form: a nested function may be generic, instantiated at the calls in its body; or the
 message names the capture as the reason.
+
+## Milestone 9: sysl targets keel
+
+Findings 43-46 are against the prerelease `ab820b7bf1`, the first with `sysl.fs.sys`. Found while
+writing `user/fsys` (the twenty-five hooks over keel's system calls), five programs written with
+`sysl.fs` (`cp`, `cmp`, `cat`, `ls`, `fscheck`), argv on the user stack and the calls `sysl.fs` needed
+that keel lacked (`getcwd`/`chdir`, `truncate`/`ftruncate`, `access`). Ranked: 43 is a defect that
+stops every `sysl.fs` program from linking on keel — the milestone's yardstick waits on it; 44 is what
+`sysl.fs` still withholds from a target that can answer it; 45 and 46 are minor. None was fixed here,
+and nothing in keel works around 43: the boot test is red against `ab820b7bf1` and green against a
+scratch copy of its library with the one change below.
+
+## 43. `sysl.fs`'s path for a target with no C library calls C's `snprintf`, and nothing says so until the link
+
+**A defect, not a gap.** `sysl.fs.sys` is built so a target with system calls and no libc gets all of
+`sysl.fs` by answering its hooks, and the compiler checks exactly that — a program missing a hook is
+refused, naming it. `cp` supplies all of them and still does not link:
+
+    $ sysl build --target aarch64-freestanding -o scratch/user/cp.elf user/cp
+    sysl: error: clang failed (exit 1):
+    ld.lld: error: undefined symbol: snprintf
+    >>> referenced by sysl.code.o.ll
+    >>>               sysl.code.o:(sysl.fs$IoError.message) in archive …/std.syslib
+
+`IoError.message` (`library/sysl/fs/error.sysl`) formats with a counted spec in the two arms a no-libc
+target reaches — `InvalidUtf8(at) -> f"not UTF-8 at byte $at%d"` and the non-`posix`
+`system_text`, whose whole purpose is that target: `f"error $code%d"`. **A counted spec lowers to
+`sysl.str.fmt_i`, which calls `snprintf`, on every target**; a plain hole does not. The shortest input
+(`sysl build-c --target aarch64-freestanding`, then `llvm-nm -u` on the archive):
+
+    @export("probe_counted")
+    counted(c: int) -> usize = f"error $c%d".bytes.len     // U snprintf  (sysl.str.fmt_i)
+
+    @export("probe_plain")
+    plain(c: int) -> usize = f"error $c".bytes.len         // sysl.str.int — no C at all
+
+Any program that prints an `IoError` — every `cp` that reports why it failed — reaches it.
+
+Workaround: none taken. Defining `snprintf` in keel's runtime would be writing C's formatter in sysl
+to cover a library bug. The fix is in `error.sysl`: `$code` and `$at` with no `%d` (the two values are
+integers, so the spec adds nothing); with that change in a scratch copy of the library (`SYSL_LIB`),
+the whole milestone passes. The second half is the gap under it: a counted spec needing libc is
+invisible on a hosted target and is only found at a freestanding link, so either `fmt_i` stops
+needing `snprintf` for the integer specs, or a freestanding build refuses a counted spec where it is
+written, the way it refuses an unanswered hook.
+
+## 44. `metadata`, the walk, `remove_dir_all`, `copy_dir_all`, `make_temp_dir`, `canonicalize` and `publish_dir` are `#if posix` though they are written over the hooks
+
+A keel program that asks for a file's metadata gets an undefined name:
+
+    import sysl.fs
+    fs.set_permissions("/hello.txt", 0o600)      // or fs.metadata(p), fs.walk(root), fs.remove_dir_all(d)
+
+    error: undefined function 'sysl.fs.set_permissions'
+
+Each is written over `sysl.fs.sys` alone — `metadata`/`link_metadata` are one `fsys.stat` into
+`Meta`, `set_permissions` one `fsys.chmod`, `make_temp_dir` one `fsys.temp_dir`, the walk and
+`remove_dir_all` `entries` plus `link_metadata` — and keel answers every hook they reach: its `stat`
+fills `mode` with POSIX's type bits, so `Meta.is_dir()` would read right. The gate's stated reason
+(`meta.sysl`: "a Windows reading of a filesystem entry is a different struct") is about a C library's
+`struct stat`, which the hook layer exists to hide: `sysl.fs.Stat` *is* the POSIX shape whoever
+supplies it. So the gate is keyed on the wrong fact — whether the target has a POSIX C library —
+rather than on whether something answers `sysl_fs_stat`. Milestone 10's `ls -l` and `rm -r` are
+these calls.
+
+Workaround: none needed in this milestone (`cp`, `ls`, `cat` use none of them). keel supplies
+`chmod` and `temp_dir` anyway (answering `-1`), though nothing a keel program can call reaches them.
+
+Clean form: the reading surface declared wherever `sysl.fs.sys` is (a non-POSIX supplier fills the
+same thirteen numbers, or leaves them zero, as the struct's comment already allows), with the
+Windows case answered by that platform's supplier rather than by a `#if` in the portable layer.
+
+## 45. A runtime's exports vanish unless a file imports its module, while the module's top-of-file `asm` stays (minor)
+
+keel's user runtime is a workspace member (`rt`) that carries `_start` (top-of-file `asm`: `bl main`,
+`bl keel_user_finish`), the exported `putchar`/`exit`, and the allocating pair named by the program's
+`allocator` block. `cp` names nothing from it — `print` and `exit` reach it by symbol — so its first
+draft did not import it:
+
+    // user/cp/main.sysl, with rt in the manifest's dependencies
+    import sysl.fs
+    main(args: []string) …
+
+    ld.lld: error: …/user.ld:11: symbol not found: keel_user_alloc
+    ld.lld: error: undefined symbol: keel_user_finish
+
+The `asm` was laid down (it is never pruned) and calls `keel_user_finish`, but the module was not
+reached, so its `@export`s were not roots and were dropped — the one half of the module needing the
+other. The hooks module (`fsys`) is not imported by `cp` either and its exports *are* kept, because
+they define `sysl.fs.sys`'s externs, which `sysl.fs` reaches. Workaround (used): every program writes
+`import rt.keel.user`, unused. Clean form: a module's `@export`s are roots whenever its top-of-file
+`asm` is laid down (or a manifest dependency that supplies the entry or the allocating pair counts
+as reached).
+
+## 46. On a target with no C library, an error `IoError` has no name for says only "error N", and the supplier cannot give it words (minor)
+
+keel's errors that `IoError` does not name arrive as `Other(n)`, and its `message` on a non-`posix`
+target is `f"error $code"` — so removing a file another process has open (keel answers `EBUSY`) says
+`error 16`. On a hosted target the words come from the platform (`sysl_fs_strerror` over
+`strerror_r`); that shim is the one call not in `sysl.fs.sys`, so a supplier that answers every
+filesystem call cannot say what its own error numbers mean. Workaround: none needed (keel's `cp` never
+meets one in the tests). Clean form: `sysl_fs_strerror` becomes the twenty-sixth hook, optional —
+answered `-1` where the supplier has no words, which is today's behaviour.
+
+## What worked in milestone 9
+
+- **The hook layer is the right seam.** Twenty-five `@export`s in a workspace member of their own
+  (`user/fsys`, 227 lines with comments), each a line or two over a system call, and `copy_file`,
+  `read_bytes`, `entries`, `File` with its buffering, `truncate`, `set_current_dir` and the error
+  values all worked on the first boot. The compile-time check named exactly the five hooks `cp`
+  reached (`open`, `read`, `write`, `seek`, `close`), and a workspace library — not the program —
+  was accepted as the supplier.
+- **One mapping, `Errno.try`.** `status(r)` turns a negative answer into a code: `Errno.try(-r)`, a
+  `match` over the variants `IoError` names, `ENOSYS` as unsupported, anything else `Other`; an
+  unknown number is `Other` too rather than a trap (finding 41's withdrawal confirmed in use).
+- **argv needs nothing from sysl but `_start`.** On `aarch64-freestanding`, `main(args: []string)`
+  is laid out as C's `main(i32 argc, ptr argv)` calling `sysl.args.args_of`, exactly as on a host; the
+  kernel writes Linux's layout at the top of the stack and `_start` loads `x0 = [sp]`, `x1 = sp + 8`.
+  `echo` proves it; 600 arguments are refused at `start_with` (`TooManyArgs`).
+- **Exit status** is `exit(n)`, the platform's `extern` the runtime already exports; `cp` exits 1 on
+  a failed copy and 2 on a bad command line. (`main -> Result[unit, E]` gives only 1.)
+- **Size**: `cp` is 16.8 KiB of text (hello: 3.3 KiB); the largest pieces are `File.read` 1.4 KiB,
+  `copy_file` 1.3 KiB, `IoError.message` 1.1 KiB. The ELF is 97 KB, nearly all segment alignment
+  (`user.ld`), not code.
+- Controls: a `read` hook that reports one byte fewer than it delivered fails the guest's `cmp`
+  (`cmp: EOF on /m9/copy.txt after byte 17`, `/m9/big.bin /m9/big.copy differ: byte 8192`), four
+  `fscheck` checks, and the host's `cmp` of `mkfs get /m9/big.copy` (25 bytes short, `differ: char
+  8192`).
 
 ## What worked in milestone 8
 
