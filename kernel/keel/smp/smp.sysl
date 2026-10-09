@@ -90,7 +90,7 @@ private flush_range(va: u64, len: u64)
     while a < va + len
         cpu.clean_invalidate_dcache_line(a)
         a += line
-    cpu.dsb()
+    dsb(sy)
 
 // Called by `keel_secondary_start` on the core's boot stack, at physical addresses, with the MMU off.
 // Like `keel_boot`, it may use only PC-relative addresses until it returns.

@@ -135,9 +135,9 @@ private map_kernel(root: *Table, pa: PhysAddr, len: u64, prot: Prot)
 // Turn translation on. The tables were written with the MMU off, so straight to memory; the walker
 // reads them through the cache, which must not hold anything older for those lines.
 enable(maps: BootMaps)
-    cpu.dsb()
+    dsb(sy)
     invalidate_pool()
-    cpu.dsb()
+    dsb(sy)
     switch_on(maps)
 
 // Turn a secondary core's translation on, with the boot core's tables: the identity map in TTBR0 for
@@ -154,7 +154,7 @@ private switch_on(maps: BootMaps)
     cpu.set_tcr(cpu.to_word(tcr_value(u3(if parange > 5 then 5 else parange))))
     cpu.set_ttbr0(cpu.to_word(Ttbr(0, 0, frame_of(maps.identity), 0)))
     cpu.set_ttbr1(cpu.to_word(Ttbr(0, 0, frame_of(maps.kernel), 0)))
-    cpu.isb()
+    isb()
     cpu.flush_tlb()
 
     var s: Sctlr = cpu.from_word(cpu.sctlr())
@@ -196,5 +196,5 @@ drop_identity()
         val (_, pa) = new_table()
         empty_root = pa
     cpu.set_ttbr0(kernel_ttbr0())
-    cpu.isb()
+    isb()
     cpu.flush_tlb()

@@ -190,7 +190,7 @@ private const TTBR0_SWITCH: bool = true
 // translation, so nothing is flushed.
 load_ttbr0(v: u64)
     cpu.set_ttbr0(if v == 0 then mm.kernel_ttbr0() else v)
-    cpu.isb()
+    isb()
 
 // The reschedule interrupt's part: switch on the way out of it, if anything is ready.
 reschedule_requested()

@@ -1,48 +1,24 @@
 module keel.cpu
 
 // The processor's own state: the exception level, the system registers keel reads and writes, and
-// the instructions that wait for or mask interrupts. A system register is named inside the
-// instruction rather than passed to it, so each register is a function of its own.
+// the instructions that wait for or mask interrupts. A register is read and written with the
+// `read_sysreg`/`write_sysreg` built-ins (DAIFSet and DAIFClr among them); what is still `asm` here is
+// an instruction sysl has no spelling for (`at`, `tlbi`, `dc`, `ic`, `yield`, `wfi`).
 
 // The exception level the processor is running at, 0 to 3 (CurrentEL bits [3:2]).
-current_el() -> u64
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "mrs {v}, CurrentEL"
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-    (v >> 2) & 3
+current_el() -> u64 = (read_sysreg("CurrentEL") >> 2) & 3
 
 // Point exception entry at a vector table. The `isb` makes the new base take effect before the next
 // instruction can fault.
 set_vbar(base: u64)
-    asm
-        [aarch64]
-            "msr vbar_el1, {base}"
-            "isb"
-            in base : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    write_sysreg("vbar_el1", base)
+    isb()
 
 // The syndrome of the exception being handled: its class and the class's own details.
-esr() -> u64
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "mrs {v}, esr_el1"
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-    v
+esr() -> u64 = read_sysreg("esr_el1")
 
 // The faulting virtual address, for an abort or a misaligned PC or SP.
-far() -> u64
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "mrs {v}, far_el1"
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-    v
+far() -> u64 = read_sysreg("far_el1")
 
 // A register value as its fields and back. A `@packed` struct with narrow fields *is* one integer, but
 // there is no conversion between the two (FINDINGS.md 8), so the value goes through memory.
@@ -60,79 +36,27 @@ from_word[T](raw: u64) -> T
 
 // The registers that set up translation (Arm ARM D19.2). Writing one does not affect the instructions
 // already in flight; `isb` below is what makes it take effect.
-set_mair(v: u64)
-    asm
-        [aarch64]
-            "msr mair_el1, {v}"
-            in v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+set_mair(v: u64) = write_sysreg("mair_el1", v)
 
-tcr() -> u64
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "mrs {v}, tcr_el1"
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-    v
+tcr() -> u64 = read_sysreg("tcr_el1")
 
-set_tcr(v: u64)
-    asm
-        [aarch64]
-            "msr tcr_el1, {v}"
-            in v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+set_tcr(v: u64) = write_sysreg("tcr_el1", v)
 
-set_ttbr0(v: u64)
-    asm
-        [aarch64]
-            "msr ttbr0_el1, {v}"
-            in v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+set_ttbr0(v: u64) = write_sysreg("ttbr0_el1", v)
 
-set_ttbr1(v: u64)
-    asm
-        [aarch64]
-            "msr ttbr1_el1, {v}"
-            in v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+set_ttbr1(v: u64) = write_sysreg("ttbr1_el1", v)
 
-sctlr() -> u64
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "mrs {v}, sctlr_el1"
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-    v
+sctlr() -> u64 = read_sysreg("sctlr_el1")
 
 set_sctlr(v: u64)
-    asm
-        [aarch64]
-            "msr sctlr_el1, {v}"
-            "isb"
-            in v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    write_sysreg("sctlr_el1", v)
+    isb()
 
 // ID_AA64MMFR0_EL1: the physical address size [3:0] and which granules exist.
-mmfr0() -> u64
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "mrs {v}, id_aa64mmfr0_el1"
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-    v
+mmfr0() -> u64 = read_sysreg("id_aa64mmfr0_el1")
 
 // CTR_EL0: DminLine [19:16] is log2 of the smallest data cache line, in words.
-ctr() -> u64
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "mrs {v}, ctr_el0"
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-    v
+ctr() -> u64 = read_sysreg("ctr_el0")
 
 // Ask the MMU to translate `va` as an EL1 read would, and answer PAR_EL1, which holds the result.
 translate_read(va: u64) -> u64
@@ -147,20 +71,9 @@ translate_read(va: u64) -> u64
         [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
     v
 
-// Barriers and maintenance. `sysl.sync.atomic_fence` is a `dmb`, which orders memory accesses
-// against each other; these order them against the translation machinery (FINDINGS.md 14).
+// Maintenance. The barriers are the `dsb(opt)` and `isb()` built-ins; TLB and cache maintenance have
+// no spelling yet (FINDINGS.md 14), so each sequence that needs one is a block of its own.
 
-// Every instruction after this one is fetched with the system register writes before it in effect.
-isb()
-    asm
-        [aarch64] "isb"
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-
-// Every memory access before this one, in the whole system, is complete.
-dsb()
-    asm
-        [aarch64] "dsb sy"
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
 // Forget every EL1 translation this core has cached, wait for that, and refetch.
 flush_tlb()
     asm
@@ -229,40 +142,18 @@ sync_icache()
 
 // Make translation table writes visible to the walker before the next instruction uses them.
 publish_tables()
-    asm
-        [aarch64]
-            "dsb ishst"
-            "isb"
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    dsb(ishst)
+    isb()
 
 // TPIDR_EL1, a register the architecture leaves to the kernel: keel keeps the running core's `Cpu`
 // record there (keel.sched), so each core finds its own without asking which core it is.
-tpidr() -> u64
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "mrs {v}, tpidr_el1"
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-    v
+tpidr() -> u64 = read_sysreg("tpidr_el1")
 
-set_tpidr(v: u64)
-    asm
-        [aarch64]
-            "msr tpidr_el1, {v}"
-            in v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+set_tpidr(v: u64) = write_sysreg("tpidr_el1", v)
 
 // MPIDR_EL1's affinity level 0: which core of its cluster this is. QEMU's `virt` numbers its cores
 // 0, 1, 2, ... there.
-core_id() -> u64
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "mrs {v}, mpidr_el1"
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
-    v & 0xff
+core_id() -> u64 = read_sysreg("mpidr_el1") & 0xff
 
 // One busy-wait step: an instruction the optimizer cannot remove, and a hint to the core that this is
 // a spin.
@@ -289,30 +180,17 @@ clean_invalidate_dcache_line(addr: u64)
         [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
 
 // Let IRQs in: clear PSTATE.I.
-enable_irqs()
-    asm
-        [aarch64] "msr daifclr, #2"
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+enable_irqs() = write_sysreg("daifclr", 2)
 
 // Mask IRQs on this core and answer what DAIF held before, for `irq_restore`. What a lock an interrupt
 // handler may also take is held under.
 irq_save() -> u64
-    var v: u64 = 0
-    asm
-        [aarch64]
-            "mrs {v}, daif"
-            "msr daifset, #2"
-            out v : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    val v = read_sysreg("daif")
+    write_sysreg("daifset", 2)
     v
 
 // Put DAIF back as `irq_save` found it.
-irq_restore(daif: u64)
-    asm
-        [aarch64]
-            "msr daif, {daif}"
-            in daif : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+irq_restore(daif: u64) = write_sysreg("daif", daif)
 
 // Sleep until an interrupt is pending. The block clobbers memory, so whatever the loop around it
 // reads is read again after it.
