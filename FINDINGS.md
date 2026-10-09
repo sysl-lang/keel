@@ -1615,6 +1615,14 @@ the module form; or an annotation on a call or an `extern` saying the callee is 
 
 ## 48. `sysl.io`'s standard input and `sysl.flush` reach C's `read`, `memchr` and `fflush` by name, and a target with no C library learns so at the link
 
+**FIXED in sysl census-35 8619de66 (`stdin-hooks`; prerelease `8619de6609`):** `sysl.io.sys` declares
+three hooks, `sysl_io_read`/`sysl_io_write`/`sysl_io_flush` (a count, or an `IoError` code negated,
+`-1` for unsupported), and a freestanding program that reaches one unanswered is refused at compile
+time naming it — which is how the unchanged keel met this prerelease (`define 'sysl_io_read' with
+'@export'`). `memchr` is no longer reached. keel's `user/fsys` now answers the three hooks with
+`status`'s mapping, and the runtime's C-named `read`, `fflush` and `memchr` are gone; `llvm-nm` of every
+user ELF names none of them.
+
 The shell reads its commands with `sysl.io.lines(&stdin())`. On `aarch64-freestanding` the program
 builds and the link fails:
 

@@ -1,7 +1,7 @@
 module keel.fsys
 
-// `sysl.fs` on keel: the twenty-five hooks `sysl.fs.sys` declares, each `@export`ed under the name the
-// standard library calls and answered with keel's system calls (keel.abi).
+// `sysl.fs` on keel: the twenty-five hooks `sysl.fs.sys` declares, and the three of `sysl.io.sys`, each
+// `@export`ed under the name the standard library calls and answered with keel's system calls (keel.abi).
 //
 // A hook answers 0, or the code of the `IoError` the call failed with; `status` is the one place a
 // kernel's error number becomes such a code. Paths cross as they arrive — a pointer and a length is
@@ -13,7 +13,7 @@ import abi.keel.abi.{EBADF, EEXIST, EISDIR, EMFILE, ENOENT, ENOSPC, ENOSYS, ENOT
     O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, SYS_ACCESS, SYS_CHDIR, SYS_CLOSE, SYS_FSTAT,
     SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR,
     SYS_STAT, SYS_TRUNCATE, SYS_UNLINK, SYS_WRITE}
-import rt.keel.user.syscall
+import rt.keel.user.{flush, syscall}
 import sysl.fs.IoError
 import sysl.fs.sys as fsys
 
@@ -225,3 +225,31 @@ readlink(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> int = UN
 
 @export("sysl_fs_realpath")
 realpath(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> int = UNSUPPORTED
+
+// --- sysl.io: the three descriptor hooks `sysl.io.sys` declares ----------------------------------------
+//
+// These answer a count rather than 0, so a failure is the `IoError` code negated, and a call keel does
+// not have is -1, as `sysl.io.sys` asks.
+
+private moved(r: i64) -> isize
+    if r >= 0 then return isize(r)
+    val code = status(r)
+    if code == UNSUPPORTED then -1 else isize(-code)
+
+// Reading the console waits for a whole line, so whatever `print` has collected — a prompt — goes out
+// first, as C's line-buffered standard output does before standard input is read.
+@export("sysl_io_read")
+io_read(fd: int, into: *u8, room: usize) -> isize
+    if fd == 0 then flush()
+    moved(syscall(SYS_READ, u64(fd), addr(into), u64(room), 0))
+
+@export("sysl_io_write")
+io_write(fd: int, from: *u8, len: usize) -> isize
+    if fd == 1 then flush()
+    moved(syscall(SYS_WRITE, u64(fd), addr(from), u64(len), 0))
+
+// keel's write is unbuffered; the only buffer is the runtime's line `print` fills.
+@export("sysl_io_flush")
+io_flush(fd: int) -> int
+    if fd == 1 then flush()
+    0

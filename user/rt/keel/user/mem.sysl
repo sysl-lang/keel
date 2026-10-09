@@ -37,10 +37,3 @@ mem_compare(a: *u8, b: *u8, n: usize) -> int
     for i in 0..<n
         if a[i] != b[i] then return int(a[i]) - int(b[i])
     0
-
-// `sysl.io`'s line reader looks for the end of a line with C's `memchr` (FINDINGS.md 48).
-@export("memchr")
-mem_find(p: *u8, c: int, n: usize) -> *u8
-    for i in 0..<n
-        if p[i] == u8(c & 0xff) then return ptr_cast(usize(p) + i)
-    null

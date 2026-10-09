@@ -184,24 +184,6 @@ wait(pid: i64 = ANY_CHILD) -> Result[(u64, ExitStatus), Errno]
 
 getppid() -> u64 = u64(call(SYS_GETPPID, 0, 0, 0, 0))
 
-// --- What the standard library asks of a C library, by C's names ------------------------------------
-//
-// `sysl.io`'s standard input reads through C's `read`, and `sysl.flush` through C's `fflush`; on a
-// target with no C library the program supplies both, as it supplies `putchar` (FINDINGS.md 48).
-
-// C's `read`. Reading the console waits for a whole line, so whatever `print` has collected — a
-// prompt — goes out first, as C's line-buffered standard output does before standard input is read.
-@export("read")
-c_read(fd: int, p: *u8, n: usize) -> isize
-    if fd == 0 then flush()
-    isize(call(SYS_READ, u64(fd), u64(usize(p)), u64(n), 0))
-
-// C's `fflush`: every stream there is, which here is `print`'s line.
-@export("fflush")
-c_fflush(stream: *u8) -> int
-    flush()
-    0
-
 // A system call of up to four arguments, its answer exactly as the kernel gave it: the result, or a
 // negative error number. For a caller that turns the number into something of its own (keel.fsys
 // turns it into an `IoError`'s code).
