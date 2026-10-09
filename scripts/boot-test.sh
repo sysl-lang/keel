@@ -78,16 +78,83 @@ after_user_line=(
     "inside a directory"    # cat /dir/inner.txt
     "keel: cat ok"
     "user: sysl.fs ok"      # fscheck: cwd, truncate, access, errors, unsupported calls, through sysl.fs
+)
+
+# Milestone 10: then init starts the shell, and the script is at the console. Each boot's session is
+# piped into QEMU's serial input and its transcript checked, in order, between the lines above and the
+# shutdown below. The console echoes a line as the shell reads it, so the transcript is the prompt,
+# the command and its output, one after another.
+session1=(
+    'echo hello'
+    'pwd'
+    'mkdir /t'
+    'cd /t'
+    'pwd'
+    'echo data > f'
+    'ls'
+    'cat f'
+    'cp f g'
+    'rm f'
+    'ls'
+    'mv g h'
+    'ls'
+    'mv h /m9/kept'
+    'cd ..'
+    'rmdir t'
+    'ppid'
+    'orphan'
+    'false'
+    'nosuch'
+    'exit'
+)
+transcript1=(
+    $'$ echo hello\nhello\n'                    # a program from /bin with its argv
+    $'$ pwd\n/\n'                               # the built-in pwd, from the root
+    $'$ mkdir /t\n$ cd /t\n$ pwd\n/t\n'         # mkdir, and cd — the shell's own directory
+    $'$ echo data > f\n$ ls\nf\n'               # > made f in /t, and ls in the child's inherited cwd
+    $'$ cat f\ndata\n'                          # ...holding what echo wrote to its redirected stdout
+    $'$ cp f g\n$ rm f\n$ ls\ng\n'              # cp, rm: only g is left
+    $'$ mv g h\n$ ls\nh\n'                      # mv
+    $'$ mv h /m9/kept\n$ cd ..\n$ rmdir t\n$ ppid\npid '   # / is as the files program expects it next boot
+    $' ppid 2\n'                                # ppid's parent is the shell, pid 2 (init is 1)
+    $'$ orphan\n$ false\nsh: false: exit status 1\n'   # a failing command's status is said
+    $'$ nosuch\nsh: nosuch: not found\n'        # ...and a missing one's
+    $'$ exit\n'
+    "init: the shell exited 0; orphans reaped: 1"   # orphan's child was handed to init and reaped
+    "keel: init exited 0"
+    "keel: every process reaped"
+)
+# The second boot finds what the first left and removes it, and edits a line: four characters typed,
+# two rubbed out with DEL (each echoed as backspace, space, backspace), two more typed.
+session2=(
+    'cat /m9/kept'
+    'rm /m9/kept'
+    'ls /m9'
+    $'echo tyxz\x7f\x7fpo'
+    'exit'
+)
+transcript2=(
+    $'$ cat /m9/kept\ndata\n'                   # the file the first boot's shell wrote, read back
+    $'$ rm /m9/kept\n$ ls /m9\nbig.bin\nbig.copy\ncopy.txt\n'
+    $'$ echo tyxz\b \b\b \bpo\ntypo\n'          # the line the shell got is the edited one
+    $'$ exit\n'
+    "init: the shell exited 0; orphans reaped: 0"
+    "keel: init exited 0"
+    "keel: every process reaped"
+)
+shutdown=(
     "keel: fs synced at shutdown"   # the dirty blocks went to the disk before the power did
     "keel: bounds check failed: index"   # the last step: a kernel bounds failure is reported...
     "keel: halted"                 # ...and stops the machine (checked below: nothing ran after it)
 )
 
-# Printed only if something went wrong: the access after a failed bounds check went ahead, or a check
-# in the `files` program failed.
-not_expected=("keel: bounds failure was not fatal" "user: FAILED")
+# Printed only if something went wrong: the access after a failed bounds check went ahead, a check in
+# the `files` program failed, the shell was restarted, or a process was left behind.
+not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: sh ended by a fault"
+    "keel: processes left unreaped" "keel: processes still running before init")
 
-user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck)
+user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
+    init sh mkdir rm rmdir mv false ppid orphan)
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
 frames_min=65000
@@ -139,13 +206,15 @@ drive=(-drive file=$disk,if=none,format=raw,id=d0 -device virtio-blk-device,driv
        -global virtio-mmio.force-legacy=false)
 
 # One boot on the disk as it stands, passing only if every line of `before_user_line`, then $2, then
-# `after_user_line` is printed in order and QEMU powers off by itself. $1 names the boot in the log.
+# `after_user_line`, then the array named $4, then `shutdown` is printed in order and QEMU powers off
+# by itself. The array named $3 is typed at the console, a line each. $1 names the boot in the log.
 boot() {
     local name=$1 user_line=$2
-    local log=$out/boot$name.log
-    local expected=($before_user_line "$user_line" $after_user_line)
+    local log=$out/boot$name.log input=$out/session$name.txt
+    local expected=($before_user_line "$user_line" $after_user_line "${(@P)4}" $shutdown)
 
-    qemu-system-aarch64 -M virt,gic-version=3 $machine -smp ${KEEL_SMP:-4} -m 256M -nographic $drive -kernel $elf > $log 2>&1 < /dev/null &
+    print -rl -- "${(@P)3}" > $input
+    qemu-system-aarch64 -M virt,gic-version=3 $machine -smp ${KEEL_SMP:-4} -m 256M -nographic $drive -kernel $elf > $log 2>&1 < $input &
     local qpid=$!
 
     waited=0
@@ -211,7 +280,7 @@ fsck() {
     fi
 }
 
-boot 1 "user: first boot, no /out.txt yet"
+boot 1 "user: first boot, no /out.txt yet" session1 transcript1
 first=$waited
 
 # The kernel's write reached the image file: sector 2, read on the host once QEMU has gone.
@@ -223,7 +292,7 @@ fi
 print -r -- "keel: disk persisted"
 fsck 1
 
-boot 2 "user: persisted across reboot"
+boot 2 "user: persisted across reboot" session2 transcript2
 second=$waited
 fsck 2
 

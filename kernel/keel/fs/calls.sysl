@@ -16,7 +16,7 @@ module keel.fs
 
 import abi.keel.abi.{EBADF, EBUSY, EEXIST, EFAULT, EINVAL, EISDIR, EMFILE, ENAMETOOLONG, ENOENT, ENOTDIR,
     ENOTEMPTY, ERANGE, Errno, FIRST_FILE_FD, MAX_FDS, O_ACCMODE, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY,
-    SEEK_CUR, SEEK_END, SEEK_SET, STDERR, STDIN, STDOUT, Stat}
+    SEEK_CUR, SEEK_END, SEEK_SET, Stat}
 import keel.mm
 import keel.sched.{OPEN_FILES, OpenFile, Process}
 import ondisk.keel.ondisk
@@ -56,11 +56,9 @@ sys_open(p: *Process, regs: *u64) -> Result[i64, Errno]
     p.files[usize(fd)] = OpenFile(ino, u32(flags), 0)
     Ok(i64(fd))
 
-// read(fd, buf, len) -> bytes read
+// read(fd, buf, len) -> bytes read, from a descriptor that is a file (keel.proc has the console's).
 sys_read(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val fd = regs[0]
-    if fd == STDIN then return Ok(0)
-    val f = file_of(p, fd)?
+    val f = file_of(p, regs[0])?
     if (u64(f.flags) & O_ACCMODE) == O_WRONLY then return Err(EBADF)
     val va = regs[1]
     val len = regs[2]
@@ -127,11 +125,27 @@ sys_close(p: *Process, regs: *u64) -> Result[i64, Errno]
 close_all(p: *Process)
     val st = lock()
     defer unlock()
-    for fd in usize(FIRST_FILE_FD)..<OPEN_FILES
+    for fd in 0..<OPEN_FILES
         val f = &p.files[fd]
         if f.ino == 0 then continue
         st.opens[usize(f.ino)] -= 1
         *f = OpenFile(0, 0, 0)
+
+// A second descriptor on the file `p`'s descriptor `fd` names, for a child to be given (keel.proc's
+// `spawn`): the same file, flags and offset, counted as open until `close_file` or the child's end.
+inherit(p: *Process, fd: u64) -> Result[OpenFile, Errno]
+    val f = file_of(p, fd)?
+    val st = lock()
+    defer unlock()
+    st.opens[usize(f.ino)] += 1
+    Ok(*f)
+
+// Give back a descriptor `inherit` made that nobody took.
+close_file(f: OpenFile)
+    if f.ino == 0 then return
+    val st = lock()
+    defer unlock()
+    st.opens[usize(f.ino)] -= 1
 
 // lseek(fd, offset, whence) -> the new offset. Past the end is allowed: a write there fills the gap
 // with zeros.
@@ -432,9 +446,10 @@ private normalized(path: []const u8, out: []u8) -> usize
         n = 1
     n
 
-// The open file a descriptor names.
+// The open file a descriptor names: one from FIRST_FILE_FD up, or 0 to 2 where a file stands in for
+// the console.
 private file_of(p: *Process, fd: u64) -> Result[*OpenFile, Errno]
-    if fd < FIRST_FILE_FD || fd >= MAX_FDS then return Err(EBADF)
+    if fd >= MAX_FDS then return Err(EBADF)
     val f = &p.files[usize(fd)]
     if f.ino == 0 then return Err(EBADF)
     Ok(f)

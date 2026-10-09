@@ -1,0 +1,154 @@
+module keel.proc
+
+// Parents and children: the process table, and the `spawn`, `wait` and `getppid` system calls.
+//
+// **The model is spawn, not fork.** `spawn(path, args, out_fd)` makes a new address space from an
+// executable on the disk — exactly what `start` already did for the kernel — and gives the child its
+// parent's current directory and standard descriptors (one of them replaced, for a shell's `>`).
+// `fork` would copy the parent's address space only for `exec` to throw the copy away, and would
+// need a second kernel stack that returns from the same system call into a copy of the trap frame;
+// keel has no copy-on-write, so the copy would be every page, and nothing in keel needs a forked
+// child that runs the parent's code. (posix_spawn exists for the same reasons.)
+//
+// **The table** holds every process from its start until it is reaped, ended or not, as raw pointers
+// under one IrqLock (`family`); each entry keeps its own box alive through `Process.me`, as a thread
+// does (keel.sched), so a parent needs no handle on its children. A process that ends is marked
+// `ended` and its children are handed to init, pid 1 — exactly then, so an orphan is never without a
+// parent to reap it. `wait` sleeps on `changed`, which every ending wakes.
+
+import abi.keel.abi.{ANY_CHILD, ARGS_ROOM, E2BIG, EAGAIN, ECHILD, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOEXEC,
+    ENOMEM, Errno, ExitStatus, INIT_PID, NO_FD}
+import keel.fs
+import keel.mm
+import keel.sched.{IrqLock, OpenFile, Process, WaitQueue}
+import sysl.buf.{Buf, buf, buf_with_capacity}
+import sysl.text.from_utf8
+
+private const MAX_PROCS: usize = 64
+private const MAX_PATH: usize = 256
+
+private var table: [MAX_PROCS]*Process
+private var family: IrqLock
+private var changed: WaitQueue
+
+// Put a new process in the table; false when it is full.
+private[proc] enter(p: &sync Process) -> bool
+    val raw: *Process = &*p
+    val flags = family.lock()
+    for i in 0..<MAX_PROCS
+        if table[i] == null
+            table[i] = raw
+            raw.me = Some(p)
+            family.unlock(flags)
+            return true
+    family.unlock(flags)
+    false
+
+// Take a process the kernel waits for out of the table.
+private[proc] leave(p: *Process)
+    val flags = family.lock()
+    for i in 0..<MAX_PROCS
+        if table[i] == p then table[i] = null
+    family.unlock(flags)
+    p.me = None
+
+// The process has ended (its thread is on its way out): its parent may reap it, and its children are
+// init's now.
+private[proc] ended(p: *Process)
+    val flags = family.lock()
+    p.ended = true
+    for i in 0..<MAX_PROCS
+        val c = table[i]
+        if c != null && c.ppid == p.pid then c.ppid = INIT_PID
+    val _ = changed.wake_all()
+    family.unlock(flags)
+
+// Whether every process that started has been reaped.
+all_reaped() -> bool = table_empty()
+
+private[proc] table_empty() -> bool
+    val flags = family.lock()
+    var empty = true
+    for i in 0..<MAX_PROCS
+        if table[i] != null then empty = false
+    family.unlock(flags)
+    empty
+
+// spawn(path, path_len, args, args_len, out_fd) -> the child's pid
+private[proc] sys_spawn(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val path_len = regs[1]
+    if path_len == 0 then return Err(ENOENT)
+    if path_len > u64(MAX_PATH) then return Err(ENAMETOOLONG)
+    var path: [MAX_PATH]u8 = [0; MAX_PATH]
+    if !mm.copy_from_user(&p.space, regs[0], path[0..<usize(path_len)]) then return Err(EFAULT)
+
+    val args_len = regs[3]
+    if args_len > ARGS_ROOM then return Err(E2BIG)
+    var packed: Buf[u8] = buf_with_capacity(usize(args_len), 0)
+    for _ in 0..<args_len
+        packed.push(0)
+    if args_len > 0 && !mm.copy_from_user(&p.space, regs[2], packed.view()) then return Err(EFAULT)
+    val args = unpacked(packed.view())?
+
+    val image = fs.read_file(p.cwd[0..<p.cwd_len], path[0..<usize(path_len)])?
+    val out = if regs[4] == NO_FD then None else Some(fs.inherit(p, regs[4])?)
+    start_image(image.view(), args.view(), p, out) match
+        Ok(child) -> Ok(i64(child.pid))
+        Err(e) -> Err(errno_of(e))
+
+// NUL-terminated arguments, one after another, as strings.
+private unpacked(packed: []const u8) -> Result[Buf[string], Errno]
+    var out: Buf[string] = buf()
+    var start: usize = 0
+    for i in 0..<packed.len
+        if packed[i] != 0 then continue
+        val arg = from_utf8(packed[start..<i]) match
+            Ok(s) -> s
+            Err(_) -> return Err(EINVAL)
+        out.push(arg)
+        start = i + 1
+    if start != packed.len then return Err(EINVAL)
+    Ok(out)
+
+private errno_of(e: LoadError) -> Errno = e match
+    Unreadable(why) -> why
+    NoMemory -> ENOMEM
+    TooManyArgs -> E2BIG
+    NoRoom -> EAGAIN
+    _ -> ENOEXEC
+
+// wait(pid, *ExitStatus) -> the pid of the child that ended. Sleeps until one has.
+private[proc] sys_wait(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val want = i64(regs[0])
+    val status_at = regs[1]
+    if status_at != 0 && !mm.user_range(&p.space, status_at, u64(sizeof(ExitStatus)), true) then return Err(EFAULT)
+    val child = ended_child(p, want)?
+    reap(child)
+    if status_at != 0
+        var status = ExitStatus(child.exit_code, child.fault)
+        val b: *u8 = ptr_cast(&status)
+        if !mm.copy_to_user(&p.space, status_at, b[0..<sizeof(ExitStatus)]) then return Err(EFAULT)
+    Ok(i64(child.pid))
+
+// A child of `parent` that has ended — `want`, or any for ANY_CHILD — taken out of the table.
+private ended_child(parent: *Process, want: i64) -> Result[&sync Process, Errno]
+    val flags = family.lock()
+    loop
+        var any = false
+        for i in 0..<MAX_PROCS
+            val c = table[i]
+            if c == null || c.ppid != parent.pid then continue
+            if want != ANY_CHILD && i64(c.pid) != want then continue
+            any = true
+            if !c.ended then continue
+            table[i] = null
+            val handle = c.me
+            c.me = None
+            family.unlock(flags)
+            return handle match
+                Some(h) -> Ok(h)
+                None -> Err(ECHILD)
+        if !any
+            family.unlock(flags)
+            return Err(ECHILD)
+        changed.sleep(&family)

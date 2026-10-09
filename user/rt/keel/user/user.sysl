@@ -8,8 +8,10 @@ module keel.user
 // for a `main(args: []string)`, turns the pair into the slice and calls it — and ends the process with
 // whatever `main` answered.
 
-import abi.keel.abi.{Errno, STDOUT, SYS_BRK, SYS_CLOSE, SYS_EXIT, SYS_FSTAT, SYS_GETDENTS, SYS_GETPID, SYS_LSEEK,
-    SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_STAT, SYS_SYNC, SYS_UNLINK, SYS_WRITE, Stat}
+import abi.keel.abi.{ANY_CHILD, Errno, ExitStatus, NO_FD, STDOUT, SYS_BRK, SYS_CLOSE, SYS_EXIT, SYS_FSTAT,
+    SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN,
+    SYS_STAT, SYS_SYNC, SYS_UNLINK, SYS_WAIT, SYS_WRITE, Stat}
+import sysl.buf.{Buf, buf}
 import sysl.slices.{as_mut_ptr, as_ptr}
 
 @section(".text.start")
@@ -144,6 +146,61 @@ rename(from: string, to: string) -> Result[unit, Errno] =
     done(call(SYS_RENAME, addr(from.bytes), len(from.bytes), addr(to.bytes), len(to.bytes)))
 
 sync() -> Result[unit, Errno] = done(call(SYS_SYNC, 0, 0, 0, 0))
+
+// --- Processes -----------------------------------------------------------------------------------
+
+// A system call of five arguments: `spawn` is the one that needs the fifth.
+private call5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
+    var r: i64 = 0
+    asm
+        [aarch64]
+            "svc #0"
+            in nr : "x8"
+            in a0 : "x0"
+            in a1 : "x1"
+            in a2 : "x2"
+            in a3 : "x3"
+            in a4 : "x4"
+            out r : "x0"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+    r
+
+// Start the executable at `path` as a child, with `args` as its argv (its name first, by convention),
+// in this process's current directory. `out` is a descriptor to stand as the child's standard output,
+// NO_FD for this process's own. Answers the child's pid.
+spawn(path: string, args: []const string, out: u64 = NO_FD) -> Result[u64, Errno]
+    var packed: Buf[u8] = buf()
+    for a in args
+        packed.extend(a.bytes)
+        packed.push(0)
+    val bytes = packed.view()
+    answer(call5(SYS_SPAWN, addr(path.bytes), len(path.bytes), addr(bytes), len(bytes), out))
+
+// Wait for a child to end — `pid`, or any one for ANY_CHILD — and answer which, and how.
+wait(pid: i64 = ANY_CHILD) -> Result[(u64, ExitStatus), Errno]
+    var s = ExitStatus(0, 0)
+    val child = answer(call(SYS_WAIT, u64(pid), u64(usize(&s)), 0, 0))?
+    Ok((child, s))
+
+getppid() -> u64 = u64(call(SYS_GETPPID, 0, 0, 0, 0))
+
+// --- What the standard library asks of a C library, by C's names ------------------------------------
+//
+// `sysl.io`'s standard input reads through C's `read`, and `sysl.flush` through C's `fflush`; on a
+// target with no C library the program supplies both, as it supplies `putchar` (FINDINGS.md 48).
+
+// C's `read`. Reading the console waits for a whole line, so whatever `print` has collected — a
+// prompt — goes out first, as C's line-buffered standard output does before standard input is read.
+@export("read")
+c_read(fd: int, p: *u8, n: usize) -> isize
+    if fd == 0 then flush()
+    isize(call(SYS_READ, u64(fd), u64(usize(p)), u64(n), 0))
+
+// C's `fflush`: every stream there is, which here is `print`'s line.
+@export("fflush")
+c_fflush(stream: *u8) -> int
+    flush()
+    0
 
 // A system call of up to four arguments, its answer exactly as the kernel gave it: the result, or a
 // negative error number. For a caller that turns the number into something of its own (keel.fsys

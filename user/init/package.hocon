@@ -1,0 +1,22 @@
+// `init`: pid 1. Starts the shell, waits for it, and reaps the processes whose parents ended first.
+
+package {
+  name    = "init"
+  version = "0.0.1"
+}
+
+dependencies {
+  rt { workspace = true }
+}
+
+// keel does not save the FP/SIMD registers yet, and leaves the unit trapping at EL0 too.
+codegen {
+  general_regs_only = true
+}
+
+targets {
+  aarch64-freestanding {
+    linker_script = "../user.ld"
+    entry         = "_start"
+  }
+}

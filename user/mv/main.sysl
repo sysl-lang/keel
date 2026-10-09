@@ -1,0 +1,15 @@
+// mv <from> <to>: a file or directory renamed, or moved into another directory under a new name.
+// Exits 1 if it could not be, 2 when not given two paths.
+
+import rt.keel.user
+import sysl.fs
+
+main(args: []string)
+    if args.len != 3
+        print("usage: mv <from> <to>")
+        exit(2)
+    fs.rename(args[1], args[2]) match
+        Ok(_) -> ()
+        Err(e) ->
+            print(s"mv: ${args[1]}: $e")
+            exit(1)

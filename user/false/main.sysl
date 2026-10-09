@@ -1,0 +1,6 @@
+// false: does nothing, unsuccessfully — its exit status is 1. A program's status is `exit(code)`;
+// `main` has no result to carry one.
+
+import rt.keel.user
+
+exit(1)

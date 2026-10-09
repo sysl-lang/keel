@@ -1,0 +1,26 @@
+module keel.selftest
+
+// What milestone 10 is for: init, and through it the shell, on the console. Run by kmain after every
+// other test, when no process is left: init is pid 1, starts /bin/sh and waits for it, and reaps any
+// orphan it is handed; when the shell exits by itself init ends too, and kmain shuts down.
+// scripts/boot-test.sh pipes a session into the console and checks the transcript.
+
+import keel.console
+import keel.proc
+
+session()
+    if !proc.restart_pids()
+        print("keel: processes still running before init")
+        return
+    console.init()
+    proc.start("/bin/init") match
+        Ok(p) ->
+            proc.wait(p)
+            if proc.exited(p)
+                print("keel: init exited", proc.exit_code(p))
+            else
+                print(s"keel: init killed: ${proc.why(p)}")
+        Err(_) ->
+            print("keel: init did not load")
+            return
+    if proc.all_reaped() then print("keel: every process reaped") else print("keel: processes left unreaped")

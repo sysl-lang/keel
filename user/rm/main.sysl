@@ -1,0 +1,21 @@
+// rm <file>...: each file removed. Exits 1 if any could not be.
+//
+// There is no `-r`: removing a tree is `sysl.fs.remove_dir_all`, which the standard library declares
+// only where the target has a POSIX C library, though it is written over the hooks keel answers
+// (FINDINGS.md 44). `rmdir` removes an empty directory.
+
+import rt.keel.user
+import sysl.fs
+
+main(args: []string)
+    if args.len < 2
+        print("usage: rm <file>...")
+        exit(2)
+    var failed = false
+    for file in args[1..]
+        fs.remove_file(file) match
+            Ok(_) -> ()
+            Err(e) ->
+                print(s"rm: $file: $e")
+                failed = true
+    if failed then exit(1)

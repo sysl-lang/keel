@@ -3,6 +3,7 @@ module keel.irq
 // What an IRQ does once the vector code has saved the interrupted registers: ask the GIC which
 // interrupt it is, handle it, and tell the GIC it is done.
 
+import keel.console
 import keel.gic
 import keel.sched
 import keel.timer
@@ -28,6 +29,8 @@ dispatch()
         sched.reschedule_requested()
     else if id == virtio.irq()
         virtio.interrupt()
+    else if id == console.irq()
+        console.interrupt()
     else
         put_str("keel: unexpected interrupt ")
         put_hex(u64(id))

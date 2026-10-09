@@ -168,6 +168,13 @@ syndrome(raw: u64) -> Syndrome
 install()
     set_vbar(u64(usize(&keel_vectors)))
 
+// A synchronous exception from EL0 — a system call, or a fault that ends the process — is keel.proc's.
+// It is reached through the symbol keel.proc exports rather than called by name, because a system call
+// may allocate (`spawn` makes a process) and this module is `@no_alloc`, a property only a whole module
+// can have: called by name, the check follows the call into every system call and refuses the build.
+// The `extern` is where the check stops, which is the one edge it should not follow (FINDINGS.md 47).
+extern "keel_user_sync" user_sync(regs: *u64, ec: u64, iss: u64)
+
 // The one function every vector slot calls, with the saved registers and the slot's number. What it
 // leaves in `frame` is what the interrupted code resumes with.
 @export("keel_trap")
@@ -184,7 +191,7 @@ keel_trap(frame: *Frame, slot: u64)
         proc.returning_to_user()
     else if slot == SYNC_LOWER
         val raw = esr()
-        proc.user_sync(&frame.x[0], u64(syndrome(raw).ec), u64(syndrome(raw).iss))
+        user_sync(&frame.x[0], u64(syndrome(raw).ec), u64(syndrome(raw).iss))
     else
         put_str("keel: unexpected exception in slot ")
         put_hex(slot)

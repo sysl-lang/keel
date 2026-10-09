@@ -56,6 +56,7 @@ enum LoadError
     NoMemory                    // no frame, or no ASID
     TooManyArgs                 // the arguments do not fit the room at the top of the stack
     Unreadable(why: Errno)      // the file could not be read: not there, a directory, too big
+    NoRoom                      // the process table is full
 
 // What loading made: the address space, where to start, and where the heap begins.
 struct Loaded

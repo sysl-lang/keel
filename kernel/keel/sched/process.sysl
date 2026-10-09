@@ -21,9 +21,12 @@ struct Process
     fault: u64                  // why it was killed (keel.proc's encoding); 0 when it exited by itself
     thread: Option[&sync Thread]
     preemptions: u64            // times the timer took the processor from its thread, once it has ended
-    files: [OPEN_FILES]OpenFile // indexed by descriptor; 0 to 2 are the console and never used here
+    files: [OPEN_FILES]OpenFile // indexed by descriptor; 0 to 2 are the console unless a file stands there
     cwd: [CWD_ROOM]u8           // the current directory: an absolute path with no `.`, `..` or `//`
     cwd_len: usize
+    ppid: u64                   // the parent's pid; 0 for a process the kernel started and waits for
+    ended: bool                 // it has ended and is waiting to be reaped (keel.proc's table lock)
+    me: Option[&sync Process]   // the box keeping itself alive while it is in keel.proc's table
 
 // Room for the current directory's path; keel.fs's longest path argument is the same.
 const CWD_ROOM: usize = 256
@@ -38,7 +41,8 @@ root_dir() -> [CWD_ROOM]u8
 const OPEN_FILES: usize = 16
 
 // A descriptor's file: an inode of the filesystem (keel.fs), the flags it was opened with, and where
-// the next read or write starts. `ino` 0 is a free descriptor. Plain numbers, so a process can name its
+// the next read or write starts. `ino` 0 is a free descriptor — or, for 0 to 2, the console. Plain
+// numbers, so a process can name its
 // files without this module importing the filesystem, which imports this one.
 struct OpenFile
     ino: u32

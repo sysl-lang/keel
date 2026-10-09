@@ -1,0 +1,17 @@
+// mkdir <dir>...: each directory made. Exits 1 if any could not be.
+
+import rt.keel.user
+import sysl.fs
+
+main(args: []string)
+    if args.len < 2
+        print("usage: mkdir <dir>...")
+        exit(2)
+    var failed = false
+    for dir in args[1..]
+        fs.make_dir(dir) match
+            Ok(_) -> ()
+            Err(e) ->
+                print(s"mkdir: $dir: $e")
+                failed = true
+    if failed then exit(1)

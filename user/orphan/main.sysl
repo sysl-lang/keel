@@ -1,0 +1,11 @@
+// orphan: starts a child and exits without waiting for it, so the child is handed to init, which
+// reaps it. The child is /bin/false, which prints nothing: an orphan's output would land wherever the
+// console happened to be. Exits 1 if the child could not be started.
+
+import rt.keel.user
+
+user.spawn("/bin/false", ["false"]) match
+    Ok(_) -> ()
+    Err(e) ->
+        print("orphan: no child, errno", i64(e))
+        exit(1)

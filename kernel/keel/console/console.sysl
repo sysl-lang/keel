@@ -1,0 +1,169 @@
+module keel.console
+
+// The console: what a program reads from descriptor 0 and writes to 1 and 2, over the PL011.
+//
+// **Input** arrives by interrupt. The handler (`interrupt`, IRQ context: it must never sleep) moves
+// each received byte into `raw`, a ring of RING bytes, and wakes whoever is waiting for one; when the
+// ring is full it masks the receive interrupt instead, so the bytes stay in the UART and a sender that
+// waits for room waits (QEMU's character back end does; real hardware would overrun).
+//
+// **Line discipline** runs in the reading thread, not in the interrupt: `read` takes bytes from the
+// ring one at a time and builds a line — echoing what it keeps, `\b \b` for a backspace (DEL or
+// Ctrl-H), a newline for CR or LF (a CR LF pair is one), Ctrl-D at the start of a line the end of the
+// input — and answers only once the line is whole. So a byte is echoed when a program reads it, not
+// when it was typed: typeahead appears in order with the output of the program before it, rather than
+// in the middle of it. A Unix terminal echoes on arrival; this console makes the opposite choice,
+// because its input is often piped from a script and the transcript is what is read back.
+//
+// One reader cooks a line at a time (`cooked`, a sleeping Mutex); a line longer than a read asked for
+// is handed out over several reads.
+
+import keel.cpu
+import keel.gic
+import keel.mm
+import keel.pl011
+import keel.sched.{IrqLock, Mutex, WaitQueue}
+import sysl.sync.SpinLock
+
+private const RING: usize = 4096
+private const LINE: usize = 256
+
+// Bytes received and not yet read, under `guard` (taken with IRQs masked: the handler shares it).
+private struct Ring
+    bytes: [RING]u8
+    head: usize                 // the oldest byte
+    count: usize
+    paused: bool                // the receive interrupt is masked until there is room again
+
+private var ring: Ring
+private var guard: IrqLock
+private var readers: WaitQueue
+private var ready: bool
+private var core: u64
+
+// The line being cooked, or the rest of one not yet read.
+private struct Line
+    text: [LINE]u8
+    len: usize                  // bytes of `text` in the line
+    at: usize                   // the next byte to hand out; at == len: there is no line
+    after_cr: bool              // the last byte ended a line with CR, so an LF right after it is that same end
+
+private var cooked: Mutex[Line]
+
+// One write's bytes stay together on the console, whichever cores are writing; an echo is a write.
+private var out: SpinLock = SpinLock(0)
+
+hold() = out.lock()
+release() = out.unlock()
+
+// Start taking input: the UART's receive interrupt, routed to this core, and whatever is already
+// waiting in the UART.
+init()
+    core = cpu.core_id()
+    ready = true
+    gic.enable_spi(pl011.IRQ, core)
+    pl011.enable_receive()
+    val flags = guard.lock()
+    drain_locked()
+    guard.unlock(flags)
+
+// The interrupt this module handles, or the GIC's spurious number before `init`.
+irq() -> u32 = if ready then pl011.IRQ else gic.SPURIOUS
+
+// IRQ context. Drain the UART into the ring; never sleep.
+interrupt()
+    val flags = guard.lock()
+    drain_locked()
+    guard.unlock(flags)
+
+// Move what the UART holds into the ring, and wake the readers. The caller holds `guard`.
+private drain_locked()
+    pl011.clear_receive()
+    loop
+        if ring.count == RING
+            ring.paused = true
+            pl011.receive_interrupts(false)
+            break
+        pl011.take_byte() match
+            Some(b) ->
+                ring.bytes[(ring.head + ring.count) % RING] = b
+                ring.count += 1
+            None -> break
+    val _ = readers.wake_all()
+
+// The next byte from the ring, sleeping until there is one.
+private next_byte() -> u8
+    val flags = guard.lock()
+    while ring.count == 0
+        readers.sleep(&guard)
+    val b = ring.bytes[ring.head]
+    ring.head = (ring.head + 1) % RING
+    ring.count -= 1
+    if ring.paused && ring.count < RING / 2
+        // What waited in the UART meanwhile may have had its interrupt acknowledged already.
+        ring.paused = false
+        pl011.receive_interrupts(true)
+        drain_locked()
+    guard.unlock(flags)
+    b
+
+private const CR: u8 = 13
+private const LF: u8 = 10
+private const BS: u8 = 8
+private const DEL: u8 = 127
+private const EOT: u8 = 4                       // Ctrl-D
+
+private echo(b: u8)
+    hold()
+    pl011.put_byte(b)
+    release()
+
+// Rub out the last character on the screen: back, a space over it, back again.
+private rub_out()
+    hold()
+    pl011.put_byte(BS)
+    pl011.put_byte(u8(' '))
+    pl011.put_byte(BS)
+    release()
+
+// Cook one line into `l`; false at the end of the input (Ctrl-D on an empty line).
+private cook(l: *Line) -> bool
+    l.len = 0
+    l.at = 0
+    loop
+        val b = next_byte()
+        if b == LF && l.after_cr
+            l.after_cr = false
+            continue
+        l.after_cr = b == CR
+        if b == CR || b == LF
+            l.text[l.len] = LF
+            l.len += 1
+            echo(LF)
+            return true
+        if b == BS || b == DEL
+            if l.len > 0
+                l.len -= 1
+                rub_out()
+            continue
+        if b == EOT
+            if l.len == 0 then return false
+            return true
+        // Room is kept for the newline; a line too long for it keeps its first LINE - 1 bytes.
+        if l.len < LINE - 1 && (b >= 32 || b == 9)
+            l.text[l.len] = b
+            l.len += 1
+            echo(b)
+
+// read(0, …) for a process whose descriptor 0 is the console: up to `len` bytes of the current line
+// into the process's memory at `va`, once there is a whole line; 0 at the end of the input. The range
+// has been checked by the caller.
+read(space: *mm.Space, va: u64, len: u64) -> u64
+    if len == 0 then return 0
+    val l = cooked.lock()
+    defer cooked.unlock()
+    if l.at == l.len && !cook(l) then return 0
+    val n = if len < u64(l.len - l.at) then usize(len) else l.len - l.at
+    if !mm.copy_to_user(space, va, l.text[l.at..<l.at + n]) then return 0
+    l.at += n
+    u64(n)

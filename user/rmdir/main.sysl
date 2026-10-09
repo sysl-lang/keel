@@ -1,0 +1,17 @@
+// rmdir <dir>...: each empty directory removed. Exits 1 if any could not be.
+
+import rt.keel.user
+import sysl.fs
+
+main(args: []string)
+    if args.len < 2
+        print("usage: rmdir <dir>...")
+        exit(2)
+    var failed = false
+    for dir in args[1..]
+        fs.remove_dir(dir) match
+            Ok(_) -> ()
+            Err(e) ->
+                print(s"rmdir: $dir: $e")
+                failed = true
+    if failed then exit(1)

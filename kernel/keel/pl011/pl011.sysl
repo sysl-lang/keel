@@ -3,7 +3,8 @@ module keel.pl011
 import keel.mm
 
 // The ARM PL011 UART that QEMU's `virt` machine puts at 0x0900_0000. QEMU's model transmits without
-// being configured, so this is the transmit half and nothing else: wait for room, write the byte.
+// being configured, so transmitting is: wait for room, write the byte. Receiving is interrupt-driven
+// and belongs to keel.console, which drains the receive FIFO here (`take_byte`).
 
 // The registers, at the offsets the PL011 TRM gives them.
 private struct Regs
@@ -11,12 +12,61 @@ private struct Regs
     rsr: volatile u32           // 0x04 receive status / error clear
     reserved: [4]u32            // 0x08 .. 0x17
     fr: volatile u32            // 0x18 flags
+    reserved2: u32              // 0x1c
+    ilpr: volatile u32          // 0x20 IrDA low-power counter
+    ibrd: volatile u32          // 0x24 integer baud rate
+    fbrd: volatile u32          // 0x28 fractional baud rate
+    lcr_h: volatile u32         // 0x2c line control
+    cr: volatile u32            // 0x30 control
+    ifls: volatile u32          // 0x34 interrupt FIFO level select
+    imsc: volatile u32          // 0x38 interrupt mask set/clear: a 1 bit lets that interrupt through
+    ris: volatile u32           // 0x3c raw interrupt status
+    mis: volatile u32           // 0x40 masked interrupt status
+    icr: volatile u32           // 0x44 interrupt clear
+
+@assert(offsetof(Regs, fr) == 0x18, "UARTFR is at 0x18")
+@assert(offsetof(Regs, imsc) == 0x38, "UARTIMSC is at 0x38")
+@assert(offsetof(Regs, icr) == 0x44, "UARTICR is at 0x44")
 
 const BASE: u64 = 0x0900_0000          // physical
+const IRQ: u32 = 33                     // virt's UART0 is SPI 1
+private const FR_RXFE: u32 = 1 << 4     // receive FIFO empty
 private const FR_TXFF: u32 = 1 << 5     // transmit FIFO full
+private const CR_UARTEN: u32 = 1 << 0
+private const CR_TXE: u32 = 1 << 8
+private const CR_RXE: u32 = 1 << 9
+private const INT_RX: u32 = 1 << 4      // receive: the FIFO reached its trigger level
+private const INT_RT: u32 = 1 << 6      // receive timeout: bytes waiting and none arriving
 
 // Through the kernel's device mapping, so only once the MMU is on.
 private regs() -> *Regs = mm.io(mm.PhysAddr(BASE))
+
+// Turn the receiver on and let its two interrupts through. The line control register is left as it
+// is: changing whether the FIFOs are on flushes the receive FIFO (QEMU's model does exactly that), and
+// a byte typed — or piped — before this would be lost. With the FIFOs off the receiver holds one byte,
+// and each one is an interrupt.
+enable_receive()
+    val r = regs()
+    r.cr = CR_UARTEN | CR_TXE | CR_RXE
+    r.imsc = INT_RX | INT_RT
+
+// Stop (false) or resume (true) the receive interrupts. Masked, bytes stay in the FIFO, and a sender
+// that waits for room — QEMU's character back end does — waits.
+receive_interrupts(on: bool)
+    regs().imsc = if on then INT_RX | INT_RT else 0
+
+// The next received byte, or None when the FIFO is empty.
+take_byte() -> Option[u8]
+    val r = regs()
+    if (r.fr & FR_RXFE) != 0 then return None
+    Some(u8(r.dr & 0xff))
+
+// Acknowledge the receive interrupts, before the FIFO is drained: a byte that arrives after the drain
+// raises them again, where clearing them afterwards could swallow that byte's interrupt and leave it
+// in the FIFO with nothing to say so (QEMU's model raises the receive interrupt once, as a byte
+// arrives, and holds the next byte back until this one is read).
+clear_receive()
+    regs().icr = INT_RX | INT_RT
 
 put_byte(b: u8)
     val r = regs()

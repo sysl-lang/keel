@@ -4,7 +4,7 @@ import keel.cpu
 import keel.fs
 import keel.mm
 import keel.sched
-import keel.sched.{Context, Process}
+import keel.sched.{Context, OpenFile, Process}
 import sysl.sync.{Atomic, Ordering}
 
 // User processes: made from an ELF image, run by a kernel thread of their own, ended by `exit`, by a
@@ -13,12 +13,14 @@ import sysl.sync.{Atomic, Ordering}
 // The process's thread enters user mode from `run` and stays there: every system call, interrupt and
 // fault it takes is handled on its kernel stack, below `run`'s frame, and returns to EL0. When the
 // process ends, `keel_leave_user` (user.sysl) unwinds straight back to `run`, which drops the address
-// space from TTBR0 and returns, and the thread ends as any kernel thread does. Whoever started the
-// process `wait`s for it: that joins the thread and frees the address space.
+// space from TTBR0, closes its files, tells the process table (family.sysl) and returns, and the thread
+// ends as any kernel thread does. Whoever started the process waits for it — the kernel with `wait`,
+// a parent process with the `wait` system call — and that joins the thread and frees the address
+// space.
 
 private var next_pid: Atomic[u64] = Atomic(1)
 
-// Start the program at `path` on the filesystem with no arguments. The process gets the next pid.
+// Start the program at `path` on the filesystem with no arguments, as a process the kernel waits for.
 start(path: string) -> Result[&sync Process, LoadError] = start_with(path, [])
 
 // Start the program at `path` with `args` — its argv, the program's name first by convention.
@@ -26,10 +28,29 @@ start_with(path: string, args: []const string) -> Result[&sync Process, LoadErro
     val image = fs.read_file("/".bytes, path.bytes) match
         Ok(b) -> b
         Err(e) -> return Err(Unreadable(e))
-    start_image(image.view(), args)
+    start_image(image.view(), args, null, None)
 
-// Load `image`, an executable already in kernel memory, and start it running with `args`.
-private start_image(image: []const u8, args: []const string) -> Result[&sync Process, LoadError]
+// Number processes from 1 again: init is pid 1. Only while there are none, which it answers.
+restart_pids() -> bool
+    if !table_empty() then return false
+    next_pid.store(1, Ordering.Release)
+    true
+
+// Load `image`, an executable already in kernel memory, and start it running with `args`. A `parent`
+// (null: the kernel) passes on its current directory, and `out`, when there is one, stands as the
+// child's standard output. The process is in the table before its thread can run.
+private[proc] start_image(image: []const u8, args: []const string, parent: *Process,
+        out: Option[OpenFile]) -> Result[&sync Process, LoadError]
+    val started = start_loaded(image, args, parent, out)
+    if started.is_err()
+        // The descriptor handed over for the child is not the child's after all.
+        out match
+            Some(f) -> fs.close_file(f)
+            None -> ()
+    started
+
+private start_loaded(image: []const u8, args: []const string, parent: *Process,
+        out: Option[OpenFile]) -> Result[&sync Process, LoadError]
     var l = load(image)?
     val sp = lay_out_args(&l.space, args) match
         Some(sp) -> sp
@@ -37,8 +58,18 @@ private start_image(image: []const u8, args: []const string) -> Result[&sync Pro
             mm.free_space(&l.space)
             return Err(TooManyArgs)
     val p: &sync Process = Process(next_pid.add(1), l.space, l.heap_base, l.heap_base, Context([0; 12], 0, 0),
-        Atomic(0), 0, 0, None, 0, sched.no_files(), sched.root_dir(), 1)
+        Atomic(0), 0, 0, None, 0, sched.no_files(), sched.root_dir(), 1, 0, false, None)
     val raw: *Process = &*p
+    if parent != null
+        raw.ppid = parent.pid
+        raw.cwd = parent.cwd
+        raw.cwd_len = parent.cwd_len
+    if !enter(p)
+        mm.free_space(&raw.space)
+        return Err(NoRoom)
+    out match
+        Some(f) -> raw.files[1] = f
+        None -> ()
     val entry = l.entry
     p.thread = Some(sched.spawn(() -> run(raw, entry, sp)))
     Ok(p)
@@ -93,11 +124,17 @@ private run(p: *Process, entry: u64, sp: u64)
     sched.load_ttbr0(0)
     cpu.enable_irqs()
 
-    // Whatever the process left open is closed for it, however it ended.
+    // Whatever the process left open is closed for it, however it ended; then its parent may reap it.
     fs.close_all(p)
+    ended(p)
 
-// Wait for the process to end, then give its address space back.
+// Wait for a process the kernel started to end, then give its address space back.
 wait(p: &sync Process)
+    leave(&*p)
+    reap(p)
+
+// Join the process's thread and free its address space: it has ended, or is about to.
+private[proc] reap(p: &sync Process)
     p.thread match
         Some(t) ->
             sched.join(t)
@@ -144,7 +181,8 @@ private reason(fault: u64) -> string
         else "exception"
 
 // Called by the trap handler for a synchronous exception from EL0: a system call, or anything else,
-// which ends the process.
+// which ends the process. keel.trap reaches it through this symbol (FINDINGS.md 47).
+@export("keel_user_sync")
 user_sync(regs: *u64, ec: u64, iss: u64)
     if ec == 0x15
         system_call(regs)

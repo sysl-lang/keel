@@ -1,0 +1,41 @@
+// init: pid 1, the first process and the one every orphan is handed to.
+//
+// It starts /bin/sh and waits. Whatever else ends meanwhile is a process whose parent ended before
+// it, given to init by the kernel, and init reaps it. When the shell exits by itself — `exit`, or the
+// end of its input — the session is over: init waits for anything still running and exits with the
+// shell's code, and the kernel shuts down. A shell that was ended by a fault is started again, since
+// a console with no shell on it is a machine nobody can use.
+
+import abi.keel.abi.ExitStatus
+import rt.keel.user
+
+var orphans = 0
+var code: i64 = 0
+
+loop
+    val sh = user.spawn("/bin/sh", ["sh"]) match
+        Ok(pid) -> pid
+        Err(e) ->
+            print("init: cannot start /bin/sh, errno", i64(e))
+            exit(1)
+    var status = ExitStatus(0, 0)
+    loop
+        user.wait() match
+            Ok((pid, s)) ->
+                if pid == sh
+                    status = s
+                    break
+                orphans += 1
+            Err(_) -> break
+    if status.fault == 0
+        code = status.code
+        break
+    print("init: sh ended by a fault, starting it again")
+
+// The session is over; nothing is left behind.
+loop
+    user.wait() match
+        Ok(_) -> orphans += 1
+        Err(_) -> break
+print(s"init: the shell exited $code; orphans reaped: $orphans")
+exit(int(code))

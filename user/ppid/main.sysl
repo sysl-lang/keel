@@ -1,0 +1,5 @@
+// ppid: this process's number and its parent's, as `pid <n> ppid <n>`.
+
+import rt.keel.user
+
+print(s"pid ${user.getpid()} ppid ${user.getppid()}")

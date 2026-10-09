@@ -1,13 +1,14 @@
 module keel.proc
 
-import abi.keel.abi.{EFAULT, ENOSYS, Errno, STDERR, STDOUT, SYS_ACCESS, SYS_BRK, SYS_CHDIR, SYS_CLOSE, SYS_EXIT,
-    SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_GETPID, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ,
-    SYS_RENAME, SYS_RMDIR, SYS_STAT, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINK, SYS_WRITE}
+import abi.keel.abi.{EFAULT, ENOSYS, Errno, STDERR, STDIN, STDOUT, SYS_ACCESS, SYS_BRK, SYS_CHDIR, SYS_CLOSE,
+    SYS_EXIT, SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR,
+    SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN, SYS_STAT, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINK, SYS_WAIT,
+    SYS_WRITE}
+import keel.console
 import keel.fs
 import keel.mm
 import keel.pl011.put_byte
 import keel.sched.Process
-import sysl.sync.SpinLock
 
 // System calls (user/abi has the numbers): `svc #0` from EL0 arrives here with the saved registers, the
 // number in x8 and the arguments in x0 to x5; the answer goes back in x0, an error as its negative
@@ -26,7 +27,7 @@ private[proc] system_call(regs: *u64)
         SYS_GETPID -> sys_getpid(p, regs)
         SYS_BRK -> sys_brk(p, regs)
         SYS_OPEN -> fs.sys_open(p, regs)
-        SYS_READ -> fs.sys_read(p, regs)
+        SYS_READ -> sys_read(p, regs)
         SYS_CLOSE -> fs.sys_close(p, regs)
         SYS_LSEEK -> fs.sys_lseek(p, regs)
         SYS_FSTAT -> fs.sys_fstat(p, regs)
@@ -42,6 +43,9 @@ private[proc] system_call(regs: *u64)
         SYS_TRUNCATE -> fs.sys_truncate(p, regs)
         SYS_FTRUNCATE -> fs.sys_ftruncate(p, regs)
         SYS_ACCESS -> fs.sys_access(p, regs)
+        SYS_SPAWN -> sys_spawn(p, regs)
+        SYS_WAIT -> sys_wait(p, regs)
+        SYS_GETPPID -> sys_getppid(p, regs)
         else Err(ENOSYS)
     regs[0] = r match
         Ok(v) -> u64(v)
@@ -71,7 +75,7 @@ private sys_write(p: *Process, regs: *u64) -> Result[i64, Errno]
     val fd = regs[0]
     val buf = UserAddr(regs[1])
     val len = regs[2]
-    if fd != STDOUT && fd != STDERR then return fs.sys_write(p, regs)
+    if (fd != STDOUT && fd != STDERR) || p.files[usize(fd)].ino != 0 then return fs.sys_write(p, regs)
     if len == 0 then return Ok(0)
 
     if !VALIDATE_USER_POINTERS
@@ -81,7 +85,7 @@ private sys_write(p: *Process, regs: *u64) -> Result[i64, Errno]
         return Ok(i64(len))
 
     if !user_readable(&p.space, buf, len) then return Err(EFAULT)
-    console.lock()
+    console.hold()
     var done: u64 = 0
     while done < len
         val va = u64(buf) + done
@@ -93,11 +97,17 @@ private sys_write(p: *Process, regs: *u64) -> Result[i64, Errno]
         for i in 0..<chunk
             put_byte(src[usize(i)])
         done += chunk
-    console.unlock()
+    console.release()
     Ok(i64(len))
 
-// One write's bytes stay together on the console, whichever cores are writing.
-private var console: SpinLock = SpinLock(0)
+// read(fd, buf, len): from a file (keel.fs), or for descriptor 0 from the console, a line at a time
+// (keel.console), sleeping until a whole line has been typed.
+private sys_read(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[0] != STDIN || p.files[0].ino != 0 then return fs.sys_read(p, regs)
+    if !mm.user_range(&p.space, regs[1], regs[2], true) then return Err(EFAULT)
+    Ok(i64(console.read(&p.space, regs[1], regs[2])))
+
+private sys_getppid(p: *Process, regs: *u64) -> Result[i64, Errno] = Ok(i64(p.ppid))
 
 // Whether all of `len` bytes from `addr` are user memory of this space: inside the user range with no
 // wrap around, and every page they touch mapped.
