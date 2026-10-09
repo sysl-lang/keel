@@ -7,8 +7,8 @@
 //   pwd         the current directory
 //   exit [n]    end the shell with code n (0 by default); the end of the input does the same
 //
-// A command that fails says so on the line after its output: `sh: <name>: exit status <n>`, or that
-// it was ended by a fault, or that it is not there (status 127).
+// A command that fails says so on the line after its output: `sh: <name>: exit status <n>`, or the
+// signal a fault ended it with (status 128 + the signal), or that it is not there (status 127).
 
 import rt.keel.user
 import sysl.buf.{Buf, buf}
