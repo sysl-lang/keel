@@ -1501,6 +1501,13 @@ written, the way it refuses an unanswered hook.
 
 ## 44. `metadata`, the walk, `remove_dir_all`, `copy_dir_all`, `make_temp_dir`, `canonicalize` and `publish_dir` are `#if posix` though they are written over the hooks
 
+**FIXED in sysl census-35 8619de66 (`fs-hooks-public`; prerelease `8619de6609`). Gap closed.** Every one
+of them is now declared wherever `sysl.fs.sys` is, and a hook answering `-1` surfaces as `IoError`
+"not supported on this target". keel uses them unchanged: `ls -l` is `sysl.fs.metadata` per entry
+(kind and size; keel keeps no times), `rm -r` is `remove_dir_all`, `cp -r` is `copy_dir_all` — the
+last needing keel's `chmod` hook to accept the bits an entry already has (finding 50). The boot test's
+first session drives all three.
+
 A keel program that asks for a file's metadata gets an undefined name:
 
     import sysl.fs
@@ -1696,6 +1703,28 @@ descriptor or "inherit" for each standard stream) and wait (pid → how it ended
 `__posix__` on a hosted target and by the program on one without a C library, under the same
 compile-time check; a `Stdio`-like choice per stream (inherit, a file, a pipe, captured) in `run` and
 `start`; and a `Status` case for "ended by the system" that is not a signal number.
+
+## After milestone 10: `ls -l`, `rm -r`, `cp -r` (branch `lsrm`)
+
+With 44 fixed, the three are each one `sysl.fs` call. One minor gap.
+
+## 50. `copy_dir_all` sets every entry's permissions unconditionally, so a target that cannot set them cannot copy a tree (minor)
+
+`cp -r` is `fs.copy_dir_all(from, to)`. keel's `chmod` hook answered `-1` (finding 44's supplier
+table had it so for every target without permissions), and `copy_dir_all` ends each entry with
+`set_permissions(dst, e.meta.permissions())?` (`dirs.sysl`). So on such a target every tree copy is
+refused, `cp: /t: not supported on this target`, even when the copy already has exactly those bits.
+Its doc comment carries permissions because an executable copied with `copy_file` stops being
+executable; a target with no permission bits has nothing to carry, and the hook contract has no way
+to say "this target has no permissions", only "this call cannot be done".
+
+Workaround (used): keel's `chmod` hook stats the path and answers 0 when the bits asked for are the
+bits it already has, `-1` otherwise. That holds on keel, which gives every new entry one default, so
+a copy always matches; a target whose defaults differ would still fail. Control: the hook put back
+to `-1` fails the boot test at `cp -r` with exactly the line above.
+
+Clean form: `copy_dir_all` skipping `set_permissions` (or accepting an unsupported answer) where the
+target has no permission bits, or `Meta` saying whether `mode`'s permission bits mean anything there.
 
 ## What worked in milestone 10
 

@@ -1,18 +1,32 @@
-// ls [<dir>]: the names in a directory (the current one by default), sorted, one to a line. Exits 1
-// if the directory could not be listed.
+// ls [-l] [<dir>]: the names in a directory (the current one by default), sorted, one to a line. With
+// `-l`, each name follows its kind (`d` for a directory, `-` for a file) and its size in bytes, read
+// with `sysl.fs.metadata`. keel keeps no times, so there are none to show. Exits 1 if the directory
+// could not be listed or an entry could not be read.
 
 import rt.keel.user
 import sysl.fs
+import sysl.path.join
 import sysl.slices.sort
 
 main(args: []string)
-    val dir = if args.len > 1 then args[1] else "."
+    val long = args.len > 1 && args[1] == "-l"
+    val first: usize = if long then 2 else 1
+    val dir = if args.len > first then args[first] else "."
     fs.entries(dir) match
         Ok(names) ->
             var all = names.view()
             sort(all)
             for name in all
-                print(name)
+                if long then detail(dir, name) else print(name)
         Err(e) ->
             print(s"ls: $dir: $e")
+            exit(1)
+
+detail(dir: string, name: string)
+    fs.metadata(join(dir, name)) match
+        Ok(m) ->
+            val kind = if m.is_dir() then "d" else "-"
+            print(f"$kind ${m.size}%8d $name")
+        Err(e) ->
+            print(s"ls: $name: $e")
             exit(1)

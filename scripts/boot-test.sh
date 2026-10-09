@@ -101,6 +101,15 @@ session1=(
     'mv h /m9/kept'
     'cd ..'
     'rmdir t'
+    'ls -l /'
+    'mkdir /t'
+    'mkdir /t/a'
+    'echo one > /t/a/x'
+    'cp -r /t /u'
+    'ls -l /u/a'
+    'rm -r /t'
+    'rm -r /u'
+    'ls /'
     'ppid'
     'orphan'
     'false'
@@ -115,7 +124,10 @@ transcript1=(
     $'$ cat f\ndata\n'                          # ...holding what echo wrote to its redirected stdout
     $'$ cp f g\n$ rm f\n$ ls\ng\n'              # cp, rm: only g is left
     $'$ mv g h\n$ ls\nh\n'                      # mv
-    $'$ mv h /m9/kept\n$ cd ..\n$ rmdir t\n$ ppid\npid '   # / is as the files program expects it next boot
+    $'$ mv h /m9/kept\n$ cd ..\n$ rmdir t\n$ ls -l /\nd '   # / is as the files program expects it next boot
+    $'\nd       96 dir\n-       19 hello.txt\nd      192 m9\n'   # ls -l: kind and size, from sysl.fs.metadata
+    $'$ mkdir /t\n$ mkdir /t/a\n$ echo one > /t/a/x\n$ cp -r /t /u\n$ ls -l /u/a\n-        4 x\n'   # copy_dir_all
+    $'$ rm -r /t\n$ rm -r /u\n$ ls /\nbin\ndir\nhello.txt\nm9\nout.txt\n$ ppid\npid '   # remove_dir_all: both trees gone
     $' ppid 2\n'                                # ppid's parent is the shell, pid 2 (init is 1)
     $'$ orphan\n$ false\nsh: false: exit status 1\n'   # a failing command's status is said
     $'$ nosuch\nsh: nosuch: not found\n'        # ...and a missing one's

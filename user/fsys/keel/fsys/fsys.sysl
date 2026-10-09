@@ -133,8 +133,15 @@ rename(from: *u8, from_len: usize, to: *u8, to_len: usize) -> int =
 @export("sysl_fs_access")
 access(path: *u8, len: usize, how: int) -> int = status(syscall(SYS_ACCESS, addr(path), u64(len), u64(how), 0))
 
+// keel has no call that changes permissions, so the only change it can make is none: asking for the
+// bits the entry already has is success (`copy_dir_all` carries every entry's bits to a copy keel
+// made with the same defaults), and anything else is unsupported.
 @export("sysl_fs_chmod")
-chmod(path: *u8, len: usize, mode: u32) -> int = UNSUPPORTED
+chmod(path: *u8, len: usize, mode: u32) -> int
+    var s = Stat(0, 0, 0, 0, 0)
+    val r = syscall(SYS_STAT, addr(path), u64(len), u64(usize(&s)), 0)
+    if r < 0 then return status(r)
+    if (s.mode & 0o7777) == (mode & 0o7777) then 0 else UNSUPPORTED
 
 // --- Directories -----------------------------------------------------------------------------------
 
