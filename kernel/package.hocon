@@ -16,7 +16,7 @@ codegen {
 // The kernel heap (keel.heap) is the program's allocator: every box, `Buf`, `string` and closure is
 // allocated through this pair. A freestanding target has no libc `malloc` to default to. The names are
 // aliases link.ld defines for keel.heap's `keel_alloc` and `keel_free`: naming the exported functions
-// themselves makes the compiler declare and define one symbol in one module (FINDINGS.md 18).
+// themselves makes the compiler declare and define one symbol in one module (FINDINGS.md 19).
 allocator {
   alloc = "keel_heap_alloc"
   free  = "keel_heap_free"

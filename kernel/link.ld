@@ -14,7 +14,7 @@
 ENTRY(_start)
 
 /* The allocating pair package.hocon names, as aliases of keel.heap's exported functions
-   (FINDINGS.md 18). */
+   (FINDINGS.md 19). */
 keel_heap_alloc = keel_alloc;
 keel_heap_free  = keel_free;
 

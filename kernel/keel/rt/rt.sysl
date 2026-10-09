@@ -6,7 +6,7 @@ module keel.rt
 //
 // Every store goes through a `*volatile u8`. Written as an ordinary loop, `memset` compiles to
 // `b memset`: LLVM recognises the loop as a memset and calls the function from inside itself, and
-// sysl has no way to say "this function is the builtin" (FINDINGS.md 19). A volatile store is one
+// sysl has no way to say "this function is the builtin" (FINDINGS.md 18). A volatile store is one
 // LLVM may not merge into a call. Byte at a time is slow, and nothing in keel is big enough yet to care.
 
 @export("memset")

@@ -89,7 +89,4 @@ private c_len(b: []const u8, at: usize) -> usize
 // Whether the NUL-terminated string at `at` is exactly `s`, or begins with it.
 private name_is(b: []const u8, at: usize, s: string) -> bool = prefix_is(b, at, s) && b[at + s.len] == 0
 
-private prefix_is(b: []const u8, at: usize, s: string) -> bool
-    for i in 0..<s.len
-        if b[at + i] != s.bytes[i] then return false
-    true
+private prefix_is(b: []const u8, at: usize, s: string) -> bool = b[at..<at + s.len] == s.bytes

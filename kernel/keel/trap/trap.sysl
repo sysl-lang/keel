@@ -1,4 +1,10 @@
 module keel.trap
+@no_alloc
+
+// Nothing an exception handler runs may allocate: the heap's lock is held with IRQs masked, but a
+// synchronous fault taken inside the heap would still find it held. `@no_alloc` is checked through
+// every call, so the handler and everything it reaches is proven allocator-free. (Releasing a counted
+// reference is still allowed and reaches `keel_free`, which is why the heap masks IRQs.)
 
 import keel.cpu.{esr, far, set_vbar}
 import keel.irq.dispatch

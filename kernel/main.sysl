@@ -23,7 +23,9 @@ import sysl.sync.Ordering
 // `_start` gives the processor a stack at its physical address and calls `keel_boot`, which builds
 // the page tables and turns the MMU on, mapping the kernel high and RAM at its own addresses too. It
 // returns the distance between the two, which moves the stack pointer to the stack's high-half
-// address; kmain is then entered at the address it was linked at, through an absolute literal.
+// address; kmain is then entered at the address it was linked at, through an absolute literal. x0 at
+// entry (a device tree's address, under Linux's boot protocol) is kept in x19, which `keel_boot`
+// preserves, and handed to kmain as its argument.
 //
 // It is assembly at the top of the file rather than a function, because a function may save a
 // register on the stack before its first instruction and there is no stack yet. The label is the
@@ -118,6 +120,7 @@ private init_memory(x0_at_entry: u64)
 
 private struct Cell
     value: u64
+
 
 // What milestone 3 is for: `Buf`, `string`, `&T` and closures in the kernel, all on keel.heap, and
 // every frame they took given back once they are gone.

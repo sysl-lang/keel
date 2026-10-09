@@ -515,6 +515,134 @@ A struct with one field would control all three, and would then not be a bitfiel
 blocker. Clean form: a literal infers from the one `Add` argument a derived type has beyond its base,
 and an inherent `impl` block for a derived type.
 
+## Milestone 3: physical frames and the kernel heap
+
+Findings 18-20 are against the same prerelease (`census-34` at `7a59452170`), found while writing the
+frame allocator, the kernel heap that is sysl's allocating pair, and the C memory functions a
+freestanding image owes. By how much each blocks: 18 (silent, a hang), 19 (the build stops), 20.
+None was fixed here.
+
+## 18. An exported `memset` written as a loop compiles to a call to itself
+
+Milestone 3, `keel.rt`. A freestanding image defines `memset`, `memcpy`, `memmove` and `memcmp`
+itself (getting-started/cli.md: "Freestanding does not mean self-contained ... `memcpy` and `memset`
+for a structure assignment you never wrote"). LLVM emitted a `memset` call for the frame bitmap's
+zeroing loop, so keel wrote one:
+
+    @export("memset")
+    mem_set(dst: *u8, c: int, n: usize) -> *u8
+        for i in 0..<n
+            dst[i] = u8(c)
+        dst
+
+At the default level it compiles to
+
+    ffff000040082da0 <memset>:
+        cbz  x2, 0xffff000040082da8 <memset+0x8>
+        b    0xffff000040082da0 <memset>        // the loop, recognised as a memset, calls memset
+        ret
+
+an endless loop for any non-zero length, and nothing says so: the image links, and the first zeroing
+loop the optimizer turns into a call hangs the kernel. The `memcpy` loop beside it happened not to be
+rewritten into a `memcpy` call this time, which is luck, not a guarantee. C has the same trap and two
+spellings for it: `-ffreestanding`/`-fno-builtin` for the file, or
+`__attribute__((no_builtin("memset")))` on the function (LLVM's `"no-builtins"` function attribute).
+sysl has neither, and does not emit the attribute for a function `@export`ed under a libc name on a
+freestanding target.
+
+Workaround (used, `keel.rt`): every store goes through a `*volatile u8`, which LLVM may not merge into
+a call. One byte at a time, which costs nothing yet.
+
+Clean form: a freestanding target marks a function exported as `memset`, `memcpy`, `memmove` or
+`memcmp` with `"no-builtins"` (it is the implementation, so it must not call itself), or an attribute
+such as `@no_builtin` for any function that has to be written without the library it implements.
+
+## 19. Naming a sysl function as the program's allocating pair declares and defines one symbol twice
+
+Milestone 3, `keel.heap`. packages.md § "One heap, and the package that names it" says the project's
+own manifest may name the pair ("an application with its own arena"), and a freestanding target has
+to. keel's heap is sysl, exported under the names the manifest gives:
+
+    allocator {                             // kernel/package.hocon
+      alloc = "keel_alloc"
+      free  = "keel_free"
+    }
+
+    @export("keel_alloc")                   // keel.heap
+    keel_alloc(n: usize) -> *u8
+    @export("keel_free")
+    keel_free(p: *u8)
+
+The compiler emits a `declare` for the pair into the program's own module unconditionally, then the
+`define` of the export, and clang refuses the IR:
+
+    sysl: error: clang failed (exit 1):
+    scratch/keel.elf.ll:6133:12: error: invalid redefinition of function 'keel_alloc'
+     6133 | define ptr @keel_alloc(i64 %c.0) #99 {
+
+(line 75 is `declare ptr @keel_alloc(i64)`). The pair is evidently meant to come from C beside a
+package; an arena written in sysl, which is what a kernel or an application with its own arena
+has, cannot be named. `@export("exit")`, which the standard library also declares (`extern exit` in
+`platform.sysl`), works, because that declaration lives in the separately compiled standard module.
+
+Workaround (used): the manifest names `keel_heap_alloc` and `keel_heap_free`, and `link.ld` defines
+them as aliases, `keel_heap_alloc = keel_alloc;`. Free, but only because keel has a linker script.
+
+Clean form: the pair's `declare` is skipped (or reused) when the compilation defines the symbol, or a
+package may name a sysl function as its allocator directly.
+
+## 20. A boxed value gets at most the allocator's 16-byte alignment, whatever its type asks for
+
+Milestone 3, probing the kernel heap. keel's `keel_alloc` answers 16-byte aligned blocks, as malloc
+does on AArch64. A box puts its three header words (memory.md § "What a heap object costs") in front
+of the payload:
+
+    @align(64)
+    struct LineSized
+        x: u64
+
+    val c: &u128 = 7
+    val a: &LineSized = LineSized(1)
+    val b: &PageSized = PageSized([0; 512])     // @align(4096), [512]u64
+    print(usize(&*c) % 16, usize(&*a) % 64, usize(&*b) % 4096, alignof(PageSized))
+
+prints `0`, `24`, `88`, `4096`. A `u128` is placed on its 16-byte boundary (the header is padded),
+so natural alignment up to the allocator's is honoured; an `@align(n)` above that is not. Part of
+this is finding 12 (the struct's `@align` not reaching storage, fix in flight), but the heap half
+does not follow from that fix: the allocating pair is `alloc(size)` and `free(ptr)` with no alignment,
+so a 4 KiB-aligned type cannot be boxed on that boundary unless the compiler over-allocates and
+rounds up (and remembers the original pointer for `free`), or the pair has an aligned form. Nothing
+diagnoses it.
+
+No workaround needed yet: what a kernel wants page aligned (tables, DMA buffers) it takes from the
+frame allocator directly, never from a box.
+
+Clean form: a box of a type whose alignment exceeds the allocator's guarantee is laid out on that
+boundary, by over-allocation or by an optional `aligned_alloc` member of the `allocator` block — or
+refused, naming the type and the allocator's alignment.
+
+## What worked in milestone 3
+
+- **sysl's own allocation in the kernel**: `Buf[u64]` grown to 10,000 elements, an interpolated
+  `string`, a `&T` box captured by a closure, all through `keel_alloc`/`keel_free`, and every frame
+  back afterwards. The `allocator` block was the whole wiring (plus finding 19's alias); the standard
+  module is rebuilt for the pair on demand. The `heap` capability needed nothing: a manifest that does
+  not mention it provides it.
+- `panic` and a failed `unwrap` end in `exit`, an ordinary C symbol: `@export("exit")` in `keel.psci`
+  prints and powers off, so out of memory is a panic with a message.
+- `@no_alloc` on `keel.trap` is checked **through every call**: a `s"..."` added to `keel.irq.dispatch`
+  was refused at the handler's call to it ("this reaches 'keel.irq.dispatch', which makes heap
+  storage"). The exception path is proven allocator-free. Releasing a reference is still allowed there
+  and reaches `keel_free`, which is why the heap masks IRQs around its lock.
+- `sysl.sync.SpinLock` is the lock for both allocators, with IRQs masked through two small asm
+  functions (`cpu.irq_save`/`irq_restore`).
+- `Option[Frame]` where `Frame = new u36`: a distinct, bitfield-sized frame number in an `Option`,
+  with no ceremony.
+- The device tree is read with `blob[0..<n]` over a `*u8`, `sysl.encoding.get_u32_be`, and slice
+  equality against a string's bytes (`b[at..<at + s.len] == s.bytes`): about sixty lines, no parser.
+- A module `var` array of raw pointers (`[8]*Page`) starts as nulls, and `null` compares against a
+  field of a raw struct pointer as expected.
+
 ## What worked in milestone 2
 
 - Page tables entirely in sysl: `TableDesc`, `LeafDesc`, `Tcr`, `Sctlr`, `Ttbr` and `Par` are
