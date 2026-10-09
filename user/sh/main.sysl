@@ -10,11 +10,13 @@
 // A command that fails says so on the line after its output: `sh: <name>: exit status <n>`, or that
 // it was ended by a fault, or that it is not there (status 127).
 
-import abi.keel.abi.{ENOENT, NO_FD, O_CREAT, O_TRUNC, O_WRONLY}
 import rt.keel.user
 import sysl.buf.{Buf, buf}
 import sysl.fs
+import sysl.fs.IoError
 import sysl.io.{lines, stdin}
+import sysl.process
+import sysl.process.{Status, Stdio}
 import sysl.text.from_utf8
 
 // One word, from the bytes collected for it.
@@ -70,33 +72,40 @@ run(all: Buf[string]) -> i64
     if args.len() == 0 then return 0
     val name = args.at(0)
 
-    var out = NO_FD
+    // The `>` file is opened here rather than handed over as a path, so that a file that cannot be made
+    // is told apart from a command that is not there.
+    var out = Stdio.Inherit
     if target != ""
-        out = user.open(target, O_WRONLY | O_CREAT | O_TRUNC) match
-            Ok(fd) -> fd
+        fs.create(target) match
+            Ok(f) -> out = Stdio.ToFile(f)
             Err(e) ->
-                print(s"sh: $target: cannot open it, errno ${i64(e)}")
+                print(s"sh: $target: cannot open it: $e")
                 return 1
-    val started = user.spawn(path_of(name), args.view(), out)
-    if out != NO_FD then val _ = user.close(out)
-    val child = started match
-        Ok(pid) -> pid
-        Err(ENOENT) ->
+    val ran = process.run(path_of(name), args.view()[1..], stdout = out)
+    out match
+        ToFile(f) ->
+            var g = f
+            val _ = g.close()
+        Inherit | ToPath(_) -> ()
+    ran match
+        Ok(Exited(0)) -> 0
+        Ok(Exited(code)) ->
+            print(s"sh: $name: exit status $code")
+            i64(code)
+        Ok(s) ->
+            print(s"sh: $name: $s")
+            128 + i64(signal_of(s))
+        Err(IoError.NotFound) ->
             print(s"sh: $name: not found")
-            return 127
+            127
         Err(e) ->
-            print(s"sh: $name: cannot run it, errno ${i64(e)}")
-            return 126
-    user.wait(i64(child)) match
-        Ok((_, s)) ->
-            if s.fault != 0
-                print(s"sh: $name: ended by a fault (${s.fault})")
-                return 128 + i64(s.fault >> 8)
-            if s.code != 0 then print(s"sh: $name: exit status ${s.code}")
-            s.code
-        Err(e) ->
-            print(s"sh: $name: lost it, errno ${i64(e)}")
-            1
+            print(s"sh: $name: cannot run it: $e")
+            126
+
+// The signal a status names, for the shell's 128-and-up answer.
+signal_of(s: Status) -> int = s match
+    Signalled(n) -> n
+    else 0
 
 // The built-ins, which act on the shell itself; false if `w` is not one of them.
 builtin(w: Buf[string]) -> bool

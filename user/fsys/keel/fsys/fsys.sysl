@@ -1,7 +1,8 @@
 module keel.fsys
 
-// `sysl.fs` on keel: the twenty-five hooks `sysl.fs.sys` declares, and the three of `sysl.io.sys`, each
-// `@export`ed under the name the standard library calls and answered with keel's system calls (keel.abi).
+// `sysl.fs` on keel: the twenty-five hooks `sysl.fs.sys` declares, the three of `sysl.io.sys` and the
+// four of `sysl.process.sys`, each `@export`ed under the name the standard library calls and answered
+// with keel's system calls (keel.abi).
 //
 // Every hook answers as a system call does — zero or more for success, the code of the `IoError` the
 // call failed with negated for an error — and `status` is the one place a kernel's error number becomes
@@ -9,13 +10,16 @@ module keel.fsys
 // calls take — and so does a descriptor. What keel has no call for (permissions, links, a temporary
 // directory) answers `sysl.sys.UNSUPPORTED`, which `sysl.fs` reports as "not supported on this target".
 
-import abi.keel.abi.{EBADF, EEXIST, EISDIR, EMFILE, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, Errno, KIND_DIR,
-    O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, SYS_ACCESS, SYS_CHDIR, SYS_CLOSE, SYS_FSTAT,
-    SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR,
-    SYS_STAT, SYS_TRUNCATE, SYS_UNLINK, SYS_WRITE}
-import rt.keel.user.{flush, syscall}
+import abi.keel.abi.{EBADF, EEXIST, EISDIR, EMFILE, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, Errno, ExitStatus,
+    KIND_DIR, NO_FD, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, SYS_ACCESS, SYS_CHDIR, SYS_CLOSE,
+    SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME,
+    SYS_RMDIR, SYS_SPAWN, SYS_STAT, SYS_TRUNCATE, SYS_UNLINK, SYS_WAIT, SYS_WRITE}
+import rt.keel.user.{flush, syscall, syscall5}
+import sysl.buf.{Buf, buf}
 import sysl.fs.IoError
 import sysl.fs.sys as fsys
+import sysl.process.sys as psys
+import sysl.slices.as_ptr
 import sysl.sys.UNSUPPORTED
 
 // --- Errors ----------------------------------------------------------------------------------------
@@ -249,3 +253,59 @@ io_write(fd: int, from: *u8, len: usize) -> isize
 io_flush(fd: int) -> int
     if fd == 1 then flush()
     0
+
+// --- sysl.process: the four hooks `sysl.process.sys` declares -------------------------------------------
+//
+// keel's spawn (22) and wait (23). What keel's spawn cannot be told — an environment (keel has none), a
+// starting directory (the child takes the caller's), a standard input or error of its own — answers
+// `UNSUPPORTED` rather than being dropped; so do a bounded wait, a signal (keel has no kill) and a
+// temporary file.
+
+@export("sysl_proc_spawn")
+proc_spawn(path: *u8, path_len: usize, argv: *psys.Text, argc: usize, envp: *psys.Text, envc: usize,
+           inherit_env: int, dir: *u8, dir_len: usize, stdin_fd: int, stdout_fd: int, stderr_fd: int,
+           started: *i64) -> i64
+    *started = 0
+    if envc != 0 || dir_len != 0 || stdin_fd != -1 || stderr_fd != -1 then return i64(UNSUPPORTED)
+    // keel takes the argument vector as each argument followed by a NUL.
+    var packed: Buf[u8] = buf()
+    for i in 0..<argc
+        val t = argv[i]
+        for j in 0..<t.len
+            packed.push(t.ptr[j])
+        packed.push(0)
+    val out = if stdout_fd < 0 then NO_FD else u64(stdout_fd)
+    val r = syscall5(SYS_SPAWN, addr(path), u64(path_len), u64(usize(as_ptr(packed.view()))), u64(packed.len()),
+                     out)
+    if r >= 0 then r else i64(status(r))
+
+@export("sysl_proc_wait")
+proc_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int
+    if timeout_ms > 0 then return UNSUPPORTED
+    var s = ExitStatus(0, 0)
+    val r = syscall(SYS_WAIT, u64(pid), u64(usize(&s)), 0, 0)
+    if r < 0 then return status(r)
+    if s.fault != 0
+        *how = psys.ended_signalled
+        *value = signal_of(s.fault)
+    else
+        *how = psys.ended_exited
+        *value = int(s.code)
+    0
+
+// The POSIX signal a host would have raised for the fault keel ended a process for: `ExitStatus.fault`
+// is ESR_EL1's exception class shifted left 8, or 0xffff for a process the kernel killed.
+private signal_of(fault: u64) -> int
+    if fault == 0xffff then return 9                   // SIGKILL
+    (fault >> 8) match
+        0x20 | 0x21 | 0x24 | 0x25 -> 11                // an instruction or data abort: SIGSEGV
+        0x22 | 0x26 -> 7                               // PC or SP alignment: SIGBUS
+        0x2c -> 8                                      // a trapped floating-point exception: SIGFPE
+        0x3c -> 5                                      // brk: SIGTRAP
+        else 4                                         // anything else it could not run: SIGILL
+
+@export("sysl_proc_kill")
+proc_kill(pid: i64, signal: int) -> int = UNSUPPORTED
+
+@export("sysl_proc_temp_path")
+proc_temp_path(into: *u8, room: usize) -> isize = isize(UNSUPPORTED)

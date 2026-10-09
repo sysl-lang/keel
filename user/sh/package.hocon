@@ -1,5 +1,5 @@
-// `sh`: keel's shell, written with the user runtime's `spawn` and `wait` and the standard library's
-// `sysl.fs` and `sysl.io`.
+// `sh`: keel's shell, written with the standard library's `sysl.process`, `sysl.fs` and `sysl.io`,
+// answered by keel.fsys's hooks.
 
 package {
   name    = "sh"

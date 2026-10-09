@@ -214,6 +214,9 @@ sockclose(sd: u64) -> Result[unit, Errno] = done(call(SYS_SOCKCLOSE, sd, 0, 0, 0
 // turns it into an `IoError`'s code).
 syscall(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 = call(nr, a0, a1, a2, a3)
 
+// The same for a call of five arguments (spawn).
+syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 = call5(nr, a0, a1, a2, a3, a4)
+
 // Write a string to standard output, all of it unless the kernel refuses.
 put(s: string) -> i64 = write_bytes(STDOUT, s.bytes)
 

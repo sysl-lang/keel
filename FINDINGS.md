@@ -1744,6 +1744,18 @@ names what is missing; and `memchr` written in sysl there, as `putbytes` already
 
 ## 49. `sysl.process` is fork/exec over C shims, so a target with its own process calls has nothing to supply, and nothing in it can give a child a file as its output
 
+**FIXED in sysl census-35 7e2a32d3 (`process-hooks`; prerelease `7e2a32d396`):** `sysl.process.sys`
+is a hook layer — `sysl_proc_spawn` (path, argv as `Text`s, env, dir, three descriptors),
+`sysl_proc_wait` (how it ended: exited, signalled, timed out), `sysl_proc_kill`,
+`sysl_proc_temp_path` — answered like the fs and io hooks; `run`/`start` take a `Stdio` per stream
+(`Inherit`, `ToFile`, `ToPath`); a child the kernel ended for a fault is reported as the POSIX signal
+for it. keel.fsys exports all four: spawn over call 22 (an environment, a directory, or a standard
+input or error of the child's own answer `UNSUPPORTED`), wait over 23 (a fault becomes `Signalled`:
+aborts 11, alignment 7, `brk` 5, a kill 9, else 4), and kill, a bounded wait and `temp_path` answer
+`UNSUPPORTED`. `sh` runs every command with `process.run(path, args, stdout = ToFile(f))` and no
+longer imports keel's `spawn`/`wait`. Control: the wait hook answering code 0 fails the transcript at
+`sh: false: exit status 1`.
+
 The shell is the program `sysl.process` is for — start a program with a list of arguments, wait,
 read how it ended — and it cannot use it on keel:
 
