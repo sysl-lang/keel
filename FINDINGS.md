@@ -2431,8 +2431,15 @@ keel.fsys answers with `wait4(pid, …, WNOHANG)`. The shell lays every job out 
 background job keeps its `&Spawned` stages and `reap_jobs` asks them with `try_wait` before each
 prompt; `fg` waits for them. `run_background`'s second layout on keel's calls is gone, and so is the
 shell's use of `user.poll`/`user.wait`/`user.spawn`. The boot test's `true | false &` is reported
-`[1] exit status 1 true | false`. Left open: `Spawned` has no accessor for its pid, so `cmd &` prints
-the job's process group (`group()`) — the first stage's pid, not the last one's as a POSIX shell does.
+`[1] exit status 1 true | false`. Left open then: `Spawned` had no accessor for its pid, so `cmd &`
+printed the job's process group (`group()`) — the first stage's pid, not the last one's as a POSIX
+shell does.
+
+**FIXED in sysl 0.1.0-alpha.8:** `Spawned.pid()` and `Child.pid()`. `cmd &` prints the last stage's
+`pid()` and the shell keeps it for `$!`, which it now expands; `group()` stays the number `kill %n`,
+`fg` and `set_foreground_group` act on. The boot test's `sleep 1 | sleep 2 &` prints a number one
+more than its group's, `echo $!` prints the same number, and `ps` lists it as the `sleep` whose
+group is the printed number's predecessor.
 
 The shell's `cmd &`, `jobs` and the `[n] done …` report before each prompt need to ask whether a stage
 has ended without waiting for it — POSIX's `waitpid(pid, WNOHANG)`, Rust's `Child::try_wait`. `Spawned`

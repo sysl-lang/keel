@@ -10,7 +10,7 @@
 //   NAME=value     a shell variable, when every word on the line is one
 //   export NAME[=value]   a variable every command run afterwards finds in its environment
 //   $NAME          the variable's value (nothing if it is unset), outside single quotes; $? is the
-//                  status of the last command
+//                  status of the last command, $! the pid of the newest background job's last stage
 //   cd [dir]       the current directory (built in: it is the shell's own); `/` with no argument
 //   pwd            the current directory
 //   exit [n]       end the shell with code n (0 by default); the end of the input does the same
@@ -27,7 +27,8 @@
 // turns into SIGINT for the foreground group, reaches the job and not the shell. The shell is in a
 // group of its own, takes the console back when the job ends, and ignores SIGINT itself.
 //
-//   cmd &          run it in the background: the shell prints `[n] <pid>` and does not wait
+//   cmd &          run it in the background: the shell prints `[n] <pid>`, the last stage's pid (also
+//                  `$!`), and does not wait
 //   jobs           the background jobs still running: `[n] running <line>`
 //   fg [%n]        bring job n (the newest, without one) to the foreground and wait for it
 //   kill [-SIG] %n send job n's group a signal (SIGTERM by default); without a `%`, /bin/kill
@@ -72,13 +73,14 @@ struct Job
     text: string
     signalled: bool             // the shell has just sent it a signal
 
-// What the shell keeps between lines: its variables, the last command's status, its process group and
-// its background jobs.
+// What the shell keeps between lines: its variables, the last command's status, its process group,
+// its background jobs and the pid `$!` answers.
 struct Shell
     vars: Buf[ShellVar]
     status: i64
     pgid: int
     jobs: Buf[Job]
+    last_background: int        // `$!`: the last stage's pid of the newest background job; 0 before one
 
 // One command of a pipeline, with its redirections taken out.
 struct Stage
@@ -155,10 +157,13 @@ cur_of(c: u8) -> Buf[u8]
     one
 
 // Expand the variable named from `b[i]` on into `cur`, and answer where the line goes on. A `$`
-// followed by neither a name nor `?` is itself.
+// followed by neither a name, `?` nor `!` is itself.
 expand(sh: *Shell, b: []const u8, i: usize, cur: *Buf[u8]) -> usize
     if i < b.len && b[i] == u8('?')
         cur.extend(s"${sh.status}".bytes)
+        return i + 1
+    if i < b.len && b[i] == u8('!')
+        if sh.last_background != 0 then cur.extend(s"${sh.last_background}".bytes)
         return i + 1
     var end = i
     while end < b.len && name_byte(b[end], end == i)
@@ -337,7 +342,8 @@ writing(f: Option[File]) -> Stdio = f match
 
 // A job in the background: started as `run_foreground` starts one, but kept rather than waited for —
 // `reap_jobs` asks its stages with `try_wait` before each prompt. The shell says the job's number and
-// its process group, the number `kill` and `fg` act on.
+// its last stage's pid, as a POSIX shell does, and keeps that pid for `$!`; `kill` and `fg` act on
+// the job's process group, which is its first stage's pid.
 run_background(sh: *Shell, all: Buf[Stage], text: string) -> i64
     val job = start_job(sh, all, false)
     if job.stages.len() == 0 then return job.last
@@ -348,7 +354,8 @@ run_background(sh: *Shell, all: Buf[Stage], text: string) -> i64
     for j in sh.jobs.view()
         if j.number >= number then number = j.number + 1
     sh.jobs.push(Job(number, job.pgid, stages, last_stage(job), text, false))
-    print(s"[$number] ${job.pgid}")
+    sh.last_background = stages.at(stages.len() - 1).pid()
+    print(s"[$number] ${sh.last_background}")
     0
 
 // Make the shell's own group the console's foreground group again.
@@ -585,7 +592,7 @@ parse_code(text: string) -> i64
 // The prompt says who the shell runs as: `# ` for root, `$ ` for anyone else.
 val prompt = if process.user() == 0 then "# " else "$ "
 
-var sh = Shell(buf(), 0, 0, buf())
+var sh = Shell(buf(), 0, 0, buf(), 0)
 for (name, value) in env.vars()
     set_var(&sh, name, value, true)
 

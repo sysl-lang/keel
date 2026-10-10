@@ -262,6 +262,10 @@ session2=(
     'fg %1'
     $'@wait \nsleep 100\n'
     '@intr'
+    'sleep 100 | sleep 100 &'
+    'echo $!'
+    'ps'
+    'kill %1'
     'ls -l /bin > /m9/l'
     'cat /m9/l /m9/l /m9/l /m9/l /m9/l /m9/l | head -n 1 | wc -l'
     'rm /m9/l'
@@ -307,6 +311,10 @@ transcript2=(
     $'# kill %1\n[1] killed by signal 15 sleep 100\n'   # SIGTERM to its group, reported at the next prompt
     $'# sleep 100 &\n[1] '
     $'\n# fg %1\nsleep 100\nsh: sleep 100: killed by signal 2\n'   # brought to the foreground, then Ctrl-C
+    $'# sleep 100 | sleep 100 &\n[1] '         # a background pipeline: the LAST stage's pid, POSIX's
+    $'\n# echo $!\n'                            # ...which $! answers too (the numbers: last_pid_check)
+    $'\n# ps\n  PID  PPID  PGID   UID CMD\n'
+    $'# kill %1\n[1] killed by signal 15 sleep 100 | sleep 100\n'   # kill %n still goes to the group
     $'# ls -l /bin > /m9/l\n# cat /m9/l /m9/l /m9/l /m9/l /m9/l /m9/l | head -n 1 | wc -l\n1\n'   # ~11 KiB of text
     $'# rm /m9/l\n'                             # through a 4 KiB pipe: head ends, cat's next write is SIGPIPE, no hang
     $'# linuxhello\nlinux: write, getpid and exit_group by Linux\'s numbers; pid '   # a static aarch64-linux
@@ -559,6 +567,27 @@ fsck 1
 boot 2 "user: persisted across reboot" session2 transcript2
 second=$waited
 fsck 2
+
+# `sleep 100 | sleep 100 &` printed its last stage's pid, as a POSIX shell does: `echo $!` printed the
+# same number, and ps lists it as a sleep whose group is another number — the first stage's, which ps
+# lists as a sleep leading that group.
+last_pid_check() {
+    perl -0777 -ne '
+        /# sleep 100 \| sleep 100 &\n\[1\] (\d+)\n# echo \$!\n(\d+)\n# ps\n(.*?)\n# kill %1/s
+            or die "the background pipeline, its \$! and its ps are not in the log\n";
+        my ($printed, $bang, $ps) = ($1, $2, $3);
+        $bang == $printed or die "\$! is $bang, but the shell printed [1] $printed\n";
+        $ps =~ /^ *$printed +\d+ +(\d+) +\d+ sleep$/m or die "ps lists no sleep with pid $printed\n";
+        my $group = $1;
+        $group != $printed or die "pid $printed is its own group: the shell printed the first stage\n";
+        $ps =~ /^ *$group +\d+ +$group +\d+ sleep$/m or die "ps lists no sleep leading group $group\n";
+        print "keel: background pipeline [1] $printed = \$!, group $group\n";
+    ' $out/boot2.log
+}
+if ! last_pid_check; then
+    print -r -- "FAIL: boot 2: the background pipeline's number is not its last stage's pid"
+    return 1
+fi
 
 # And the host reads what the second boot wrote, through the same format.
 $mkfs get $disk /out.txt $out/out.txt
