@@ -248,6 +248,9 @@ private brk_locked(p: *Process, want: u64) -> i64
     if want < p.heap_base || want > mm.heap_limit() then return i64(p.brk)
     val old_top = page_up(p.brk)
     val new_top = page_up(want)
+    // A break never grows over a page something else mapped there (mmap's MAP_FIXED, as musl's malloc
+    // puts a PROT_NONE guard just past the break): Linux refuses it, and so the break stays.
+    if new_top > old_top && !mm.range_unused(&p.space, old_top, new_top - old_top) then return i64(p.brk)
     var va = old_top
     while va < new_top
         mm.map_user_page(&p.space, va, mm.UserProt(true, false)) match

@@ -45,10 +45,15 @@ range_unused(s: *Space, va: u64, len: u64) -> bool
         a += PAGE_SIZE
     true
 
+// Off only to show what the search is for: every mapping with no address asked for is then put at the
+// top of the window, over the last one — the second of musl's malloc's mmaps fails, ENOMEM.
+private const LOOK_FOR_ROOM: bool = true
+
 // The lowest address of `len` bytes of unused pages in the window, the highest such run found looking
 // down from mmap_top(); None when there is no run that long.
 find_room(s: *Space, len: u64) -> Option[u64]
     if len == 0 || len > mmap_top() - MMAP_BASE then return None
+    if !LOOK_FOR_ROOM then return Some(mmap_top() - len)
     var top = mmap_top()
     while top - MMAP_BASE >= len
         // Look down from `top` for the first page in use below it; the run is long enough if none comes

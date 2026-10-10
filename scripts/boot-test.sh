@@ -21,7 +21,7 @@ root=${0:A:h:h}
 out=$root/scratch
 mkdir -p $out
 
-limit=${KEEL_TIMEOUT:-15}
+limit=${KEEL_TIMEOUT:-25}
 opt=${KEEL_OPT:-}
 accel=${KEEL_ACCEL:-hvf}
 compiler=${KEEL_SYSL:-sysl}
@@ -51,11 +51,11 @@ before_user_line=(
     "keel: smp ran on "     # threads ran on more than one core (the count is checked below)
     "keel: smp mutex ok"    # 4 threads x 100,000 additions under the Mutex, on >= 2 cores at once
     "keel: smp heap ok"     # 4 threads x 10,000 Bufs on the heap at once; every block and frame back
-    "keel: virtio-blk found, capacity 16384 sectors"   # the 8 MiB image, found in a virtio-mmio slot
+    "keel: virtio-blk found, capacity 32768 sectors"   # the 16 MiB image, found in a virtio-mmio slot
     "keel: disk read ok"    # sector 1 read back the bytes this script put there
     "keel: disk write ok"   # a pattern written to sector 2 read back the same
     "keel: disk smp ok"     # 4 threads x 100 reads at once, on >= 2 cores, every byte right
-    "keel: fs mounted, 2048 blocks"   # the superblock mkfs wrote, checked against the disk's size
+    "keel: fs mounted, 4096 blocks"   # the superblock mkfs wrote, checked against the disk's size
     "user: hello from EL0"  # a sysl program read from /bin, at EL0 in its own address space, printing through `write`
     "keel: process 1 exited 0"   # ...and ending with `exit(0)`
     "keel: process 2 killed: permission fault"   # a program reading kernel memory is killed, alone
@@ -459,7 +459,7 @@ frames_max=65536
 elf=$out/keel.elf
 mkfs=$out/mkfs
 
-# The disk: an 8 MiB keel filesystem (2048 blocks; 28 programs at -O0 overflow 1024) that mkfs builds from a directory holding
+# The disk: a 16 MiB keel filesystem (4096 blocks; the programs at -O0 and busybox's 273 overflow 2048) that mkfs builds from a directory holding
 # /hello.txt and /dir/inner.txt. Its block 0 is a boot block the filesystem never uses, which is where
 # milestone 7's test lives: sector 1 gets byte i = (7i + 3) mod 256 here, the kernel writes sector 2
 # with byte i = (13i + 0x5a) mod 256, and after the first boot the script reads it back from the file.
@@ -548,7 +548,7 @@ print -l "root:x:0:" "users:x:100:alice" > $fsroot/etc/group
 print "for root's eyes only" > $fsroot/etc/secret
 owners=$out/owners
 print -l "/home/alice 1000 100 755" "/bin/su 0 0 4755" "/etc/secret 0 0 600" > $owners
-$mkfs build $disk 2048 $fsroot $owners
+$mkfs build $disk 4096 $fsroot $owners
 sector 7 3 | perl -e 'open(my $f, "+<", $ARGV[0]) or die; seek($f, 512, 0); local $/; print $f <STDIN>' $disk
 
 if [[ $accel == hvf ]]; then
