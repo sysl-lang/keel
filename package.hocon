@@ -5,5 +5,6 @@
 //   user/rt       a user program's runtime: its entry, the system call wrappers, `putchar`, a heap
 //   user/<prog>   one user program each, linked low (user/user.ld) and embedded in the kernel
 //   ondisk        the filesystem's on-disk structs, compiled into both the kernel and mkfs
+//   kfs           KFS, the new filesystem (kfs/SPEC.md): its format and algorithms, for both sides
 //   tools/mkfs    a host program: builds, checks and reads filesystem images
-workspace = ["kernel", "user/*", "ondisk", "tools/*"]
+workspace = ["kernel", "user/*", "ondisk", "kfs", "tools/*"]
