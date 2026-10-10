@@ -40,10 +40,10 @@ start(argc: int, argv: **u8) -> never
     environ = ptr_cast(usize(argv) + (usize(argc) + 1) * 8)
     exit(program_main(argc, argv))
 
-// The environment, as C keeps it and as `sysl.env` reads it: a zero-ended vector of `NAME=value`
-// strings — the one the kernel laid on the stack. `sysl.env` names `environ` and `getenv` as externs
-// and has no hook layer for a target with no C library, and a sysl `var` cannot be `@export`ed, so the
-// variable is defined here in assembly (FINDINGS.md 65).
+// The environment, as C keeps it: a zero-ended vector of `NAME=value` strings — the one the kernel laid
+// on the stack. `sysl.env` reads it through keel.fsys's hooks, which ask `env_entry` here. It is a word
+// of `.data` rather than module storage because `keel_user_start` sets it before `main` runs, and
+// `main` is what fills module storage.
 @section(".data")
 asm
     [aarch64]
@@ -55,33 +55,24 @@ asm
 
 extern environ: **u8
 
-// C's `getenv`, over `environ`: the value of the first entry whose name is `name`, or null.
-@export("getenv")
-getenv(name: *u8) -> *u8
+// Entry `i` of this process's environment, `NAME=value` as bytes, or None past the last.
+env_entry(i: usize) -> Option[[]const u8]
+    for k in 0..<i + 1
+        if environ[k] == null then return None
+    val e = environ[i]
     var n: usize = 0
-    while name[n] != 0
+    while e[n] != 0
         n += 1
-    var i: usize = 0
-    loop
-        val e = environ[i]
-        if e == null then return null
-        var k: usize = 0
-        while k < n && e[k] == name[k]
-            k += 1
-        if k == n && e[n] == u8('=') then return ptr_cast(usize(e) + n + 1)
-        i += 1
+    Some(e[0..<n])
 
 // This process's environment entries, `NAME=value` each, as bytes (keel.fsys builds a child's from it).
 environment() -> Buf[[]const u8]
     var out: Buf[[]const u8] = buf()
     var i: usize = 0
     loop
-        val e = environ[i]
-        if e == null then return out
-        var n: usize = 0
-        while e[n] != 0
-            n += 1
-        out.push(e[0..<n])
+        env_entry(i) match
+            Some(e) -> out.push(e)
+            None -> return out
         i += 1
 
 // The system calls, one `svc` each. The kernel preserves every register but x0.
@@ -352,8 +343,9 @@ chown(path: string, uid: u32, gid: u32) -> Result[unit, Errno] =
 
 // --- Signals and process groups --------------------------------------------------------------------
 //
-// keel.abi's signal calls. The standard library has no signal surface — no handler, no mask, no process
-// group (FINDINGS.md 69) — so a program on keel calls these directly.
+// keel.abi's signal calls. `sysl.signal` (signals as counted flags) and `sysl.process`'s groups and
+// foreground reach them through keel.fsys's hooks; a program that wants a handler of its own, a mask or
+// `setpgid` calls these directly.
 //
 // The restorer every handler returns to: it makes `sigreturn`, which puts back the registers the
 // signal interrupted (keel.abi's `SigFrame`). Linux's `sa_restorer`, kept in the runtime rather than
@@ -370,12 +362,16 @@ asm
 extern keel_sigreturn_trampoline: u8
 
 // Set `sig`'s action — SIG_DFL, SIG_IGN, or the address of a handler `(sig: u64)`, which runs with
-// `mask` blocked as well as `sig` — and answer the action it replaces.
-sigaction(sig: u64, handler: u64, mask: u64 = 0) -> Result[SigAction, Errno]
-    var old = SigAction(0, 0, 0)
+// `mask` blocked as well as `sig` — and answer the action it replaces. `flags` is SA_RESTART or 0.
+sigaction(sig: u64, handler: u64, mask: u64 = 0, flags: u64 = 0) -> Result[SigAction, Errno]
+    var old = SigAction(0, 0, 0, 0)
     val restorer = u64(usize(&keel_sigreturn_trampoline))
-    done(call5(SYS_SIGACTION, sig, handler, mask, restorer, u64(usize(&old))))?
+    done(call6(SYS_SIGACTION, sig, handler, mask, restorer, u64(usize(&old)), flags))?
     Ok(old)
+
+// Put back an action `sigaction` answered, exactly as it was.
+restore_action(sig: u64, a: SigAction) -> Result[unit, Errno] =
+    done(call6(SYS_SIGACTION, sig, a.handler, a.mask, a.restorer, 0, a.flags))
 
 // Change the blocked set (`how`: SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK) and answer what it was.
 sigprocmask(how: u64, set: u64) -> Result[u64, Errno]
@@ -414,9 +410,8 @@ procs() -> Result[Buf[ProcInfo], Errno]
 
 // --- UDP sockets -----------------------------------------------------------------------------------
 //
-// keel.abi's socket calls, as they are: a socket is a number, an address a `SockAddr`. The standard
-// library has no datagram socket and no hook to supply one through (FINDINGS.md 54), so a program on
-// keel calls these directly.
+// keel.abi's socket calls, as they are: a socket is a number, an address a `SockAddr`. A program
+// written with `sysl.net` reaches them through keel.fsys's hooks instead.
 
 socket() -> Result[u64, Errno] = answer(call(SYS_SOCKET, 0, 0, 0, 0))
 

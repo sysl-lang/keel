@@ -1,0 +1,85 @@
+module keel.fsys
+
+// `sysl.signal` on keel: the five hooks of `sysl.signal.sys`, over keel's sigaction (41) and kill (44).
+//
+// The handler `watch` installs is `counted`, a function of this module that adds one to the signal's
+// count and does nothing else, installed with SA_RESTART so that a call the signal arrives during is
+// made again rather than answering EINTR. Its restorer is the runtime's `keel_sigreturn_trampoline`,
+// as for every handler on keel (`user.sigaction` passes it). The first `watch` of a signal keeps the
+// action it replaced, for `disposition(sig, set_restored)` to put back.
+//
+// `sysl.signal` holds its own lock around every call that changes a disposition, so the tables below
+// are only ever written by one caller at a time; `arrivals` reads a count the handler writes, which is
+// why the counts are atomic.
+
+import abi.keel.abi.{Errno, NSIG, SA_RESTART, SIG_DFL, SIG_IGN, SYS_KILL, SigAction}
+import rt.keel.user
+import sysl.fs.IoError
+import sysl.signal.sys as ssys
+import sysl.sync.{Atomic, Ordering}
+
+private var arrived: [32]Atomic[i64] = [Atomic(0); 32]
+private var watched: [32]bool = [false; 32]
+private var before: [32]SigAction = [SigAction(0, 0, 0, 0); 32]
+
+@assert(NSIG == 32, "the tables hold one entry per signal keel numbers")
+
+// What a signal outside keel's 1 to NSIG - 1 is answered: EINVAL.
+private invalid() -> int = -IoError.Other(22).code()
+
+private on_keel(sig: int) -> bool = sig >= 1 && u64(sig) < NSIG
+
+// A keel call's error as a hook's status.
+private refused(e: Errno) -> int = status(-i64(e))
+
+// The handler: one more arrival of `sig`. It runs between two instructions of whatever the program was
+// doing, so it touches nothing but the count.
+private counted(sig: u64)
+    if sig < NSIG
+        arrived[usize(sig)].add(1, Ordering.Release)
+
+@export("sysl_sig_watch")
+sig_watch(sig: int) -> int
+    if !on_keel(sig) then return invalid()
+    if watched[usize(sig)] then return 0
+    user.sigaction(u64(sig), u64(usize(&counted)), 0, SA_RESTART) match
+        Ok(old) ->
+            before[usize(sig)] = old
+            watched[usize(sig)] = true
+            0
+        Err(e) -> refused(e)
+
+@export("sysl_sig_arrivals")
+sig_arrivals(sig: int) -> i64
+    if !on_keel(sig) then return i64(invalid())
+    arrived[usize(sig)].load(Ordering.Acquire)
+
+@export("sysl_sig_disposition")
+sig_disposition(sig: int, how: int) -> int
+    if !on_keel(sig) then return invalid()
+    val s = u64(sig)
+    if how == ssys.set_restored
+        if !watched[usize(sig)] then return 0
+        user.restore_action(s, before[usize(sig)]) match
+            Ok(_) ->
+                watched[usize(sig)] = false
+                return 0
+            Err(e) -> return refused(e)
+    if how != ssys.set_default && how != ssys.set_ignored then return invalid()
+    user.sigaction(s, if how == ssys.set_default then SIG_DFL else SIG_IGN) match
+        Ok(_) ->
+            watched[usize(sig)] = false
+            0
+        Err(e) -> refused(e)
+
+@export("sysl_sig_send")
+sig_send(pid: i64, sig: int) -> int
+    if sig < 0 then return invalid()
+    status(user.syscall(SYS_KILL, u64(pid), u64(sig), 0, 0))
+
+// keel delivers a pending signal on the way back from the system call that sent it, so a signal this
+// process sends itself has been handled by the time `kill` returns — C's `raise`.
+@export("sysl_sig_raise")
+sig_raise(sig: int) -> int
+    if sig < 0 then return invalid()
+    status(user.syscall(SYS_KILL, user.getpid(), u64(sig), 0, 0))

@@ -252,8 +252,9 @@ private reason(fault: u64) -> string
 @export("keel_user_sync")
 user_sync(regs: *u64, ec: u64, iss: u64)
     if ec == 0x15
-        system_call(regs)
-        returning_to_user(regs)
+        val again = system_call(regs)
+        val p = current_process()
+        if p != null then deliver(p, regs, again)
     else if ec == 0x24 && is_write_permission_fault(iss) && mm.break_cow(&current_process().space, cpu.far())
         // A write to a copy-on-write page (mm's cow.sysl): the page is writable now, and the store runs
         // again.

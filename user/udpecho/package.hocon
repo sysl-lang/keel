@@ -1,4 +1,4 @@
-// `udpecho`: a UDP echo server, written with the user runtime's socket calls.
+// `udpecho`: a UDP echo server, written with `sysl.net`.
 
 package {
   name    = "udpecho"
@@ -7,6 +7,7 @@ package {
 
 dependencies {
   rt { workspace = true }
+  fsys { workspace = true }
 }
 
 // keel does not save the FP/SIMD registers yet, and leaves the unit trapping at EL0 too.

@@ -26,11 +26,13 @@ const SIGKILL: u64 = 9
 const SIGSTOP: u64 = 19
 
 // What a signal does: SIG_DFL (0), SIG_IGN (1), or the address of a handler in the process, which
-// returns to `restorer`; `mask` is blocked as well while the handler runs.
+// returns to `restorer`; `mask` is blocked as well while the handler runs; `flags` is keel.abi's
+// SA_RESTART or 0.
 struct Action
     handler: u64
     mask: u64
     restorer: u64
+    flags: u64
 
 const SIG_DFL: u64 = 0
 const SIG_IGN: u64 = 1
@@ -43,7 +45,7 @@ struct Signals
     sleep_queue: *WaitQueue     // where the process's thread is asleep interruptibly, or null; under `lock`
     sleep_guard: *IrqLock       // that queue's guard
 
-private no_action() -> Action = Action(SIG_DFL, 0, 0)
+private no_action() -> Action = Action(SIG_DFL, 0, 0, 0)
 
 // A new program's signals: every action the default, nothing blocked or pending.
 fresh_signals() -> &sync Signals = Signals(irq_lock(), Atomic(0), 0, [no_action(); SIGNALS], null, null)

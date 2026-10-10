@@ -251,6 +251,7 @@ session2=(
     'sigtest'
     '@wait sigtest: waiting for Ctrl-C'
     '@intr'
+    'stdsig'
     'sleep 100 &'
     'jobs'
     'ps'
@@ -289,6 +290,8 @@ transcript2=(
     $'# spin x\nspin: spinning\nsh: spin: killed by signal 2\n'   # Ctrl-C ends the foreground job, not the shell
     $'# sigtest\nsigtest: handler ok\nsigtest: mask ok\nsigtest: eintr ok\nsigtest: sigpipe ok\n'
     $'sigtest: sigchld ok\nsigtest: waiting for Ctrl-C\nsigtest: registers intact across Ctrl-C\n'   # a handler, and back
+    $'# stdsig\nstdsig: watch ok\nstdsig: restart ok\nstdsig: ignore ok\nstdsig: group ok\n'   # sysl.signal and
+                                                # sysl.process groups through keel.fsys's hooks; SA_RESTART
     $'# sleep 100 &\n[1] '                      # a background job: its number and pid
     $'\n# jobs\n[1] running sleep 100\n'
     $'# ps\n  PID  PPID  PGID   UID CMD\n    1     0     1     0 init\n'   # the table, init first
@@ -317,7 +320,7 @@ not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login e
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
     init sh mkdir rm rmdir mv false ppid orphan udpecho login su id whoami chmod chown env wc grep head true forktest
-    sigtest ps kill sleep)
+    sigtest stdsig ps kill sleep)
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
 frames_min=65000

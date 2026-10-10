@@ -1,5 +1,6 @@
-// What the standard library's `sysl.fs` asks of the system under it (`sysl.fs.sys`'s hooks), answered
-// over keel's system calls. A program that uses `sysl.fs` depends on this and imports it.
+// What the standard library asks of the system under it — the hooks of `sysl.fs.sys`, `sysl.io.sys`,
+// `sysl.process.sys`, `sysl.signal.sys`, `sysl.net.sys` and `sysl.env.sys` — answered over keel's system calls. A
+// program that uses any of those modules depends on this.
 
 package {
   name    = "fsys"

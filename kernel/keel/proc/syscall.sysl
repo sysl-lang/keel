@@ -1,6 +1,6 @@
 module keel.proc
 
-import abi.keel.abi.{EINVAL, ENOSYS, EPERM, Errno, SYS_CHMOD, SYS_CHOWN, SYS_DUP, SYS_DUP2, SYS_GETGID, SYS_PIPE,
+import abi.keel.abi.{EINTR, EINVAL, ENOSYS, EPERM, Errno, SYS_CHMOD, SYS_CHOWN, SYS_DUP, SYS_DUP2, SYS_GETGID, SYS_PIPE,
     SYS_GETUID, SYS_SETGID, SYS_SETUID, SYS_ACCESS, SYS_BRK, SYS_CHDIR, SYS_CLOSE,
     SYS_EXIT, SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR,
     SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN, SYS_STAT, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINK, SYS_WAIT,
@@ -21,8 +21,12 @@ import keel.sched.Process
 // -> i64` in a module `val`) is the natural form, but its initializer is not folded into the image: it
 // is computed in a `main` that an image entered at `_start` never runs, so every entry read as null
 // (FINDINGS.md 31).
-private[proc] system_call(regs: *u64)
+//
+// Answers the x0 the call was made with when it answered EINTR and may be made again (every call but
+// `nanosleep`, whose answer says how long was left), for `deliver` to restart it under SA_RESTART.
+private[proc] system_call(regs: *u64) -> Option[u64]
     val p = current_process()
+    val first = regs[0]
     val r = regs[8] match
         SYS_EXIT -> sys_exit(p, regs)
         SYS_WRITE -> sys_write(p, regs)
@@ -78,6 +82,9 @@ private[proc] system_call(regs: *u64)
     regs[0] = r match
         Ok(v) -> u64(v)
         Err(e) -> u64(-i64(e))
+    r match
+        Err(EINTR) if regs[8] != SYS_NANOSLEEP -> Some(first)
+        _ -> None
 
 private sys_exit(p: *Process, regs: *u64) -> Result[i64, Errno]
     p.exit_code = i64(regs[0])

@@ -48,7 +48,7 @@ const SYS_DUP2: u64 = 37        // dup2(old, new) -> new: `new` closed first if 
 const SYS_DUP: u64 = 38         // dup(old) -> the lowest free descriptor, now the same as `old`
 const SYS_FORK: u64 = 39        // fork() -> the child's pid in the parent, 0 in the child
 const SYS_EXECVE: u64 = 40      // execve(path, path_len, args, args_len, env, env_len) -> never on success
-const SYS_SIGACTION: u64 = 41   // sigaction(sig, handler, mask, restorer, *SigAction old | 0) -> 0
+const SYS_SIGACTION: u64 = 41   // sigaction(sig, handler, mask, restorer, *SigAction old | 0, flags) -> 0
 const SYS_SIGPROCMASK: u64 = 42 // sigprocmask(how, set, *u64 old | 0) -> 0
 const SYS_SIGRETURN: u64 = 43   // sigreturn() -> never: the registers a handler interrupted, from its frame
 const SYS_KILL: u64 = 44        // kill(pid | 0 | -1 | -pgid, sig) -> 0
@@ -113,13 +113,19 @@ const SIG_SETMASK: u64 = 2
 // A signal's bit in a set: `1 << sig`.
 sig_bit(sig: u64) -> u64 = u64(1) << sig
 
+// `sigaction`'s flags. With SA_RESTART a system call the handled signal interrupted — one that would
+// have answered EINTR — is made again once the handler returns, instead of answering; `nanosleep` is
+// the exception, and answers EINTR with what was left either way. Linux's number.
+const SA_RESTART: u64 = 0x1000_0000
+
 // What `sigaction` answers about the action it replaced.
 struct SigAction
     handler: u64                // SIG_DFL, SIG_IGN or the handler's address
     mask: u64                   // blocked as well while the handler runs
     restorer: u64               // where the handler returns to
+    flags: u64                  // SA_RESTART, or 0
 
-@assert(sizeof(SigAction) == 24, "a SigAction is 24 bytes")
+@assert(sizeof(SigAction) == 32, "a SigAction is 32 bytes")
 
 // What delivering a signal to a handler puts on the stack, at the stack pointer the handler starts
 // with: the registers as they were — x0 to x30, then where the program was (ELR), its flags (SPSR) and

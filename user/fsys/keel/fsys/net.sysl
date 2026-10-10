@@ -1,0 +1,184 @@
+module keel.fsys
+
+// `sysl.net` on keel: the hooks of `sysl.net.sys`, over keel's UDP sockets — socket (25), bind (26),
+// recvfrom (27), sendto (28) and sockclose (29).
+//
+// keel has datagrams on one IPv4 interface and nothing else, so a stream socket, `listen`, `accept`
+// and `shutdown` answer `UNSUPPORTED`, and an IPv6 address EAFNOSUPPORT. What keel's calls do not keep
+// — a socket's receive timeout (keel's recvfrom takes one per call), the peer `connect` fixed, the port
+// it was bound to — is kept here, in a table indexed by the socket's number. A name resolves only when
+// it is an address written out (`10.0.2.2`): keel has no resolver.
+
+import abi.keel.abi.{SYS_BIND, SYS_RECVFROM, SYS_SENDTO, SYS_SOCKCLOSE, SYS_SOCKET, SockAddr}
+import rt.keel.user.{syscall, syscall5}
+import sysl.fs.IoError
+import sysl.net.sys as nsys
+import sysl.net.sys.Endpoint
+import sysl.sys.UNSUPPORTED
+
+// keel's socket numbers are 0 to 3: its stack has four.
+private const ROOM: usize = 4
+
+private var timeout_ms: [ROOM]u64 = [0; ROOM]
+private var connected: [ROOM]bool = [false; ROOM]
+private var peer: [ROOM]SockAddr = [SockAddr(0, 0, 0); ROOM]
+private var bound: [ROOM]u16 = [0; ROOM]
+
+// keel's address on its one interface, 10.0.2.15: what `local` names.
+private const OUR_IP: u32 = 0x0a00_020f
+
+private const EINVAL: int = 22
+private const ENOENT: int = 2
+private const EDESTADDRREQ: int = 89
+private const EAFNOSUPPORT: int = 97
+
+private failed(code: int) -> int = -IoError.Other(code).code()
+
+private known(fd: int) -> bool = fd >= 0 && usize(fd) < ROOM
+
+private keel_addr(e: *Endpoint) -> SockAddr =
+    SockAddr((u32(e.octets[0]) << 24) | (u32(e.octets[1]) << 16) | (u32(e.octets[2]) << 8) | u32(e.octets[3]),
+             e.port, 0)
+
+private endpoint(a: SockAddr) -> Endpoint
+    var o: [16]u8 = [0; 16]
+    o[0] = u8(a.ip >> 24)
+    o[1] = u8((a.ip >> 16) & 0xff)
+    o[2] = u8((a.ip >> 8) & 0xff)
+    o[3] = u8(a.ip & 0xff)
+    Endpoint(o, 0, a.port, 4)
+
+private addr_of(p: *SockAddr) -> u64 = u64(usize(p))
+
+@export("sysl_net_socket")
+net_socket(family: int, kind: int) -> int
+    if family != 4 then return failed(EAFNOSUPPORT)
+    if kind != nsys.datagram then return UNSUPPORTED
+    val r = syscall(SYS_SOCKET, 0, 0, 0, 0)
+    if r < 0 then return status(r)
+    if usize(r) >= ROOM
+        val _ = syscall(SYS_SOCKCLOSE, u64(r), 0, 0, 0)
+        return failed(EINVAL)
+    val sd = usize(r)
+    timeout_ms[sd] = 0
+    connected[sd] = false
+    bound[sd] = 0
+    int(r)
+
+@export("sysl_net_connect")
+net_connect(fd: int, to: *Endpoint) -> int
+    if !known(fd) then return failed(EINVAL)
+    if to.family != 4 then return failed(EAFNOSUPPORT)
+    peer[usize(fd)] = keel_addr(to)
+    connected[usize(fd)] = true
+    0
+
+@export("sysl_net_bind")
+net_bind(fd: int, at: *Endpoint) -> int
+    if !known(fd) then return failed(EINVAL)
+    if at.family != 4 then return failed(EAFNOSUPPORT)
+    val r = syscall(SYS_BIND, u64(fd), u64(at.port), 0, 0)
+    if r < 0 then return status(r)
+    bound[usize(fd)] = at.port
+    0
+
+@export("sysl_net_listen")
+net_listen(fd: int, backlog: int) -> int = UNSUPPORTED
+
+@export("sysl_net_accept")
+net_accept(fd: int, peer_at: *Endpoint) -> int = UNSUPPORTED
+
+@export("sysl_net_local")
+net_local(fd: int, at: *Endpoint) -> int
+    if !known(fd) || bound[usize(fd)] == 0 then return failed(EINVAL)
+    *at = endpoint(SockAddr(OUR_IP, bound[usize(fd)], 0))
+    0
+
+@export("sysl_net_send_to")
+net_send_to(fd: int, from: *u8, len: usize, to: *Endpoint) -> isize
+    if !known(fd) then return isize(failed(EINVAL))
+    if to.family != 4 then return isize(failed(EAFNOSUPPORT))
+    var a = keel_addr(to)
+    moved(syscall(SYS_SENDTO, u64(fd), u64(usize(from)), u64(len), addr_of(&a)))
+
+@export("sysl_net_recv_from")
+net_recv_from(fd: int, into: *u8, room: usize, from: *Endpoint) -> isize
+    if !known(fd) then return isize(failed(EINVAL))
+    var a = SockAddr(0, 0, 0)
+    val r = syscall5(SYS_RECVFROM, u64(fd), u64(usize(into)), u64(room), addr_of(&a), timeout_ms[usize(fd)])
+    if r >= 0 then *from = endpoint(a)
+    moved(r)
+
+@export("sysl_net_send")
+net_send(fd: int, from: *u8, len: usize) -> isize
+    if !known(fd) then return isize(failed(EINVAL))
+    if !connected[usize(fd)] then return isize(failed(EDESTADDRREQ))
+    var a = peer[usize(fd)]
+    moved(syscall(SYS_SENDTO, u64(fd), u64(usize(from)), u64(len), addr_of(&a)))
+
+// A connected socket takes datagrams from its peer only; one from anywhere else is dropped here, as
+// the kernel of a POSIX host drops it.
+@export("sysl_net_recv")
+net_recv(fd: int, into: *u8, room: usize) -> isize
+    if !known(fd) then return isize(failed(EINVAL))
+    if !connected[usize(fd)] then return isize(failed(EDESTADDRREQ))
+    val want = peer[usize(fd)]
+    loop
+        var a = SockAddr(0, 0, 0)
+        val r = syscall5(SYS_RECVFROM, u64(fd), u64(usize(into)), u64(room), addr_of(&a), timeout_ms[usize(fd)])
+        if r < 0 || (a.ip == want.ip && a.port == want.port) then return moved(r)
+
+@export("sysl_net_shutdown")
+net_shutdown(fd: int, how: int) -> int = UNSUPPORTED
+
+@export("sysl_net_close")
+net_close(fd: int) -> int
+    if known(fd) then connected[usize(fd)] = false
+    status(syscall(SYS_SOCKCLOSE, u64(fd), 0, 0, 0))
+
+// keel's sends never wait (no free buffer drops the datagram), so a write timeout has nothing to bound,
+// and no port outlives its socket, so there is nothing for `reuse_address` to allow.
+@export("sysl_net_option")
+net_option(fd: int, which: int, value: i64) -> int
+    if !known(fd) || value < 0 then return failed(EINVAL)
+    if which == nsys.read_timeout
+        timeout_ms[usize(fd)] = u64(value)
+        return 0
+    if which == nsys.write_timeout || which == nsys.reuse_address then return 0
+    failed(EINVAL)
+
+@export("sysl_net_resolve")
+net_resolve(host: *u8, host_len: usize, port: int, passive: int, out: *Endpoint, room: usize) -> int
+    if room == 0 || port < 0 || port > 0xffff then return failed(EINVAL)
+    if host_len == 0
+        if passive == 0 then return failed(ENOENT)
+        out[0] = endpoint(SockAddr(0, u16(port), 0))
+        return 1
+    dotted(host, host_len) match
+        Some(ip) ->
+            out[0] = endpoint(SockAddr(ip, u16(port), 0))
+            1
+        None -> failed(ENOENT)
+
+// `a.b.c.d`, each a decimal number up to 255, as an address; anything else is not one.
+private dotted(text: *u8, len: usize) -> Option[u32]
+    var ip: u32 = 0
+    var part: u32 = 0
+    var digits = 0
+    var parts = 0
+    for i in 0..<len
+        val c = text[i]
+        if c == u8('.')
+            if digits == 0 || parts == 3 then return None
+            ip = (ip << 8) | part
+            parts += 1
+            part = 0
+            digits = 0
+        elif c >= u8('0') && c <= u8('9')
+            part = part * 10 + u32(c - u8('0'))
+            digits += 1
+            if part > 255 || digits > 3 then return None
+        else
+            return None
+    if digits == 0 || parts != 3 then return None
+    Some((ip << 8) | part)

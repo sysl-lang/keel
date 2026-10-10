@@ -1,0 +1,111 @@
+// stdsig: the standard library's signals and process groups, checked from EL0. Each line is printed
+// only once its checks have passed; a failure prints `user: FAILED: …` and exits 1.
+//
+//   watch ok     `sysl.signal.watch(INT)`, then `raise(INT)`: `take` answers true once, then false
+//   restart ok   a read of a pipe, interrupted by a watched signal from a child, is made again and
+//                answers the byte the child writes after it — SA_RESTART — rather than EINTR
+//   ignore ok    dropping the watch put INT's default back; `ignore(INT)` and a `raise` this process
+//                survives
+//   group ok     `process_group()` is this process's group; a child started with `group: New` and
+//                `foreground` leads its own group, holds the console, and starts with INT at its
+//                default though this process ignores it; one started with `Join` is in that group;
+//                `set_foreground_group` takes the console back
+//
+// `stdsig leader` and `stdsig member <group>` are the two children: each checks what it was started
+// with and exits 0 if it was right.
+
+import abi.keel.abi.{SIGINT, SIG_DFL}
+import rt.keel.user
+import sysl.process
+import sysl.process.{Group, Status, Stdio}
+import sysl.signal
+import sysl.text.parse_int
+
+stop(what: string) -> never
+    print(s"user: FAILED: $what")
+    user.exit(1)
+
+check(ok: bool, what: string)
+    if !ok then stop(what)
+
+// Started as a job's leader: its group is its own pid, the console's foreground is that group, and
+// SIGINT is at its default — the action the call below replaces. Its standard input is a pipe, and it
+// stays (keeping its group alive for a member to join) until the pipe's writer closes it.
+leader() -> int
+    val me = int(user.getpid())
+    if process.process_group() != me then return 1
+    process.foreground_group() match
+        Ok(g) -> if g != me then return 2
+        Err(_) -> return 3
+    user.sigaction(SIGINT, SIG_DFL) match
+        Ok(old) -> if old.handler != SIG_DFL then return 4
+        Err(_) -> return 5
+    var room: [8]u8 = [0; 8]
+    loop
+        user.read(0, room[..]) match
+            Ok(0) -> return 0
+            Ok(_) -> ()
+            Err(_) -> return 6
+
+// Started to join group `want`.
+member(want: string) -> int = parse_int(want) match
+    Ok(g) -> if process.process_group() == int(g) then 0 else 1
+    Err(_) -> 2
+
+main(args: []string)
+    if args.len == 2 && args[1] == "leader" then user.exit(leader())
+    if args.len == 3 && args[1] == "member" then user.exit(member(args[2]))
+    check(args.len == 1, s"started with ${args.len} arguments it does not know")
+
+    watching()
+    val back = user.sigaction(SIGINT, SIG_DFL).unwrap()
+    check(back.handler == SIG_DFL, "the last watch of INT, dropped, did not put its default back")
+    check(signal.ignore(signal.INT).is_ok(), "ignore(INT)")
+    check(signal.raise(signal.INT).is_ok(), "raise(INT) while ignored")
+    print("stdsig: ignore ok")
+
+    val mine = process.process_group()
+    check(mine == int(user.getpgid().unwrap()), s"process_group() answered $mine")
+    var (hold, release) = process.pipe().unwrap()
+    var lead = process.spawn("/bin/stdsig", ["leader"], stdin = Stdio.FromFile(hold), group = Group.New,
+                             foreground = true).unwrap()
+    check(hold.close().is_ok(), "closing the leader's end of the pipe")
+    val g = lead.group()
+    check(g != mine, "the new group is this process's")
+    val joined = process.run("/bin/stdsig", ["member", s"$g"], group = Group.Join(g)).unwrap()
+    check(joined == Status.Exited(0), s"the member of group $g ended $joined")
+    check(release.close().is_ok(), "closing the pipe the leader waits on")
+    val led = lead.wait().unwrap()
+    check(led == Status.Exited(0), s"the leader ended $led")
+    check(process.set_foreground_group(mine).is_ok(), "taking the console back")
+    check(process.foreground_group().unwrap() == mine, "the console's group is not this process's again")
+    check(signal.restore_default(signal.INT).is_ok(), "restore_default(INT)")
+    print("stdsig: group ok")
+    user.exit(0)
+
+// The watch of INT lives for this call, and is the last one, so returning puts INT's default back.
+watching()
+    val w = signal.watch(signal.INT).unwrap()
+    check(!w.take(), "a watch began with an arrival")
+    check(signal.raise(signal.INT).is_ok(), "raise(INT)")
+    check(w.take(), "take() did not see the raised INT")
+    check(!w.take(), "take() saw the one INT twice")
+    print("stdsig: watch ok")
+
+    val (r, wr) = user.pipe().unwrap()
+    val waker = user.fork().unwrap()
+    if waker == 0
+        val _ = user.nanosleep(50_000_000)
+        val _ = signal.send(i64(user.getppid()), signal.INT)
+        val _ = user.nanosleep(50_000_000)
+        val _ = user.write_file(wr, "x".bytes)
+        user.exit(0)
+    var room: [8]u8 = [0; 8]
+    user.read(r, room[..]) match
+        Ok(n) -> check(n == 1 && room[0] == u8('x'), s"the restarted read answered $n bytes")
+        Err(e) -> stop(s"the read answered errno ${i64(e)} instead of being made again")
+    check(w.take(), "the INT that interrupted the read was not counted")
+    check(user.wait(i64(waker)).is_ok(), "waiting for the waker")
+    val _ = user.close(r)
+    val _ = user.close(wr)
+    print("stdsig: restart ok")

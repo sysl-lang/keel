@@ -1,11 +1,11 @@
 // udpecho <port> <seconds>: answer every UDP datagram sent to <port> with the same bytes, until one says
 // "bye" (answered too) or <seconds> pass with nothing arriving. Exits 0 after a "bye", 1 otherwise.
 //
-// The socket calls are keel.user's, not the standard library's: `sysl.posix.net` is TCP over C shims
-// and has no seam a target without a C library could answer (FINDINGS.md 54).
+// Written with `sysl.net`, whose hooks keel.fsys answers over keel's socket calls.
 
-import abi.keel.abi.{ETIMEDOUT, Errno}
 import rt.keel.user
+import sysl.fs.IoError
+import sysl.net.{resolve_passive, timed_out, udp_socket}
 import sysl.text.parse_int
 
 main(args: []string)
@@ -16,41 +16,48 @@ private serve(args: []string) -> int
         print("usage: udpecho <port> <seconds>")
         return 2
     val port = parse_int(args[1]) match
-        Ok(n) if n > 0 && n < 65536 -> u16(n)
+        Ok(n) if n > 0 && n < 65536 -> int(n)
         _ ->
             print("udpecho: not a port:", args[1])
             return 2
     val seconds = parse_int(args[2]) match
-        Ok(n) if n > 0 -> u64(n)
+        Ok(n) if n > 0 -> int(n)
         _ ->
             print("udpecho: not a number of seconds:", args[2])
             return 2
 
-    val sd = user.socket() match
-        Ok(s) -> s
+    val here = resolve_passive(port) match
+        Ok(found) -> found[0]
+        Err(e) -> return failed("resolve", e)
+    var s = udp_socket(here) match
+        Ok(sock) -> sock
         Err(e) -> return failed("socket", e)
-    user.bind(sd, port) match
+    defer s.close()
+    s.bind(here) match
         Ok(_) -> ()
         Err(e) -> return failed("bind", e)
+    s.read_timeout(seconds * 1000) match
+        Ok(_) -> ()
+        Err(e) -> return failed("read_timeout", e)
     print("udpecho: listening on port", port)
 
     var served = 0
     var buf: [1472]u8 = [0; 1472]
     loop
-        val (n, from) = user.recvfrom(sd, buf[..], seconds * 1000) match
+        val (n, from) = s.recv_from(buf[..]) match
             Ok(got) -> got
-            Err(ETIMEDOUT) ->
+            Err(e) if timed_out(e) ->
                 print("udpecho: nothing for", seconds, "seconds; served", served)
                 return 1
-            Err(e) -> return failed("recvfrom", e)
-        val data = buf[0..<usize(n)]
-        user.sendto(sd, data, from) match
+            Err(e) -> return failed("recv_from", e)
+        val data = buf[0..<n]
+        s.send_to(data, from) match
             Ok(_) -> served += 1
-            Err(e) -> return failed("sendto", e)
+            Err(e) -> return failed("send_to", e)
         if n == 3 && data[0] == u8('b') && data[1] == u8('y') && data[2] == u8('e')
             print("udpecho: bye after", served, "datagrams")
             return 0
 
-private failed(what: string, e: Errno) -> int
-    print("udpecho:", what, "failed, errno", i64(e))
+private failed(what: string, e: IoError) -> int
+    print("udpecho:", what, "failed:", e)
     1

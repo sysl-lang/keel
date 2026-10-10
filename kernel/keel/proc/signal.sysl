@@ -15,7 +15,8 @@ module keel.proc
 // exception masked: only NZCV is taken from the frame).
 
 import abi.keel.abi.{EFAULT, EINTR, EINVAL, ENOTTY, EPERM, ESRCH, Errno, INIT_PID, MAX_FDS, NSIG, ProcInfo,
-    SIGINT, SIGKILL, SIGSEGV, SIGSTOP, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_SETMASK, SIG_UNBLOCK, SigAction, SigFrame}
+    SA_RESTART, SIGINT, SIGKILL, SIGSEGV, SIGSTOP, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_SETMASK, SIG_UNBLOCK, SigAction,
+    SigFrame}
 import keel.console
 import keel.mm
 import keel.sched
@@ -43,9 +44,17 @@ private const NZCV: u64 = 0xf000_0000
 // across a signal come out wrong.
 private const RESTORE_CALLER_SAVED: bool = true
 
+// Off only to show what SA_RESTART is for: with it off an interrupted call answers EINTR whatever its
+// handler asked, and `stdsig`'s read of a pipe fails where it should have been made again.
+private const RESTART_CALLS: bool = true
+
 // Deliver what is pending for `p`, the calling thread's process, as it returns to user mode with
 // `regs`. May not return: a signal whose action is to end the process ends it here.
-private[proc] deliver(p: *Process, regs: *u64)
+//
+// `again` is the x0 a system call that has just answered EINTR was made with, when the call may be
+// made again; a handler whose action asks for SA_RESTART then returns to the `svc` itself, x0 as it
+// was, rather than to the EINTR.
+private[proc] deliver(p: *Process, regs: *u64, again: Option[u64] = None)
     loop
         val (sig, a) = sched.take(p)
         if sig == 0 then return
@@ -53,6 +62,12 @@ private[proc] deliver(p: *Process, regs: *u64)
         if a.handler == SIG_DFL
             if sched.default_ignores(sig) then continue
             end(p, sig, 0)
+        if RESTART_CALLS && (a.flags & SA_RESTART) != 0
+            again match
+                Some(x0) ->
+                    regs[0] = x0
+                    regs[PC] = regs[PC] - 4
+                None -> ()
         // A process whose stack cannot take the frame cannot run the handler.
         if !push_frame(p, regs, sig, a) then end(p, SIGSEGV, 0)
         return
@@ -95,11 +110,12 @@ private[proc] sys_sigreturn(p: *Process, regs: *u64) -> Result[i64, Errno]
     // The dispatcher writes the answer to x0: the one it had.
     Ok(i64(regs[0]))
 
-// sigaction(sig, handler, mask, restorer, *SigAction old | 0) -> 0
+// sigaction(sig, handler, mask, restorer, *SigAction old | 0, flags) -> 0
 private[proc] sys_sigaction(p: *Process, regs: *u64) -> Result[i64, Errno]
     val sig = regs[0]
-    val a = Action(regs[1], regs[2], regs[3])
+    val a = Action(regs[1], regs[2], regs[3], regs[5])
     if sig == 0 || sig >= NSIG || sig == SIGKILL || sig == SIGSTOP then return Err(EINVAL)
+    if (a.flags & ~SA_RESTART) != 0 then return Err(EINVAL)
     if a.handler != SIG_DFL && a.handler != SIG_IGN && a.restorer == 0 then return Err(EINVAL)
     val old_at = regs[4]
     if old_at != 0 && !mm.user_range(&p.space, old_at, u64(sizeof(SigAction)), true) then return Err(EFAULT)
@@ -111,7 +127,7 @@ private[proc] sys_sigaction(p: *Process, regs: *u64) -> Result[i64, Errno]
     if sched.ignores(s, sig) then s.pending.store(s.pending.load(Ordering.Relaxed) & ~sched.bit(sig), Ordering.Release)
     s.lock.unlock(flags)
     if old_at != 0
-        var o = SigAction(old.handler, old.mask, old.restorer)
+        var o = SigAction(old.handler, old.mask, old.restorer, old.flags)
         val b: *u8 = ptr_cast(&o)
         if !mm.copy_to_user(&p.space, old_at, b[0..<sizeof(SigAction)]) then return Err(EFAULT)
     Ok(0)

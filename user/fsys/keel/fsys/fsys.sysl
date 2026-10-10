@@ -1,8 +1,9 @@
 module keel.fsys
 
-// `sysl.fs` on keel: the twenty-five hooks `sysl.fs.sys` declares, the three of `sysl.io.sys` and the
-// four of `sysl.process.sys`, each `@export`ed under the name the standard library calls and answered
-// with keel's system calls (keel.abi).
+// The standard library on keel: the twenty-five hooks `sysl.fs.sys` declares, the three of
+// `sysl.io.sys` and eight of `sysl.process.sys` here, `sysl.signal.sys`'s in signal.sysl,
+// `sysl.net.sys`'s in net.sysl and `sysl.env.sys`'s in env.sysl — each `@export`ed under the name the standard library calls and
+// answered with keel's system calls (keel.abi).
 //
 // Every hook answers as a system call does — zero or more for success, the code of the `IoError` the
 // call failed with negated for an error — and `status` is the one place a kernel's error number becomes
@@ -11,7 +12,7 @@ module keel.fsys
 // answers `sysl.sys.UNSUPPORTED`, which `sysl.fs` reports as "not supported on this target".
 
 import abi.keel.abi.{EACCES, EBADF, EEXIST, EINTR, EISDIR, EMFILE, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EPERM,
-    Errno, SYS_KILL,
+    Errno, SPAWN_FOREGROUND, SPAWN_SETPGROUP, SYS_GETPGID, SYS_KILL, SYS_PIPE, SYS_TCGETPGRP, SYS_TCSETPGRP,
     ExitStatus, KIND_DIR, NO_FD, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, SYS_ACCESS, SYS_CHDIR, SYS_CHMOD,
     SYS_CLOSE,
     SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME,
@@ -31,7 +32,7 @@ import sysl.sys.UNSUPPORTED
 // is written out rather than passed through — `IoError`'s own reading of a number is the target's, and
 // ENOTEMPTY is 66 on a BSD — so a number the cases do not name goes over as `Other`, and ENOSYS, a call
 // this kernel does not have, is "unsupported", which is what it means to a program.
-private status(r: i64) -> int
+private[fsys] status(r: i64) -> int
     if r >= 0 then return 0
     Errno.try(-r) match
         Some(e) -> code_of(e)
@@ -240,7 +241,7 @@ realpath(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> int = UN
 //
 // These answer a count rather than 0; a failure is `status`'s answer, as for every hook.
 
-private moved(r: i64) -> isize = if r >= 0 then isize(r) else isize(status(r))
+private[fsys] moved(r: i64) -> isize = if r >= 0 then isize(r) else isize(status(r))
 
 // Reading the console waits for a whole line, so whatever `print` has collected — a prompt — goes out
 // first, as C's line-buffered standard output does before standard input is read.
@@ -260,19 +261,26 @@ io_flush(fd: int) -> int
     if fd == 1 then flush()
     0
 
-// --- sysl.process: the four hooks `sysl.process.sys` declares -------------------------------------------
+// --- sysl.process: the hooks of `sysl.process.sys` -------------------------------------------------
 //
-// keel's spawn (22), wait (23) and kill (44). The child's three standard streams and its environment go
+// keel's spawn (22), wait (23), pipe (36), kill (44), getpgid (46), tcsetpgrp (47) and tcgetpgrp (48). The child's three standard streams and its environment go
 // to keel's spawn as they are asked for; wait's POSIX status becomes an exit code or a signal. What it
 // cannot be told — a starting directory (the child takes the caller's) — answers `UNSUPPORTED` rather
 // than being dropped; so do a bounded wait and a temporary file.
 
+//
+// `pgid` is keel's SPAWN_SETPGROUP: `group_new` (0) asks for a group numbered by the child's pid, more
+// than 0 joins that group, and `group_inherit` leaves the child in this one; `foreground` adds
+// SPAWN_FOREGROUND, which makes the child's group the console's before it runs. keel's spawn starts
+// every child with every signal at its default and nothing blocked, so a job begins with INT, QUIT,
+// TSTP, TTIN, TTOU and CHLD reset whatever this program ignores.
 @export("sysl_proc_spawn")
 proc_spawn(path: *u8, path_len: usize, argv: *psys.Text, argc: usize, envp: *psys.Text, envc: usize,
            inherit_env: int, dir: *u8, dir_len: usize, stdin_fd: int, stdout_fd: int, stderr_fd: int,
-           started: *i64) -> i64
+           started: *i64, pgid: i64, foreground: int) -> i64
     *started = 0
     if dir_len != 0 then return i64(UNSUPPORTED)
+    if pgid < psys.group_inherit then return i64(-IoError.Other(22).code())
     // keel takes the argument vector as each argument followed by a NUL, and the environment the same
     // way: this program's own entries first when it is inherited, less any `envp` names again.
     var packed: Buf[u8] = buf()
@@ -288,8 +296,13 @@ proc_spawn(path: *u8, path_len: usize, argv: *psys.Text, argc: usize, envp: *psy
     for i in 0..<envc
         append_text(&env, envp[i])
         env.push(0)
+    var flags: u64 = 0
+    if pgid != psys.group_inherit
+        flags = SPAWN_SETPGROUP
+        if foreground != 0 then flags |= SPAWN_FOREGROUND
+    val group = if pgid > 0 then u64(pgid) else 0
     var attr = SpawnAttr([fd_of(stdin_fd), fd_of(stdout_fd), fd_of(stderr_fd)], u64(usize(as_ptr(env.view()))),
-                         u64(env.len()), 1, 0, 0)
+                         u64(env.len()), 1, flags, group)
     val r = syscall5(SYS_SPAWN, addr(path), u64(path_len), u64(usize(as_ptr(packed.view()))), u64(packed.len()),
                      u64(usize(&attr)))
     if r >= 0 then r else i64(status(r))
@@ -340,3 +353,48 @@ proc_kill(pid: i64, signal: int) -> int
 
 @export("sysl_proc_temp_path")
 proc_temp_path(into: *u8, room: usize) -> isize = isize(UNSUPPORTED)
+
+// keel's pipe (36). Neither end reaches a child it was not placed in: keel's spawn hands a child only
+// the three streams it names.
+@export("sysl_proc_pipe")
+proc_pipe(read_end: *int, write_end: *int) -> int
+    var fds: [2]u32 = [0, 0]
+    val r = syscall(SYS_PIPE, u64(usize(&fds[0])), 0, 0, 0)
+    if r < 0 then return status(r)
+    *read_end = int(fds[0])
+    *write_end = int(fds[1])
+    0
+
+// getpgid(0): the group this process is in.
+@export("sysl_proc_getpgrp")
+proc_getpgrp() -> i64
+    val r = syscall(SYS_GETPGID, 0, 0, 0, 0)
+    if r < 0 then i64(status(r)) else r
+
+// keel has one terminal, the console, and every process's controlling terminal is it; its calls only
+// ask that the descriptor they are handed be the console. So the first of 0, 1 and 2 that is answers
+// for the program, whatever the others were pointed at — and with none of them on it, the program has
+// no terminal to ask about: ENXIO.
+private const ENXIO: int = 6
+
+private console_fd() -> Option[u64]
+    for fd in 0..<3
+        if syscall(SYS_TCGETPGRP, u64(fd), 0, 0, 0) >= 0 then return Some(u64(fd))
+    None
+
+@export("sysl_proc_tcgetpgrp")
+proc_tcgetpgrp() -> i64
+    val fd = console_fd() match
+        Some(f) -> f
+        None -> return i64(-IoError.Other(ENXIO).code())
+    val r = syscall(SYS_TCGETPGRP, fd, 0, 0, 0)
+    if r < 0 then i64(status(r)) else r
+
+// keel has no stopped state, so a background group's tcsetpgrp earns no SIGTTOU to hold back.
+@export("sysl_proc_tcsetpgrp")
+proc_tcsetpgrp(pgid: i64) -> int
+    if pgid <= 0 then return -IoError.Other(22).code()
+    val fd = console_fd() match
+        Some(f) -> f
+        None -> return -IoError.Other(ENXIO).code()
+    status(syscall(SYS_TCSETPGRP, fd, u64(pgid), 0, 0))

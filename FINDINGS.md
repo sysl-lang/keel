@@ -1944,6 +1944,11 @@ that exists), as its subscript already is.
 
 ## 54. The standard library has no datagram socket, and its TCP module is C shims with no seam a target without a C library can answer
 
+**FIXED in sysl 0.1.0-alpha.6:** `sysl.net` (was `sysl.posix.net`) has `UdpSocket` beside the stream
+`Socket`, and every call goes through `sysl.net.sys`'s hooks, an address crossing as an `Endpoint`.
+keel.fsys answers them over keel's socket calls (net.sysl: datagrams only, a stream socket
+`UNSUPPORTED`, a numeric name resolving to itself), and `udpecho` is written with `sysl.net`.
+
 Milestone 11, `/bin/udpecho`. The program a socket API is for — bind a port, receive a datagram and
 its sender, send one back — cannot be written with the standard library on keel, for three reasons,
 each the shape findings 40, 48 and 49 had for files, standard input and processes:
@@ -2180,6 +2185,13 @@ target, as `%d` already is, so `%-6s` means the same with or without a C library
 
 ## 65. `sysl.env` has no hook layer, so a target with no C library can supply an environment only by impersonating libc
 
+**FIXED in sysl 0.1.0-alpha.6:** `sysl.env.sys` declares `sysl_env_get`, `sysl_env_count` and
+`sysl_env_entry`, text crossing as a pointer and a length; a freestanding program that reads its
+environment without answering them is refused at compile time, naming them. keel.fsys answers them
+(env.sysl) and `user/rt` no longer exports `getenv`. `environ` stays a `.data` word in the runtime,
+but only because `keel_user_start` sets it before `main` fills module storage — nothing outside the
+runtime names it now.
+
 Milestone 13, `/bin/env` and the shell's starting variables. `sysl.fs`, `sysl.io` and `sysl.process`
 each reach the system through a `*.sys` module of hooks a freestanding program answers with
 `@export`s (`sysl_fs_*`, `sysl_io_*`, `sysl_proc_*`). `sysl.env` does not: it names C's own
@@ -2318,6 +2330,16 @@ their whole runtime; or neither, with a target's own runtime the place for them,
 ## Milestone 15b: signals and job control
 
 ## 69. The standard library has no signal surface, and `sysl.process` cannot put a child in a process group or give it the terminal
+
+**FIXED in sysl 0.1.0-alpha.6:** `sysl.signal` (signals as counted flags: `watch`/`take`, `ignore`,
+`restore_default`, `send`, `raise`) over `sysl.signal.sys`'s five hooks, and `sysl.process` gained
+`Group` (`Inherit`, `New`, `Join`) and `foreground` on every start, `process_group`,
+`foreground_group` and `set_foreground_group`, over `sysl_proc_getpgrp`/`_tcgetpgrp`/`_tcsetpgrp` and
+`sysl_proc_spawn`'s new `pgid` and `foreground`. keel.fsys answers all of them (signal.sysl;
+`sysl_proc_spawn` maps them onto SPAWN_SETPGROUP/SPAWN_FOREGROUND), and `watch`'s SA_RESTART needed a
+kernel change: `sigaction` takes a sixth argument, `flags`, and a handled signal whose action has
+SA_RESTART returns the process to the `svc` of the call it interrupted. `stdsig` checks all of it from
+EL0. **The shell still goes through keel's spawn**; moving it onto `sysl.process` is the next item.
 
 Milestone 15b. keel now has POSIX-shaped signals (41 sigaction, 42 sigprocmask, 43 sigreturn, 44
 kill), process groups (45 setpgid, 46 getpgid) and a console foreground group (47 tcsetpgrp, 48
