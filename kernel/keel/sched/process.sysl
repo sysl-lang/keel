@@ -31,6 +31,7 @@ struct Process
     gid: u32                    // its one group; there are no supplementary groups
     env: &sync Env              // its environment, which a child is given unless its parent says otherwise
     pgid: u64                   // its process group
+    sid: u64                    // its session: a child's is its parent's; `setsid` starts one numbered by its pid
     term_signal: u64            // the signal that ended it; 0 when it called `exit`
     name: [NAME_ROOM]u8         // argv[0], cut to NAME_ROOM bytes, for `procs`
 

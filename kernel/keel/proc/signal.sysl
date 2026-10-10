@@ -226,18 +226,20 @@ private signal_group(pgid: u64, sig: u64)
 console_interrupt(pgid: u64) = signal_group(pgid, SIGINT)
 
 // Whether `p` may put a process in group `pgid`: one of its own user's processes is in it (root may
-// join any). There are no sessions to bound it further.
+// join any), and that process is in `p`'s session — a group never spans two.
 private[proc] group_joinable(p: *Process, pgid: u64) -> bool
     val flags = family.lock()
     var ok = false
     for i in 0..<MAX_PROCS
         val c = table[i]
-        if c != null && c.pgid == pgid && !c.ended && (p.uid == 0 || c.uid == p.uid) then ok = true
+        if c != null && c.pgid == pgid && !c.ended && c.sid == p.sid && (p.uid == 0 || c.uid == p.uid)
+            ok = true
     family.unlock(flags)
     ok
 
-// setpgid(pid | 0, pgid | 0) -> 0: the caller, or a child of its own, into group `pgid` — its own number
-// for 0, a new group then — or an existing group of the caller's user.
+// setpgid(pid | 0, pgid | 0) -> 0: the caller, or a child of its own in its session, into group `pgid` —
+// its own number for 0, a new group then — or an existing group of the caller's user in that session.
+// A session's leader stays in the group it leads: EPERM.
 private[proc] sys_setpgid(p: *Process, regs: *u64) -> Result[i64, Errno]
     val pid = if regs[0] == 0 then p.pid else regs[0]
     val pgid = if regs[1] == 0 then pid else regs[1]
@@ -248,9 +250,43 @@ private[proc] sys_setpgid(p: *Process, regs: *u64) -> Result[i64, Errno]
         val c = table[i]
         if c == null || c.pid != pid || c.ended then continue
         if c != p && c.ppid != p.pid then break
+        if c.sid == c.pid || c.sid != p.sid
+            family.unlock(flags)
+            return Err(EPERM)
         c.pgid = pgid
         family.unlock(flags)
         return Ok(0)
+    family.unlock(flags)
+    Err(ESRCH)
+
+// setsid() -> the new session's id: the caller made the leader of a new session numbered by its pid, and
+// of a new group of the same number in it. A caller whose pid already numbers a group — it leads one, or
+// a process it started is still in it — is EPERM, so a group never spans two sessions. keel has one
+// terminal and every descriptor on it reaches it, so leaving the old session leaves the console's
+// foreground group to that session: the new one can set it to none of its own groups (TIOCSPGRP checks
+// the session through `group_joinable`).
+private[proc] sys_setsid(p: *Process) -> Result[i64, Errno]
+    val flags = family.lock()
+    for i in 0..<MAX_PROCS
+        val c = table[i]
+        if c != null && !c.ended && c.pgid == p.pid
+            family.unlock(flags)
+            return Err(EPERM)
+    p.sid = p.pid
+    p.pgid = p.pid
+    family.unlock(flags)
+    Ok(i64(p.pid))
+
+// getsid(pid | 0) -> the session of the caller or of the process `pid`.
+private[proc] sys_getsid(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[0] == 0 || regs[0] == p.pid then return Ok(i64(p.sid))
+    val flags = family.lock()
+    for i in 0..<MAX_PROCS
+        val c = table[i]
+        if c != null && c.pid == regs[0]
+            val s = c.sid
+            family.unlock(flags)
+            return Ok(i64(s))
     family.unlock(flags)
     Err(ESRCH)
 

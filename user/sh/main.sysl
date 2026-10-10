@@ -36,11 +36,11 @@
 // status <n> <line>`, or `[n] killed by signal <n> <line>`. A job the shell has just signalled is given
 // up to half a second to end first, so that its report comes at the very next prompt.
 //
-// A job in the foreground runs through `sysl.process`: pipes, `Group.New`/`Join` and `foreground`. A
-// job in the background runs through keel's own spawn and is reaped with keel's wait that does not
-// block, which `sysl.process` has no counterpart of; `fg` waits for it the same way.
+// Every job runs through `sysl.process`: pipes, `Group.New`/`Join`, and `foreground` for one the shell
+// waits for. A background job's stages are kept as they were started and asked with `try_wait`, which
+// does not block, before each prompt; `fg` waits for them.
 
-import abi.keel.abi.{ENOENT, ExitStatus, NO_FD, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGINT, SIGTERM}
+import abi.keel.abi.{SIGINT, SIGTERM}
 import rt.keel.user
 import sysl.buf.{Buf, buf}
 import sysl.env
@@ -62,15 +62,14 @@ struct ShellVar
     value: string
     exported: bool
 
-// A background job: its number, its process group, the pids of its stages still running, the line
-// that started it, and how its last stage ended once it has.
+// A background job: its number, its process group, every stage that was started, which of them answers
+// for the job, and the line that started it.
 struct Job
     number: u64
-    pgid: u64
-    pids: Buf[u64]
-    last_pid: u64
+    pgid: int
+    stages: Buf[&Spawned]
+    last_at: usize              // the stage whose status is the job's; `stages.len()` when it never started
     text: string
-    last: Status
     signalled: bool             // the shell has just sent it a signal
 
 // What the shell keeps between lines: its variables, the last command's status, its process group and
@@ -185,12 +184,6 @@ assignment(t: Token) -> Option[(string, string)]
     if n == 0 || n == b.len || b[n] != u8('=') then return None
     Some((word_of(slice_buf(b[0..<n])), word_of(slice_buf(b[n + 1..]))))
 
-// Where a command is: a word with a `/` in it as it is, any other in /bin.
-path_of(name: string) -> string
-    for b in name.bytes
-        if b == u8('/') then return name
-    s"/bin/$name"
-
 // The line's commands, split at `|`, with each one's redirections taken out; None (and a message) if a
 // redirection has no file or a stage is empty.
 stages(toks: Buf[Token]) -> Option[Buf[Stage]]
@@ -236,24 +229,24 @@ exported_vars(sh: *Shell) -> Buf[Var]
         if v.exported then out.push(Var(v.name, v.value))
     out
 
-// The exported variables, as keel's spawn takes them.
-exported_entries(sh: *Shell) -> Buf[string]
-    var out: Buf[string] = buf()
-    for v in sh.vars.view()
-        if v.exported then out.push(s"${v.name}=${v.value}")
-    out
-
 // Say how a command that failed ended, and answer its status.
 reported(name: string, code: i64) -> i64
     if code != 0 then print(s"sh: $name: exit status $code")
     code
 
-// A job in the foreground — one command or a pipeline — through `sysl.process`: a pipe between each
-// two stages, every stage started before any is waited for, and the shell's copy of every file it
-// opened closed once the stage that needs it has its own — or no reader would ever see the end of its
-// input. The first stage starts a new process group, which is made the console's before its program
-// runs, and every later one joins it; the shell takes the console back once every stage has ended.
-run_foreground(sh: *Shell, all: Buf[Stage]) -> i64
+// A job's stages as they were started: each with its name, the job's process group (0 when nothing
+// started), and the status of a failure to start the last stage (0 when it started).
+struct Started
+    stages: Buf[(&Spawned, string)]
+    pgid: int
+    last: i64
+
+// A job — one command or a pipeline — started through `sysl.process`: a pipe between each two stages,
+// every stage started before any is waited for, and the shell's copy of every file it opened closed
+// once the stage that needs it has its own — or no reader would ever see the end of its input. The
+// first stage starts a new process group, made the console's before its program runs when the job is
+// in the `foreground`, and every later one joins it.
+start_job(sh: *Shell, all: Buf[Stage], foreground: bool) -> Started
     val env = exported_vars(sh)
     var started: Buf[(&Spawned, string)] = buf()
     var pgid = 0
@@ -287,7 +280,7 @@ run_foreground(sh: *Shell, all: Buf[Stage]) -> i64
         if last == 0
             val group = if pgid == 0 then Group.New else Group.Join(pgid)
             process.spawn(name, st.args.view()[1..], env = env.view(), inherit_env = false, stdin = reading(input),
-                          stdout = writing(output), group = group, foreground = pgid == 0) match
+                          stdout = writing(output), group = group, foreground = foreground && pgid == 0) match
                 Ok(child) ->
                     if pgid == 0 then pgid = child.group()
                     started.push((child, name))
@@ -299,11 +292,20 @@ run_foreground(sh: *Shell, all: Buf[Stage]) -> i64
                     last = 126
         closed(input)
         closed(output)
-    // Every stage is waited for; the status is the last stage's, if it was started.
-    var last_at = started.len()
-    if all.len() > 0 && started.len() > 0 && last == 0 then last_at = started.len() - 1
-    for i in 0..<started.len()
-        val (child, name) = started.at(i)
+    Started(started, pgid, last)
+
+// Which of a job's started stages answers for it: the last, if the last stage was started.
+last_stage(job: Started) -> usize
+    if job.stages.len() > 0 && job.last == 0 then job.stages.len() - 1 else job.stages.len()
+
+// A job in the foreground: every stage is waited for, the status is the last stage's if it was
+// started, and the shell takes the console back once every stage has ended.
+run_foreground(sh: *Shell, all: Buf[Stage]) -> i64
+    val job = start_job(sh, all, true)
+    var last = job.last
+    val last_at = last_stage(job)
+    for i in 0..<job.stages.len()
+        val (child, name) = job.stages.at(i)
         child.wait() match
             Ok(s) -> if i == last_at then last = status_of(name, s)
             Err(_) -> ()
@@ -333,69 +335,20 @@ writing(f: Option[File]) -> Stdio = f match
     Some(g) -> Stdio.ToFile(g)
     None -> Stdio.Inherit
 
-// A job in the background, through keel's own calls, laid out as `run_foreground` lays one out but
-// remembered rather than waited for: its stages are reaped by `reap_jobs` with a wait that does not
-// block, which `sysl.process` does not have.
+// A job in the background: started as `run_foreground` starts one, but kept rather than waited for —
+// `reap_jobs` asks its stages with `try_wait` before each prompt. The shell says the job's number and
+// its process group, the number `kill` and `fg` act on.
 run_background(sh: *Shell, all: Buf[Stage], text: string) -> i64
-    val env = exported_entries(sh)
-    var started: Buf[(u64, string)] = buf()
-    var pgid: u64 = 0
-    var last: i64 = 0
-    var from_prev = NO_FD
-    for i in 0..<all.len()
-        val st = all.at(i)
-        val name = st.args.at(0)
-        var input = from_prev
-        var output = NO_FD
-        from_prev = NO_FD
-        if i + 1 < all.len()
-            user.pipe() match
-                Ok((r, w)) ->
-                    output = w
-                    from_prev = r
-                Err(e) ->
-                    print(s"sh: cannot make a pipe: ${user.describe(e)}")
-                    close_fd(input)
-                    last = 1
-                    break
-        last = 0
-        if st.input != ""
-            close_fd(input)
-            input = opened_fd(st.input, O_RDONLY)
-            if input == NO_FD then last = 1
-        if st.output != ""
-            close_fd(output)
-            output = opened_fd(st.output, O_WRONLY | O_CREAT | (if st.append then O_APPEND else O_TRUNC))
-            if output == NO_FD then last = 1
-        if last == 0
-            val group = if pgid == 0 then user.NEW_GROUP else pgid
-            user.spawn(path_of(name), st.args.view(), stdin = input, stdout = output, env = Some(env.view()),
-                    group = group) match
-                Ok(pid) ->
-                    started.push((pid, name))
-                    if pgid == 0 then pgid = pid
-                Err(ENOENT) ->
-                    print(s"sh: $name: not found")
-                    last = 127
-                Err(e) ->
-                    print(s"sh: $name: cannot run it: ${user.describe(e)}")
-                    last = 126
-        close_fd(input)
-        close_fd(output)
-    var last_pid: u64 = 0
-    if all.len() > 0 && started.len() > 0 && last == 0
-        val (pid, _) = started.at(started.len() - 1)
-        last_pid = pid
-    if started.len() == 0 then return last
-    var pids: Buf[u64] = buf()
-    for (pid, _) in started.view()
-        pids.push(pid)
+    val job = start_job(sh, all, false)
+    if job.stages.len() == 0 then return job.last
+    var stages: Buf[&Spawned] = buf()
+    for (child, _) in job.stages.view()
+        stages.push(child)
     var number: u64 = 1
     for j in sh.jobs.view()
         if j.number >= number then number = j.number + 1
-    sh.jobs.push(Job(number, pgid, pids, last_pid, text, Status.Exited(0), false))
-    val (newest, _) = started.at(started.len() - 1)
-    print(s"[$number] $newest")
+    sh.jobs.push(Job(number, job.pgid, stages, last_stage(job), text, false))
+    print(s"[$number] ${job.pgid}")
     0
 
 // Make the shell's own group the console's foreground group again.
@@ -407,19 +360,15 @@ take_console(sh: *Shell)
 foreground(sh: *Shell, j: usize) -> i64
     val job = sh.jobs.at(j)
     sh.jobs.remove(j)
-    val _ = process.set_foreground_group(int(job.pgid))
+    val _ = process.set_foreground_group(job.pgid)
     print(job.text)
     var last: i64 = 0
-    for pid in job.pids.view()
-        user.wait(i64(pid)) match
-            Ok((_, s)) ->
-                if pid == job.last_pid then last = status_of(job.text, ended(s))
+    for i in 0..<job.stages.len()
+        job.stages.at(i).wait() match
+            Ok(s) -> if i == job.last_at then last = status_of(job.text, s)
             Err(_) -> ()
     take_console(sh)
     last
-
-// keel's exit status as `sysl.process` says one.
-ended(s: ExitStatus) -> Status = if s.signalled() then Status.Signalled(int(s.signal())) else Status.Exited(int(s.code()))
 
 // The job a `%n` word names, as an index into the job list; the newest for "".
 job_named(sh: *Shell, word: string) -> Option[usize]
@@ -442,25 +391,34 @@ reap_jobs(sh: *Shell)
     while i < sh.jobs.len()
         var job = sh.jobs.at(i)
         var naps = if job.signalled then 50 else 0
-        loop
-            var left: Buf[u64] = buf()
-            for pid in job.pids.view()
-                user.poll(i64(pid)) match
-                    Ok(Some((_, s))) ->
-                        if pid == job.last_pid then job.last = ended(s)
-                    Ok(None) -> left.push(pid)
-                    Err(_) -> ()
-            job.pids = left
-            if job.pids.len() == 0 || naps == 0 then break
+        while !finished(job) && naps > 0
             naps -= 1
             val _ = user.nanosleep(10_000_000)
         job.signalled = false
-        if job.pids.len() > 0
+        if !finished(job)
             sh.jobs.set(i, job)
             i += 1
             continue
         sh.jobs.remove(i)
-        print(s"[${job.number}] ${ending(job.last)} ${job.text}")
+        print(s"[${job.number}] ${ending(job_status(job))} ${job.text}")
+
+// Whether every stage of `job` has ended. `try_wait` reaps a stage that has and remembers how it ended,
+// so asking again answers at once; a stage it cannot ask about counts as ended.
+finished(job: Job) -> bool
+    var all = true
+    for child in job.stages.view()
+        child.try_wait() match
+            Ok(None) -> all = false
+            _ -> ()
+    all
+
+// How a job that has finished ended: its last stage's status, or done when that stage never started.
+job_status(job: Job) -> Status
+    if job.last_at < job.stages.len()
+        job.stages.at(job.last_at).try_wait() match
+            Ok(Some(s)) -> return s
+            _ -> ()
+    Status.Exited(0)
 
 // How a background job ended, as its report says it.
 ending(s: Status) -> string = s match
@@ -518,16 +476,6 @@ signal_named(word: string) -> u64
         "TERM" -> 15
         "CHLD" -> 17
         else 0
-
-// A file for `<`, `>` or `>>`, opened with `flags`; NO_FD (and a message) if it cannot be.
-opened_fd(file: string, flags: u64) -> u64 = user.open(file, flags) match
-    Ok(fd) -> fd
-    Err(e) ->
-        print(s"sh: $file: cannot open it: ${user.describe(e)}")
-        NO_FD
-
-close_fd(fd: u64)
-    if fd != NO_FD then val _ = user.close(fd)
 
 // How the pipeline's last stage ended, said if it failed, as its status.
 status_of(name: string, s: Status) -> i64 = s match
@@ -642,9 +590,8 @@ for (name, value) in env.vars()
     set_var(&sh, name, value, true)
 
 // A group of its own, the console's while it reads a line, and Ctrl-C ignored: it is the job's to take.
-// Each of these may fail where the input is not the console, which changes nothing else. Becoming a
-// group's leader is keel's own call: `sysl.process` puts a child in a group, never this program.
-val _ = user.setpgid(0, 0)
+// Each of these may fail where the input is not the console, which changes nothing else.
+val _ = process.set_process_group()
 sh.pgid = process.process_group()
 take_console(&sh)
 val _ = signal.ignore(int(SIGINT))

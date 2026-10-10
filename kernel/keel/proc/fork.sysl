@@ -36,10 +36,11 @@ private[proc] sys_clone(p: *Process, regs: *u64) -> Result[i64, Errno]
     val space = mm.fork_space(&p.space) match
         Some(s) -> s
         None -> return Err(ENOMEM)
-    // The child has its parent's signal actions and blocked set, nothing pending, and its process group.
+    // The child has its parent's signal actions and blocked set, nothing pending, its process group and
+    // its session.
     val child: &sync Process = Process(new_pid(), space, p.heap_base, p.brk, Context([0; 12], 0, 0),
         sched.copied_signals(p.sig), 0, 0, None, 0, sched.no_files(), p.cwd, p.cwd_len, p.pid, false, None, p.uid,
-        p.gid, copied_env(p), p.pgid, 0, p.name)
+        p.gid, copied_env(p), p.pgid, p.sid, 0, p.name)
     val raw: *Process = &*child
     for fd in 0..<sched.OPEN_FILES
         raw.files[fd] = p.files[fd]

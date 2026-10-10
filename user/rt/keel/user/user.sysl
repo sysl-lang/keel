@@ -13,7 +13,7 @@ import abi.keel.abi.{AF_INET, ANY_CHILD, AT_FDCWD, AT_REMOVEDIR, EACCES, EINTR, 
     SO_RCVTIMEO, SPAWN_FOREGROUND, SPAWN_SETPGROUP, STDOUT, SYS_BIND, SYS_BRK, SYS_CLONE, SYS_CLOSE, SYS_DUP, SYS_DUP3,
     SYS_EXIT, SYS_FSTAT, SYS_GETDENTS64, SYS_GETPGID, SYS_GETPID, SYS_GETPPID, SYS_IOCTL, SYS_KILL, SYS_LSEEK,
     SYS_MKDIRAT, SYS_NANOSLEEP, SYS_NEWFSTATAT, SYS_OPENAT, SYS_PIPE2, SYS_PROCS, SYS_READ, SYS_RECVFROM,
-    SYS_RENAMEAT, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK, SYS_SENDTO, SYS_SETPGID, SYS_SETSOCKOPT, SYS_SOCKET,
+    SYS_RENAMEAT, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK, SYS_SENDTO, SYS_SETSOCKOPT, SYS_SOCKET,
     SYS_SPAWN, SYS_SYNC, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE, SigAction, SockAddrIn, SpawnAttr, Stat, TIOCGPGRP,
     TIOCSPGRP, Timespec, Timeval, WNOHANG, empty_stat, sock_addr_in}
 import sysl.buf.{Buf, buf}
@@ -340,8 +340,8 @@ describe(e: Errno) -> string = e match
 // --- Signals and process groups --------------------------------------------------------------------
 //
 // keel.abi's signal calls. `sysl.signal` (signals as counted flags) and `sysl.process`'s groups and
-// foreground reach them through keel.fsys's hooks; a program that wants a handler of its own, a mask or
-// `setpgid` calls these directly.
+// foreground reach them through keel.fsys's hooks, as does putting this program in a group or a session
+// of its own; a program that wants a handler of its own or a mask calls these directly.
 //
 // The restorer every handler returns to: it makes `rt_sigreturn` (139), which puts back the registers
 // the signal interrupted (keel.abi's `SigFrame`). Linux's `sa_restorer`, kept in the runtime rather
@@ -380,8 +380,6 @@ sigprocmask(how: u64, set: u64) -> Result[u64, Errno]
 
 // Send `sig` to process `pid`, to the caller's group for 0, to group `g` for -g.
 kill(pid: i64, sig: u64) -> Result[unit, Errno] = done(call(SYS_KILL, u64(pid), sig, 0, 0))
-
-setpgid(pid: u64, pgid: u64) -> Result[unit, Errno] = done(call(SYS_SETPGID, pid, pgid, 0, 0))
 
 getpgid(pid: u64 = 0) -> Result[u64, Errno] = answer(call(SYS_GETPGID, pid, 0, 0, 0))
 

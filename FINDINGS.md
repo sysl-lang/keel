@@ -2425,6 +2425,15 @@ with job control the business of a target's own runtime, as now.
 
 ## 70. `sysl.process` has no wait that does not block, so a shell cannot hold a background job as a `Spawned`
 
+**FIXED in sysl 0.1.0-alpha.7:** `Spawned.try_wait()` and `Child.try_wait()` (`None` while the child
+runs; the answer remembered, so `wait` after it answers at once) over a `sysl_proc_poll` hook, which
+keel.fsys answers with `wait4(pid, …, WNOHANG)`. The shell lays every job out once (`start_job`): a
+background job keeps its `&Spawned` stages and `reap_jobs` asks them with `try_wait` before each
+prompt; `fg` waits for them. `run_background`'s second layout on keel's calls is gone, and so is the
+shell's use of `user.poll`/`user.wait`/`user.spawn`. The boot test's `true | false &` is reported
+`[1] exit status 1 true | false`. Left open: `Spawned` has no accessor for its pid, so `cmd &` prints
+the job's process group (`group()`) — the first stage's pid, not the last one's as a POSIX shell does.
+
 The shell's `cmd &`, `jobs` and the `[n] done …` report before each prompt need to ask whether a stage
 has ended without waiting for it — POSIX's `waitpid(pid, WNOHANG)`, Rust's `Child::try_wait`. `Spawned`
 has `wait` (`@blocks`) and `kill`, and the hook has no non-blocking mode (`sysl_proc_wait`'s `timeout_ms`
@@ -2457,6 +2466,14 @@ not to block (a `how` flag, or `timeout_ms` of a value that means "now, without 
 
 ## 71. `sysl.process` can put a child in a process group, but cannot make the calling program a group's leader
 
+**FIXED in sysl 0.1.0-alpha.7, both shapes:** `set_process_group(pgid: int = 0)` over `sysl_proc_setpgid`
+and `new_session()` over `sysl_proc_setsid`. keel.fsys answers them with `setpgid(0, pgid)` (154) and
+`setsid` (157), which keel gained for it, with `getsid` (156): `Process.sid`, inherited by spawn and
+fork, a kernel-started process leading its own; a group never spans two sessions (`setpgid`,
+`spawn`'s group and `TIOCSPGRP` are bounded to the caller's), a session's leader stays in its group,
+and a caller whose pid numbers a group is refused a session. The shell's `user.setpgid(0, 0)` is
+`process.set_process_group()`, and `user.setpgid` is gone. `stdsig: session ok` checks both from EL0.
+
 A job-control shell starts by putting itself in a group of its own and taking the terminal, so that a
 Ctrl-C at its prompt does not reach whatever started it (on keel, init and login). alpha.6 gives the
 second half — `set_foreground_group(process_group())` — but the first has no call:
@@ -2477,6 +2494,10 @@ this program's pid) over a `sysl_proc_setpgid` hook, beside `process_group`; or 
 `new_session()` (`setsid`), which is what a login program does for the shell it starts.
 
 ## 72. An imported enum variant loses to another file's private constant of the same name (bug, minor)
+
+**FIXED in sysl 0.1.0-alpha.7:** the reduction below builds, and the spawn and exec hooks' `PATH`
+search writes `i64(ENOENT)` again, the import of keel.abi's variant beside net.sysl's `private const
+ENOENT`.
 
 keel.fsys's fsys.sysl imports `ENOENT` (a variant of keel.abi's `enum Errno: i64`); its net.sysl, in the
 same module, declares `private const ENOENT: int = 2`. In fsys.sysl, `i64(ENOENT)` resolves to net.sysl's

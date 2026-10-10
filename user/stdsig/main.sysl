@@ -10,12 +10,16 @@
 //                `foreground` leads its own group, holds the console, and starts with INT at its
 //                default though this process ignores it; one started with `Join` is in that group;
 //                `set_foreground_group` takes the console back
+//   session ok   a child moves into a group of its own and back (`set_process_group`); another starts
+//                a session (`new_session`) and is then refused a second one, a group of its own and
+//                this process's group; this process, leading its group, is refused a session
 //
-// `stdsig leader` and `stdsig member <group>` are the two children: each checks what it was started
-// with and exits 0 if it was right.
+// `stdsig leader`, `stdsig member <group>`, `stdsig regroup <group>` and `stdsig session <group>` are
+// the children: each checks what it was started with and exits 0 if it was right.
 
 import abi.keel.abi.{SIGINT, SIG_DFL}
 import rt.keel.user
+import sysl.fs.IoError
 import sysl.process
 import sysl.process.{Group, Status, Stdio}
 import sysl.signal
@@ -52,9 +56,50 @@ member(want: string) -> int = parse_int(want) match
     Ok(g) -> if process.process_group() == int(g) then 0 else 1
     Err(_) -> 2
 
+// Started in its parent's group `back`: made the leader of a group of its own, and moved back.
+regroup(back: string) -> int
+    val g = parse_int(back) match
+        Ok(g) -> int(g)
+        Err(_) -> return 1
+    val me = int(user.getpid())
+    if process.process_group() != g then return 2
+    if process.set_process_group().is_err() then return 3
+    if process.process_group() != me then return 4
+    if process.set_process_group(g).is_err() then return 5
+    if process.process_group() != g then return 6
+    0
+
+// Started in its parent's group `back`, so leading none: made the leader of a new session numbered by
+// its pid, and of a group of the same number. Then, leading both, a second session is refused, as are
+// a group of its own (a session's leader stays in the group it leads) and its parent's group, which is
+// in the other session.
+session(back: string) -> int
+    val g = parse_int(back) match
+        Ok(g) -> int(g)
+        Err(_) -> return 1
+    val me = int(user.getpid())
+    if process.process_group() != g then return 2
+    process.new_session() match
+        Ok(sid) -> if sid != me then return 3
+        Err(_) -> return 4
+    if process.process_group() != me then return 5
+    process.new_session() match
+        Err(IoError.NotPermitted) -> ()
+        _ -> return 6
+    process.set_process_group() match
+        Err(IoError.NotPermitted) -> ()
+        _ -> return 7
+    process.set_process_group(g) match
+        Err(IoError.NotPermitted) -> ()
+        _ -> return 8
+    if process.process_group() != me then return 9
+    0
+
 main(args: []string)
     if args.len == 2 && args[1] == "leader" then user.exit(leader())
     if args.len == 3 && args[1] == "member" then user.exit(member(args[2]))
+    if args.len == 3 && args[1] == "regroup" then user.exit(regroup(args[2]))
+    if args.len == 3 && args[1] == "session" then user.exit(session(args[2]))
     check(args.len == 1, s"started with ${args.len} arguments it does not know")
 
     watching()
@@ -81,6 +126,16 @@ main(args: []string)
     check(process.foreground_group().unwrap() == mine, "the console's group is not this process's again")
     check(signal.restore_default(signal.INT).is_ok(), "restore_default(INT)")
     print("stdsig: group ok")
+
+    val moved = process.run("/bin/stdsig", ["regroup", s"$mine"], group = Group.Join(mine)).unwrap()
+    check(moved == Status.Exited(0), s"the child that changed groups ended $moved")
+    val led_session = process.run("/bin/stdsig", ["session", s"$mine"], group = Group.Join(mine)).unwrap()
+    check(led_session == Status.Exited(0), s"the child that started a session ended $led_session")
+    process.new_session() match
+        Err(IoError.NotPermitted) -> ()
+        _ -> stop("a group's leader was not refused a session")
+    check(process.process_group() == mine, "this process left its group")
+    print("stdsig: session ok")
     user.exit(0)
 
 // The watch of INT lives for this call, and is the last one, so returning puts INT's default back.

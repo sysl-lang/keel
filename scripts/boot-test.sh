@@ -252,6 +252,8 @@ session2=(
     '@wait sigtest: waiting for Ctrl-C'
     '@intr'
     'stdsig'
+    'true | false &'
+    'sleep 1'
     'sleep 100 &'
     'jobs'
     'ps'
@@ -293,7 +295,10 @@ transcript2=(
     $'sigtest: sigchld ok\nsigtest: waiting for Ctrl-C\nsigtest: registers intact across Ctrl-C\n'   # a handler, and back
     $'# stdsig\nstdsig: watch ok\nstdsig: restart ok\nstdsig: ignore ok\nstdsig: group ok\n'   # sysl.signal and
                                                 # sysl.process groups through keel.fsys's hooks; SA_RESTART
-    $'# sleep 100 &\n[1] '                      # a background job: its number and pid
+    $'stdsig: session ok\n'                     # set_process_group and new_session (setpgid, setsid 157)
+    $'# true | false &\n[1] '                   # a background pipeline that ends by itself: reaped by
+    $'[1] exit status 1 true | false\n'         # try_wait (sysl_proc_poll), its last stage's status
+    $'# sleep 100 &\n[1] '                      # a background job: its number and process group
     $'\n# jobs\n[1] running sleep 100\n'
     $'# ps\n  PID  PPID  PGID   UID CMD\n    1     0     1     0 init\n'   # the table, init first
     $'     0 sleep\n'                           # ...the background sleep in it

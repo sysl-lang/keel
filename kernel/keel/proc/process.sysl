@@ -95,7 +95,7 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
     val pid = new_pid()
     val p: &sync Process = Process(pid, l.space, l.heap_base, l.heap_base, Context([0; 12], 0, 0),
         sched.fresh_signals(), 0, 0, None, 0, sched.no_files(), sched.root_dir(), 1, 0, false, None, run_as.uid,
-        run_as.gid, sched.env_of(env), pid, 0, name_from(args))
+        run_as.gid, sched.env_of(env), pid, pid, 0, name_from(args))
     val raw: *Process = &*p
     for fd in 0..<3
         raw.files[fd] = std[fd]
@@ -103,6 +103,7 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
         raw.ppid = parent.pid
         raw.cwd = parent.cwd
         raw.cwd_len = parent.cwd_len
+        raw.sid = parent.sid
         if group.pgid == INHERIT_GROUP then raw.pgid = parent.pgid
     if group.pgid != INHERIT_GROUP && group.pgid != NEW_GROUP then raw.pgid = group.pgid
     if group.foreground && FOREGROUND_AT_SPAWN then console.set_foreground(raw.pgid)

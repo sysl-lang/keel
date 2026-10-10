@@ -17,8 +17,8 @@ import abi.keel.abi.{AT_FDCWD, AT_REMOVEDIR, DIRENT64_NAME, EACCES, EBADF, EEXIS
     O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PATH_ROOM, SPAWN_FOREGROUND, SPAWN_SETPGROUP, SYS_CHDIR, SYS_CLOSE,
     SYS_EXECVE, SYS_FACCESSAT, SYS_FCHMODAT, SYS_FCHOWNAT, SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS64,
     SYS_GETGID, SYS_GETPGID, SYS_GETUID, SYS_IOCTL, SYS_KILL, SYS_LSEEK, SYS_MKDIRAT, SYS_NEWFSTATAT, SYS_OPENAT,
-    SYS_PIPE2, SYS_READ, SYS_RENAMEAT, SYS_SETGID, SYS_SETUID, SYS_SPAWN, SYS_TRUNCATE, SYS_UNLINKAT, SYS_WAIT4,
-    SYS_WRITE, SpawnAttr, Stat, TIOCGPGRP, TIOCSPGRP, empty_stat}
+    SYS_PIPE2, SYS_READ, SYS_RENAMEAT, SYS_SETGID, SYS_SETPGID, SYS_SETSID, SYS_SETUID, SYS_SPAWN, SYS_TRUNCATE,
+    SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE, SpawnAttr, Stat, TIOCGPGRP, TIOCSPGRP, WNOHANG, empty_stat}
 import rt.keel.user.{environment, flush, syscall, syscall5, syscall6}
 import sysl.buf.{Buf, buf}
 import sysl.fs.IoError
@@ -364,11 +364,11 @@ proc_spawn(path: *u8, path_len: usize, argv: *psys.Text, argc: usize, envp: *psy
     val group = if pgid > 0 then u64(pgid) else 0
     var attr = SpawnAttr([fd_of(stdin_fd), fd_of(stdout_fd), fd_of(stderr_fd)], u64(usize(as_ptr(env.view()))),
                          u64(env.len()), 1, flags, group)
-    var r = -i64(Errno.ENOENT)
+    var r = -i64(ENOENT)
     for c in searched(path, path_len, env.view()).view()
         r = syscall5(SYS_SPAWN, u64(usize(as_ptr(c.view()))), u64(c.len()), u64(usize(as_ptr(packed.view()))),
                      u64(packed.len()), u64(usize(&attr)))
-        if r != -i64(Errno.ENOENT) then break
+        if r != -i64(ENOENT) then break
     if r >= 0 then r else i64(status(r))
 
 // Where a program is looked for, in order: `path` itself when it names a directory (it has a `/`), and
@@ -445,13 +445,13 @@ proc_exec(path: *u8, path_len: usize, argv: *psys.Text, argc: usize, envp: *psys
     val arg_ptrs = pointers_to(packed.view())
     val env_ptrs = pointers_to(env.view())
     flush()
-    var r = -i64(Errno.ENOENT)
+    var r = -i64(ENOENT)
     for c in searched(path, path_len, env.view()).view()
         var named = c
         named.push(0)
         r = syscall(SYS_EXECVE, u64(usize(as_ptr(named.view()))), u64(usize(as_ptr(arg_ptrs.view()))),
                     u64(usize(as_ptr(env_ptrs.view()))), 0)
-        if r != -i64(Errno.ENOENT) then break
+        if r != -i64(ENOENT) then break
     if r < 0 then status(r) else -IoError.Other(5).code()
 
 // A pointer to each NUL-ended string of `packed`, then a null one: an `argv` or `envp` as execve takes
@@ -519,6 +519,33 @@ proc_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> in
         *how = psys.ended_signalled
         *value = int(s.signal())
     0
+
+// wait4 with WNOHANG: 0 while the child runs, 1 once it has ended and been reaped.
+@export("sysl_proc_poll")
+proc_poll(pid: i64, how: *int, value: *int) -> int
+    var s = ExitStatus(0)
+    val r = syscall(SYS_WAIT4, u64(pid), u64(usize(&s)), WNOHANG, 0)
+    if r < 0 then return status(r)
+    if r == 0 then return 0
+    if s.exited()
+        *how = psys.ended_exited
+        *value = int(s.code())
+    else
+        *how = psys.ended_signalled
+        *value = int(s.signal())
+    1
+
+// setpgid(0, pgid): this process into group `pgid`, or a new group of its own for 0.
+@export("sysl_proc_setpgid")
+proc_setpgid(pgid: i64) -> int
+    if pgid < 0 then return -IoError.Other(22).code()
+    status(syscall(SYS_SETPGID, 0, u64(pgid), 0, 0))
+
+// setsid: a new session led by this process, answering its id.
+@export("sysl_proc_setsid")
+proc_setsid() -> i64
+    val r = syscall(SYS_SETSID, 0, 0, 0, 0)
+    if r < 0 then i64(status(r)) else r
 
 // kill(2), with POSIX's numbering.
 @export("sysl_proc_kill")
