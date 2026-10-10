@@ -1,7 +1,7 @@
 module keel.fsys
 
-// The standard library on keel: the twenty-five hooks `sysl.fs.sys` declares, the three of
-// `sysl.io.sys` and eight of `sysl.process.sys` here, `sysl.signal.sys`'s in signal.sysl,
+// The standard library on keel: the twenty-six hooks `sysl.fs.sys` declares, the three of
+// `sysl.io.sys` and eleven of `sysl.process.sys` here, `sysl.signal.sys`'s in signal.sysl,
 // `sysl.net.sys`'s in net.sysl and `sysl.env.sys`'s in env.sysl — each `@export`ed under the name the standard library calls and
 // answered with keel's system calls (keel.abi).
 //
@@ -14,10 +14,10 @@ module keel.fsys
 import abi.keel.abi.{EACCES, EBADF, EEXIST, EINTR, EISDIR, EMFILE, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EPERM,
     Errno, SPAWN_FOREGROUND, SPAWN_SETPGROUP, SYS_GETPGID, SYS_KILL, SYS_PIPE, SYS_TCGETPGRP, SYS_TCSETPGRP,
     ExitStatus, KIND_DIR, NO_FD, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, SYS_ACCESS, SYS_CHDIR, SYS_CHMOD,
-    SYS_CLOSE,
+    SYS_CHOWN, SYS_CLOSE, SYS_EXECVE, SYS_GETGID, SYS_GETUID, SYS_SETGID, SYS_SETUID,
     SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME,
     SYS_RMDIR, SYS_SPAWN, SYS_STAT, SYS_TRUNCATE, SYS_UNLINK, SYS_WAIT, SYS_WRITE, SpawnAttr}
-import rt.keel.user.{environment, flush, syscall, syscall5}
+import rt.keel.user.{environment, flush, syscall, syscall5, syscall6}
 import sysl.buf.{Buf, buf}
 import sysl.fs.IoError
 import sysl.fs.sys as fsys
@@ -147,6 +147,11 @@ access(path: *u8, len: usize, how: int) -> int = status(syscall(SYS_ACCESS, addr
 @export("sysl_fs_chmod")
 chmod(path: *u8, len: usize, mode: u32) -> int = status(syscall(SYS_CHMOD, addr(path), u64(len), u64(mode), 0))
 
+// `set_owner`: keel's chown (35), root only; an id past 16 bits is EINVAL.
+@export("sysl_fs_chown")
+chown(path: *u8, len: usize, owner: u32, group: u32) -> int =
+    status(syscall(SYS_CHOWN, addr(path), u64(len), u64(owner), u64(group)))
+
 // --- Directories -----------------------------------------------------------------------------------
 
 // An open directory: its descriptor, and the whole `Dirent` records the last `getdents` handed back,
@@ -263,7 +268,8 @@ io_flush(fd: int) -> int
 
 // --- sysl.process: the hooks of `sysl.process.sys` -------------------------------------------------
 //
-// keel's spawn (22), wait (23), pipe (36), kill (44), getpgid (46), tcsetpgrp (47) and tcgetpgrp (48). The child's three standard streams and its environment go
+// keel's spawn (22), wait (23), the user calls (30-33), pipe (36), execve (40), kill (44), getpgid (46),
+// tcsetpgrp (47) and tcgetpgrp (48). The child's three standard streams and its environment go
 // to keel's spawn as they are asked for; wait's POSIX status becomes an exit code or a signal. What it
 // cannot be told — a starting directory (the child takes the caller's) — answers `UNSUPPORTED` rather
 // than being dropped; so do a bounded wait and a temporary file.
@@ -281,12 +287,74 @@ proc_spawn(path: *u8, path_len: usize, argv: *psys.Text, argc: usize, envp: *psy
     *started = 0
     if dir_len != 0 then return i64(UNSUPPORTED)
     if pgid < psys.group_inherit then return i64(-IoError.Other(22).code())
-    // keel takes the argument vector as each argument followed by a NUL, and the environment the same
-    // way: this program's own entries first when it is inherited, less any `envp` names again.
+    val packed = packed_args(argv, argc)
+    val env = packed_env(envp, envc, inherit_env)
+    var flags: u64 = 0
+    if pgid != psys.group_inherit
+        flags = SPAWN_SETPGROUP
+        if foreground != 0 then flags |= SPAWN_FOREGROUND
+    val group = if pgid > 0 then u64(pgid) else 0
+    var attr = SpawnAttr([fd_of(stdin_fd), fd_of(stdout_fd), fd_of(stderr_fd)], u64(usize(as_ptr(env.view()))),
+                         u64(env.len()), 1, flags, group)
+    var r = -i64(Errno.ENOENT)
+    for c in searched(path, path_len, env.view()).view()
+        r = syscall5(SYS_SPAWN, u64(usize(as_ptr(c.view()))), u64(c.len()), u64(usize(as_ptr(packed.view()))),
+                     u64(packed.len()), u64(usize(&attr)))
+        if r != -i64(Errno.ENOENT) then break
+    if r >= 0 then r else i64(status(r))
+
+// Where a program is looked for, in order: `path` itself when it names a directory (it has a `/`), and
+// otherwise each directory of the `PATH` the child will have — `env` is its environment, packed — with
+// `path` after it; with no `PATH`, keel's one directory of programs, /bin. An empty directory in `PATH`
+// is the current one, as POSIX reads it.
+private searched(path: *u8, path_len: usize, env: []const u8) -> Buf[Buf[u8]]
+    var out: Buf[Buf[u8]] = buf()
+    var named: Buf[u8] = buf()
+    var has_slash = false
+    for i in 0..<path_len
+        if path[i] == u8('/') then has_slash = true
+        named.push(path[i])
+    if has_slash || path_len == 0
+        out.push(named)
+        return out
+    val dirs = path_of_env(env)
+    var start: usize = 0
+    for i in 0..dirs.len
+        if i == dirs.len || dirs[i] == u8(':')
+            var c: Buf[u8] = buf()
+            if i == start then c.push(u8('.')) else c.extend(dirs[start..<i])
+            c.push(u8('/'))
+            c.extend(named.view())
+            out.push(c)
+            start = i + 1
+    out
+
+// The value of `PATH` among the NUL-ended `NAME=value` entries of `env`, or "/bin" when there is none.
+private path_of_env(env: []const u8) -> []const u8
+    var at: usize = 0
+    while at < env.len
+        var end = at
+        while end < env.len && env[end] != 0
+            end += 1
+        val entry = env[at..<end]
+        if entry.len >= 5 && entry[0..<5] == "PATH=".bytes then return entry[5..]
+        at = end + 1
+    "/bin".bytes
+
+// A hook's descriptor as keel's spawn takes it: -1, "this program's own", is NO_FD.
+private fd_of(fd: int) -> u64 = if fd < 0 then NO_FD else u64(fd)
+
+// keel's spawn and execve take the argument vector as each argument followed by a NUL.
+private packed_args(argv: *psys.Text, argc: usize) -> Buf[u8]
     var packed: Buf[u8] = buf()
     for i in 0..<argc
         append_text(&packed, argv[i])
         packed.push(0)
+    packed
+
+// ...and the environment the same way: this program's own entries first when it is inherited, less any
+// `envp` names again.
+private packed_env(envp: *psys.Text, envc: usize, inherit_env: int) -> Buf[u8]
     var env: Buf[u8] = buf()
     if inherit_env != 0
         for e in environment()
@@ -296,19 +364,42 @@ proc_spawn(path: *u8, path_len: usize, argv: *psys.Text, argc: usize, envp: *psy
     for i in 0..<envc
         append_text(&env, envp[i])
         env.push(0)
-    var flags: u64 = 0
-    if pgid != psys.group_inherit
-        flags = SPAWN_SETPGROUP
-        if foreground != 0 then flags |= SPAWN_FOREGROUND
-    val group = if pgid > 0 then u64(pgid) else 0
-    var attr = SpawnAttr([fd_of(stdin_fd), fd_of(stdout_fd), fd_of(stderr_fd)], u64(usize(as_ptr(env.view()))),
-                         u64(env.len()), 1, flags, group)
-    val r = syscall5(SYS_SPAWN, addr(path), u64(path_len), u64(usize(as_ptr(packed.view()))), u64(packed.len()),
-                     u64(usize(&attr)))
-    if r >= 0 then r else i64(status(r))
+    env
 
-// A hook's descriptor as keel's spawn takes it: -1, "this program's own", is NO_FD.
-private fd_of(fd: int) -> u64 = if fd < 0 then NO_FD else u64(fd)
+// keel's execve (40), which keeps the pid, the descriptors and the directory and answers only when it
+// fails, having checked everything before giving the image up. `print`'s line goes out first: the
+// buffer holding it goes with the image.
+@export("sysl_proc_exec")
+proc_exec(path: *u8, path_len: usize, argv: *psys.Text, argc: usize, envp: *psys.Text, envc: usize,
+          inherit_env: int) -> int
+    val packed = packed_args(argv, argc)
+    val env = packed_env(envp, envc, inherit_env)
+    flush()
+    var r = -i64(Errno.ENOENT)
+    for c in searched(path, path_len, env.view()).view()
+        r = syscall6(SYS_EXECVE, u64(usize(as_ptr(c.view()))), u64(c.len()), u64(usize(as_ptr(packed.view()))),
+                     u64(packed.len()), u64(usize(as_ptr(env.view()))), u64(env.len()))
+        if r != -i64(Errno.ENOENT) then break
+    if r < 0 then status(r) else -IoError.Other(5).code()
+
+// keel keeps one user and one group per process, so the real ids are the ones the process acts as.
+@export("sysl_proc_get_id")
+proc_get_id(which: int) -> i64
+    val nr = which match
+        psys.id_user | psys.id_real_user -> SYS_GETUID
+        psys.id_group | psys.id_real_group -> SYS_GETGID
+        else return i64(-IoError.Other(22).code())
+    val r = syscall(nr, 0, 0, 0, 0)
+    if r < 0 then i64(status(r)) else r
+
+// setuid (32) and setgid (33): EPERM unless the process is root.
+@export("sysl_proc_set_id")
+proc_set_id(which: int, id: u32) -> int
+    val nr = which match
+        psys.id_user -> SYS_SETUID
+        psys.id_group -> SYS_SETGID
+        else return -IoError.Other(22).code()
+    status(syscall(nr, u64(id), 0, 0, 0))
 
 private append_text(b: *Buf[u8], t: psys.Text)
     for j in 0..<t.len

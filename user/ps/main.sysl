@@ -5,16 +5,6 @@
 import rt.keel.user
 import sysl.text.from_utf8
 
-// `text` right-aligned in `width` columns. A width on a string hole is C's `snprintf` on a freestanding
-// target (FINDINGS.md 64), so the padding is written out.
-padded(text: string, width: usize) -> string
-    var out = ""
-    var n = text.bytes.len
-    while n < width
-        out = out + " "
-        n += 1
-    out + text
-
 // A record's name: its bytes up to the first NUL.
 name_of(bytes: [16]u8) -> string
     var n: usize = 0
@@ -30,7 +20,5 @@ main(args: []string)
             exit(1)
     print("  PID  PPID  PGID   UID CMD")
     for p in procs.view()
-        val cols = padded(s"${p.pid}", 5) + " " + padded(s"${p.ppid}", 5) + " " + padded(s"${p.pgid}", 5) + " " +
-            padded(s"${p.uid}", 5)
         val mark = if p.ended != 0 then " <ended>" else ""
-        print(s"$cols ${name_of(p.name)}$mark")
+        print(f"${p.pid}%5d ${p.ppid}%5d ${p.pgid}%5d ${p.uid}%5d ${name_of(p.name)}$mark")

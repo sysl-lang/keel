@@ -281,8 +281,8 @@ transcript2=(
     $'# false\nsh: false: exit status 1\n# echo $?\n1\n'   # $? after a failure...
     $'# true\n# echo $?\n0\n'                 # ...and after a success
     $'# echo $HOME $USER\n/ root\n'           # login gave the shell its environment
-    $'# export GREETING=hi\n# env | grep GREETING\nGREETING=hi\n'   # export reaches a child (keel spawn)
-    $'# env > /m9/env.txt\n# grep GREETING /m9/env.txt\nGREETING=hi\n'   # ...and through sysl.process
+    $'# export GREETING=hi\n# env | grep GREETING\nGREETING=hi\n'   # export reaches a child in a pipeline
+    $'# env > /m9/env.txt\n# grep GREETING /m9/env.txt\nGREETING=hi\n'   # ...and one writing a file
     $'# env | grep X | wc -l\n0\n'           # X was never exported
     $'# rm /m9/log\n# rm /m9/env.txt\n'
     # Milestone 15b: signals and job control.

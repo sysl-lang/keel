@@ -4,9 +4,11 @@
 // themselves with /bin/echo, /bin/env and /bin/false — with arguments and an environment — and are
 // waited for. Exits 0 only if every check passed.
 
-import abi.keel.abi.{ENOENT, Errno}
 import rt.keel.user
 import sysl.buf.{Buf, buf}
+import sysl.fs.IoError
+import sysl.process
+import sysl.process.Var
 import sysl.text.from_utf8
 
 var failures: u64 = 0
@@ -132,8 +134,8 @@ if failures == looped then print("user: fork loop ok")
 val execs = failures
 user.fork() match
     Ok(0) ->
-        val e = user.execve("/bin/echo", ["echo", "user: exec echo", "ok"], Some(["FORKTEST=yes"]))
-        print(s"user: FAILED: execve /bin/echo: errno ${i64(e)}")
+        val e = process.exec("echo", ["user: exec echo", "ok"], [Var("FORKTEST", "yes")], inherit_env = false)
+        print(s"user: FAILED: exec echo: $e")
         user.exit(9)
     Ok(child) -> check(reaped(child) == 0, "echo did not exit 0")
     Err(e) -> fail(s"fork: errno ${i64(e)}")
@@ -148,8 +150,8 @@ user.fork() match
         val _ = user.dup2(ew, 1)
         val _ = user.close(ew)
         val _ = user.close(er)
-        val e = user.execve("/bin/env", ["env"], Some(["FORKTEST=yes", "SECOND=2"]))
-        user.exit(int(i64(e)) + 10)
+        val _ = process.exec("env", [], [Var("FORKTEST", "yes"), Var("SECOND", "2")], inherit_env = false)
+        user.exit(10)
     Ok(child) ->
         val _ = user.close(ew)
         val seen = drained(er)
@@ -161,15 +163,15 @@ user.fork() match
 // A status other than 0 comes back through execve and wait.
 user.fork() match
     Ok(0) ->
-        val _ = user.execve("/bin/false", ["false"])
+        val _ = process.exec("false")
         user.exit(9)
     Ok(child) -> check(reaped(child) == 1, "false did not exit 1")
     Err(e) -> fail(s"fork: errno ${i64(e)}")
 
 // A failed execve answers its error to a caller that carries on as it was.
 mark = 42
-val missing: Errno = user.execve("/bin/missing", ["missing"])
-check(missing == ENOENT, s"execve of a missing file answered errno ${i64(missing)}")
+val missing = process.exec("/bin/missing")
+check(missing == IoError.NotFound, s"exec of a missing file answered '$missing'")
 check(mark == 42 && heap.at(9) == 10, "a failed execve changed the caller's memory")
 if failures == execs then print("user: exec ok")
 

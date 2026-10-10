@@ -32,7 +32,7 @@ detail(dir: string, name: string, users: Buf[User])
     fs.metadata(join(dir, name)) match
         Ok(m) ->
             val owner = passwd.user_name(users, m.owner)
-            print(f"${mode_string(m)} ${padded(owner, 6)} ${m.size}%8d $name")
+            print(f"${mode_string(m)} ${owner}%-6s ${m.size}%8d $name")
         Err(e) ->
             print(s"ls: $name: $e")
             exit(1)
@@ -46,13 +46,3 @@ mode_string(m: Meta) -> string
         bit(p, 0o010, "x") + bit(p, 0o004, "r") + bit(p, 0o002, "w") + bit(p, 0o001, "x")
 
 bit(p: u32, mask: u32, letter: string) -> string = if (p & mask) != 0 then letter else "-"
-
-// `text` and spaces after it, to `width` bytes. `f"${text}%-6s"` says the same, and is refused on a
-// freestanding target as needing C's snprintf (FINDINGS.md 64).
-padded(text: string, width: usize) -> string
-    var out = text
-    var n = text.bytes.len
-    while n < width
-        out = out + " "
-        n += 1
-    out

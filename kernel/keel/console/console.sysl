@@ -24,8 +24,8 @@ module keel.console
 // program it is meant to stop is usually not reading. It is not echoed (the echo would be written from
 // interrupt context, under a lock the threads take with interrupts on) and the input typed before it
 // is not thrown away. The sending is keel.proc's, reached through `keel_console_interrupt` because
-// keel.proc imports this module and because this handler runs under keel.trap's `@no_alloc`, whose
-// check an `extern` ends (FINDINGS.md 47).
+// keel.proc imports this module; that function is `@no_alloc` itself, as everything on keel.trap's
+// interrupt path is.
 
 import keel.cpu
 import keel.gic

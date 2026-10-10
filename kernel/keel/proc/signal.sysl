@@ -192,7 +192,10 @@ private signal_group(pgid: u64, sig: u64)
     family.unlock(flags)
     wakes.wake_all()
 
-// Ctrl-C at the console (keel.console, interrupt context): SIGINT to its foreground group.
+// Ctrl-C at the console (keel.console, interrupt context): SIGINT to its foreground group. It runs on
+// keel.trap's interrupt path, so it carries that path's promise itself: the `extern` it is reached
+// through is where the caller's check stops.
+@no_alloc
 @export("keel_console_interrupt")
 console_interrupt(pgid: u64) = signal_group(pgid, SIGINT)
 

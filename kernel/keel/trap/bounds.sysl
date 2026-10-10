@@ -1,5 +1,4 @@
 module keel.trap
-@no_alloc
 
 // A failed bounds check anywhere in the kernel, the standard library's code included.
 //
@@ -21,6 +20,7 @@ import keel.psci.system_off
 private const SIGNED_A: u32 = 1 << 8
 private const SIGNED_B: u32 = 1 << 9
 
+@no_alloc
 @export("sysl_bounds_fail")
 bounds_fail(kind: u32, a: usize, b: usize, length: usize, at: *u8) -> never
     put_str("keel: bounds check failed: ")

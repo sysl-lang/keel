@@ -7,6 +7,7 @@ package {
 
 dependencies {
   rt { workspace = true }
+  fsys { workspace = true }
 }
 
 // keel does not save the FP/SIMD registers yet, and leaves the unit trapping at EL0 too.

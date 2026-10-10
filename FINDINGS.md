@@ -1649,6 +1649,15 @@ use `sysl.process`. None was fixed here.
 
 ## 47. `@no_alloc` is a property of a whole module, so an exception entry whose interrupt path must not allocate and whose system-call path must cannot say so
 
+**FIXED in sysl 0.1.0-alpha.6:** `@no_alloc` may be written on a function, checked through every call
+from it (`error: this reaches 'grow', which makes a slice with storage of its own, by the call path
+'on_irq' → 'grow' → … and 'on_irq' declared '@no_alloc'`). `keel.trap` is no longer `@no_alloc` as a
+module: `keel_trap` calls `proc.user_sync` and `proc.returning_to_user` by name, and everything else —
+`kernel_side` (both IRQ slots and EL1's synchronous one), `probe`, `sysl_bounds_fail` — is `@no_alloc`
+itself. The `keel_user_sync`/`keel_returning_to_user` symbols are gone. `keel_console_interrupt` stays an
+`extern` (keel.proc imports keel.console), but it is now `@no_alloc` at its definition, so the edge the
+`extern` hides is checked from the other side.
+
 `keel.trap` is `@no_alloc`: its IRQ path (`dispatch`, the timer, the scheduler's preemption, the
 drivers' interrupt handlers) runs on whatever stack the interrupt landed on, and the check through
 every call is what keeps it allocator-free. The same module's `keel_trap` also takes the synchronous
@@ -2122,6 +2131,12 @@ module's functions get bare global C names, so all libc code lives in module `ke
 
 ## 63. The standard library has no notion of a process's user, and `sysl.fs` reads an owner but cannot change one
 
+**FIXED in sysl 0.1.0-alpha.6:** `sysl.fs.set_owner` over a `sysl_fs_chown` hook, and
+`sysl.process.user()`/`group()`/`real_user()`/`real_group()`/`set_user`/`set_group` over
+`sysl_proc_get_id`/`sysl_proc_set_id`. keel.fsys answers all three (one uid per process, so the real ids
+are the effective ones); `id`, `whoami`, `chown`, `login`, `su` and the shell's prompt use them, and the
+runtime's `getuid`/`getgid`/`setuid`/`setgid`/`chown` are gone.
+
 Milestone 12, `/bin/id`, `/bin/whoami`, `/bin/chown`, `/bin/login`, `/bin/su`. `sysl.fs` carries the
 permission half of ownership portably and completely — `Meta.mode`/`permissions()` to read,
 `set_permissions` (the `sysl_fs_chmod` hook) to write — and keel.fsys now answers both. The owner half
@@ -2153,6 +2168,9 @@ Clean form: a `set_owner(path, owner, group)` beside `set_permissions`, over a `
 portable programs and `Meta.owner == process.user()` is the "is it mine" test.
 
 ## 64. A width on a string hole needs C's `snprintf` on a freestanding target — but only when the string is not a constant
+
+**FIXED in sysl 0.1.0-alpha.6:** the input below builds for `aarch64-freestanding`. `ls -l` writes
+`${owner}%-6s` and `ps` `${p.pid}%5d`; both hand-written `padded` loops are gone.
 
 Milestone 12, `/bin/ls -l`, padding the owner's name to a column:
 
@@ -2226,6 +2244,12 @@ by `getenv`/`environ` on a hosted target and by an `@export` on a freestanding o
 
 ## 66. `sysl.process` cannot build a pipeline: no standard input for a child, no pipe, and no start that neither waits nor captures
 
+**FIXED in sysl 0.1.0-alpha.6:** `Stdio.FromFile`/`FromPath`, `stdin` on every start, `process.pipe()`
+over `sysl_proc_pipe`, and `spawn(…) -> &Spawned` whose `wait` reads nothing. The shell's foreground jobs
+— a single command, a pipeline, `<`, `>`, `>>` — run through them. keel.fsys's spawn hook now also does
+the `PATH` search its contract asks for (`/bin` when the child has no `PATH`), so the shell names a
+program as typed and the child's `argv[0]` is what it was. Background jobs are finding 70.
+
 Milestone 13, the shell's `a | b | c` and `< file`. `Stdio` exists for the two output streams only,
 and `begun` hands the hook `stdin_fd = -1` unconditionally, so no call can give a child a standard
 input:
@@ -2264,6 +2288,9 @@ reading), a `sysl.process.pipe() -> Result[(File, File), IoError]` over a `sysl_
 
 ## 67. A tuple of literals in a `match` arm does not take its type from a sibling arm (bug, minor)
 
+**FIXED in sysl 0.1.0-alpha.6:** the input below builds and prints `7`. forktest's stopgap was the
+right code anyway (`stop` on a failed pipe), so nothing in keel changed.
+
 Milestone 15a, `/bin/forktest`'s fallback when `pipe` fails. A scalar literal in one arm takes the
 type a sibling arm gives (`Ok((a, _)) -> a` / `Err(_) -> 0` is a `u64`), and so does a tuple of
 literals once the declaration names the type — but not a tuple of literals with nothing but the
@@ -2292,6 +2319,12 @@ Clean form: a literal inside a tuple (or array, or constructor) arm is inferred 
 arm's element types, as a bare literal arm already is.
 
 ## 68. `sysl.process` has no way to express `fork` or replacing the program (`exec`)
+
+**FIXED in sysl 0.1.0-alpha.6, the first shape:** `process.exec(program, args, env, inherit_env) ->
+IoError` over a `sysl_proc_exec` hook, with `fork` left out on purpose (its docstring: a kernel's own
+runtime is where a fork belongs). keel.fsys answers the hook with execve (40), flushing `print`'s line
+first; forktest's three execs and its failed one go through `process.exec`, and the runtime's `execve` is
+gone. `rt.keel.user.fork()` stays, as the library says it should.
 
 Milestone 15a. keel now has `fork` (39) and `execve` (40), and a sysl program can call them only
 through keel's own runtime (`user.fork()`, `user.execve(path, args, env)`). `sysl.process` offers
@@ -2339,7 +2372,9 @@ their whole runtime; or neither, with a target's own runtime the place for them,
 `sysl_proc_spawn` maps them onto SPAWN_SETPGROUP/SPAWN_FOREGROUND), and `watch`'s SA_RESTART needed a
 kernel change: `sigaction` takes a sixth argument, `flags`, and a handled signal whose action has
 SA_RESTART returns the process to the `svc` of the call it interrupted. `stdsig` checks all of it from
-EL0. **The shell still goes through keel's spawn**; moving it onto `sysl.process` is the next item.
+EL0. The shell's foreground jobs now run through `sysl.process` (`Group.New`/`Join`, `foreground`,
+`set_foreground_group`, `process_group`), it ignores SIGINT with `signal.ignore`, `kill %n` and `/bin/kill`
+use `signal.send`. What remains on keel's own calls is findings 70 and 71.
 
 Milestone 15b. keel now has POSIX-shaped signals (41 sigaction, 42 sigprocmask, 43 sigreturn, 44
 kill), process groups (45 setpgid, 46 getpgid) and a console foreground group (47 tcsetpgrp, 48
@@ -2385,6 +2420,96 @@ Shapes to choose between: a flag-setting surface only (`on_signal(sig) -> &Atomi
 `Stream` of signal numbers fed by a self-pipe), with the raw handler left to targets' runtimes; a
 `group`/`foreground` pair on `start` and `run` over a `sysl_proc_spawn` that takes them; or neither,
 with job control the business of a target's own runtime, as now.
+
+## Moving onto alpha.6: the shell on `sysl.process`
+
+## 70. `sysl.process` has no wait that does not block, so a shell cannot hold a background job as a `Spawned`
+
+The shell's `cmd &`, `jobs` and the `[n] done …` report before each prompt need to ask whether a stage
+has ended without waiting for it — POSIX's `waitpid(pid, WNOHANG)`, Rust's `Child::try_wait`. `Spawned`
+has `wait` (`@blocks`) and `kill`, and the hook has no non-blocking mode (`sysl_proc_wait`'s `timeout_ms`
+bounds the *child's life*: a deadline already past stops a running child rather than reporting it):
+
+    import sysl.process
+
+    main()
+        val job = process.spawn("sleep", ["100"], group = process.Group.New).unwrap()
+        print((*job).try_wait())
+
+    $ sysl build -o p main.sysl
+    error: type 'sysl.process.Spawned' has no method 'try_wait'
+
+(Written `job.try_wait()`, the refusal misleads: *"a method call reaches through one level of
+indirection and &sysl.process.Spawned has more, so the rest is written: '(*x).try_wait(…)'"* — for a
+method that does not exist at any level.)
+
+Nor can a program reap the child some other way and keep the `Spawned`: dropping one that was never
+waited for stops and reaps the child by its pid, which by then may be another process's.
+
+Stopgap (kept, named): a background job runs through keel's own calls — `rt.keel.user.pipe`/`open`/
+`spawn(…, group)`, reaped by `user.poll` (WNOHANG) with `user.nanosleep` for the half-second grace after
+`kill %n`, and `fg %n` waits for it with `user.wait`. The shell lays a job out twice (`run_foreground` on
+`sysl.process`, `run_background` on keel's calls), ~50 lines that go once this exists.
+
+Clean form: `Spawned.try_wait(*self) -> Result[Option[Status], IoError]` — `None` while the child runs,
+the `Status` (remembered, as `wait`'s is) once it has ended — over a `sysl_proc_wait` that can be asked
+not to block (a `how` flag, or `timeout_ms` of a value that means "now, without stopping it").
+
+## 71. `sysl.process` can put a child in a process group, but cannot make the calling program a group's leader
+
+A job-control shell starts by putting itself in a group of its own and taking the terminal, so that a
+Ctrl-C at its prompt does not reach whatever started it (on keel, init and login). alpha.6 gives the
+second half — `set_foreground_group(process_group())` — but the first has no call:
+
+    import sysl.process
+
+    process.set_process_group(0)
+
+    $ sysl build -o p main.sysl
+    error: undefined function 'sysl.process.set_process_group'
+
+(`grep -rln setpgid` over the alpha.6 library finds only `process/hosted/__posix__/spawn.c`.)
+
+Stopgap (kept, named): `user.setpgid(0, 0)`, one line at the shell's start.
+
+Clean form: `set_process_group(pgid: int = 0)` (POSIX `setpgid(0, pgid)`: zero, a new group numbered by
+this program's pid) over a `sysl_proc_setpgid` hook, beside `process_group`; or the session-level
+`new_session()` (`setsid`), which is what a login program does for the shell it starts.
+
+## 72. An imported enum variant loses to another file's private constant of the same name (bug, minor)
+
+keel.fsys's fsys.sysl imports `ENOENT` (a variant of keel.abi's `enum Errno: i64`); its net.sysl, in the
+same module, declares `private const ENOENT: int = 2`. In fsys.sysl, `i64(ENOENT)` resolves to net.sysl's
+constant and is refused as private. Reduced (module `m` in two files, `n` a module beside it):
+
+    // n/n.sysl
+    module n
+    enum Errno: i64
+        EPERM = 1
+        LIMIT = 7
+
+    // m/a.sysl
+    module m
+    private const LIMIT: int = 2
+    first() -> int = LIMIT
+
+    // m/b.sysl
+    module m
+    import n.LIMIT
+    second() -> int = int(i64(LIMIT))
+
+    $ sysl build -o p .
+    error: 'm.LIMIT' is private to '…/m/a.sysl', the file that declares it
+     --> m/b.sysl:5:27
+
+With `n`'s `LIMIT` an ordinary `const` instead of a variant, the same program builds and the import wins
+(prints 9). A name a file cannot reach should not be a candidate there — the rule 0.0.150 applied to a
+`private` type hiding a variant — and the file's own import should be what the name means.
+
+Stopgap (used): `i64(Errno.ENOENT)`, qualified, in the spawn and exec hooks' `PATH` search.
+
+Clean form: in a file that imports a name, another file's `private` declaration of that name is not a
+candidate, whatever kind of thing the import names.
 
 ## What worked in milestone 15b
 

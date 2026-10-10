@@ -3,9 +3,10 @@
 
 import passwd.keel.passwd
 import rt.keel.user
+import sysl.process
 
-val uid = user.getuid()
-val gid = user.getgid()
+val uid = process.user()
+val gid = process.group()
 val uname = passwd.user_name(passwd.read_users(), uid)
 val gname = passwd.group_name(passwd.read_groups(), gid)
 print(s"uid=$uid($uname) gid=$gid($gname)")

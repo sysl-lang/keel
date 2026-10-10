@@ -248,8 +248,7 @@ private reason(fault: u64) -> string
         else "exception"
 
 // Called by the trap handler for a synchronous exception from EL0: a system call, or anything else,
-// which ends the process. keel.trap reaches it through this symbol (FINDINGS.md 47).
-@export("keel_user_sync")
+// which ends the process.
 user_sync(regs: *u64, ec: u64, iss: u64)
     if ec == 0x15
         val again = system_call(regs)
@@ -278,8 +277,7 @@ private fault_signal(ec: u64) -> u64 = ec match
 
 // Called on every way back to EL0 after the kernel had the processor, with the registers the process
 // resumes with: a pending signal is delivered here (signal.sysl) — ending the process, or running its
-// handler. keel.trap's interrupt path reaches it through this symbol (FINDINGS.md 47).
-@export("keel_returning_to_user")
+// handler. keel.trap calls it after an interrupt taken at EL0.
 returning_to_user(regs: *u64)
     val p = current_process()
     if p != null then deliver(p, regs)

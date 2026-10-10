@@ -6,13 +6,14 @@
 // the target's group and uid before the shell starts. A wrong password exits 1 having changed nothing.
 // The password is echoed, as login's is.
 
-import abi.keel.abi.Errno
 import passwd.keel.passwd
 import rt.keel.user
+import sysl.fs.IoError
 import sysl.io.{lines, stdin}
+import sysl.process
 
-refuse(e: Errno) -> never
-    print(s"su: cannot change user: ${user.describe(e)}")
+refuse(e: IoError) -> never
+    print(s"su: cannot change user: $e")
     exit(1)
 
 main(args: []string)
@@ -31,10 +32,10 @@ main(args: []string)
     if !passwd.opens(u, password)
         print("su: incorrect password")
         exit(1)
-    user.setgid(u.gid) match
+    process.set_group(u.gid) match
         Ok(_) -> ()
         Err(e) -> refuse(e)
-    user.setuid(u.uid) match
+    process.set_user(u.uid) match
         Ok(_) -> ()
         Err(e) -> refuse(e)
     val shell = user.spawn(u.shell, ["sh"]) match

@@ -2,5 +2,6 @@
 
 import passwd.keel.passwd
 import rt.keel.user
+import sysl.process
 
-print(passwd.user_name(passwd.read_users(), user.getuid()))
+print(passwd.user_name(passwd.read_users(), process.user()))

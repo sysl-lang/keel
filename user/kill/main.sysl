@@ -4,6 +4,7 @@
 
 import abi.keel.abi.SIGTERM
 import rt.keel.user
+import sysl.signal
 import sysl.text.from_utf8
 
 // A signal's number from its name or number, without the `-`; 0 for one this does not know.
@@ -59,10 +60,10 @@ main(args: []string)
     for word in args[first..]
         pid_of(word) match
             Some(pid) ->
-                user.kill(pid, sig) match
+                signal.send(pid, int(sig)) match
                     Ok(_) -> ()
                     Err(e) ->
-                        print(s"kill: $word: ${user.describe(e)}")
+                        print(s"kill: $word: $e")
                         failed = 1
             None ->
                 print(s"kill: $word: not a pid")

@@ -11,8 +11,8 @@ module keel.user
 import abi.keel.abi.{ANY_CHILD, EACCES, EINVAL, ENOENT, EPERM, Errno, ExitStatus, NO_FD, STDOUT, SYS_BRK, SYS_CLOSE, SYS_EXIT, SYS_FSTAT,
     SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN,
     SYS_STAT, SYS_SYNC, SYS_UNLINK, SYS_WAIT, SYS_WRITE, Stat, SYS_SOCKET, SYS_BIND, SYS_RECVFROM, SYS_SENDTO,
-    SYS_SOCKCLOSE, SockAddr, SYS_GETUID, SYS_GETGID, SYS_SETUID, SYS_SETGID, SYS_CHOWN, SYS_PIPE, SYS_DUP2, SYS_DUP,
-    SpawnAttr, SYS_FORK, SYS_EXECVE, EINTR, ESRCH, ProcInfo, SPAWN_FOREGROUND, SPAWN_SETPGROUP, SigAction,
+    SYS_SOCKCLOSE, SockAddr, SYS_PIPE, SYS_DUP2, SYS_DUP,
+    SpawnAttr, SYS_FORK, EINTR, ESRCH, ProcInfo, SPAWN_FOREGROUND, SPAWN_SETPGROUP, SigAction,
     SYS_GETPGID, SYS_KILL, SYS_NANOSLEEP, SYS_PROCS, SYS_SETPGID, SYS_SIGACTION, SYS_SIGPROCMASK, SYS_TCGETPGRP,
     SYS_TCSETPGRP, WNOHANG}
 import sysl.buf.{Buf, buf}
@@ -271,32 +271,11 @@ getppid() -> u64 = u64(call(SYS_GETPPID, 0, 0, 0, 0))
 
 // Copy this process: answers the child's pid in the parent and 0 in the child, which carries on from
 // the same call with a copy-on-write copy of the parent's memory, its descriptors, directory and
-// environment.
+// environment. The standard library has `exec` but deliberately no `fork`, which belongs to a runtime
+// that owns every thread and every count there is — this one.
 fork() -> Result[u64, Errno] = answer(call(SYS_FORK, 0, 0, 0, 0))
 
-// Replace this process's program with the one at `path`, with `args` as its argv (its name first, by
-// convention) and `env` as its whole environment (`NAME=value` entries), or this process's own for
-// None. Answers only when it fails; the process is then as it was.
-execve(path: string, args: []const string, env: Option[[]const string] = None) -> Errno
-    var packed: Buf[u8] = buf()
-    for a in args
-        packed.extend(a.bytes)
-        packed.push(0)
-    var block: Buf[u8] = buf()
-    env match
-        Some(entries) ->
-            for e in entries
-                block.extend(e.bytes)
-                block.push(0)
-        None ->
-            for e in environment()
-                block.extend(e)
-                block.push(0)
-    val r = call6(SYS_EXECVE, addr(path.bytes), len(path.bytes), addr(packed.view()), len(packed.view()),
-        addr(block.view()), len(block.view()))
-    Errno(-r)
-
-// A system call of six arguments: `execve` is the one that needs the sixth.
+// A system call of six arguments: `execve` and `sigaction` need the sixth.
 private call6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64
     var r: i64 = 0
     asm
@@ -313,21 +292,7 @@ private call6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> 
         [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
     r
 
-// --- Users -----------------------------------------------------------------------------------------
-//
-// keel.abi's user calls. The standard library has no notion of a process's user, and `sysl.fs` can
-// read a file's owner but not change it (FINDINGS.md 63), so a program on keel calls these directly.
-
-getuid() -> u32 = u32(call(SYS_GETUID, 0, 0, 0, 0))
-
-getgid() -> u32 = u32(call(SYS_GETGID, 0, 0, 0, 0))
-
-// Become `uid`; EPERM unless this process is root.
-setuid(uid: u32) -> Result[unit, Errno] = done(call(SYS_SETUID, u64(uid), 0, 0, 0))
-
-setgid(gid: u32) -> Result[unit, Errno] = done(call(SYS_SETGID, u64(gid), 0, 0, 0))
-
-// An error number in words, for the messages a program prints about these calls.
+// An error number in words, for the messages a program prints about keel's own calls.
 describe(e: Errno) -> string = e match
     EPERM -> "operation not permitted"
     ESRCH -> "no such process"
@@ -336,10 +301,6 @@ describe(e: Errno) -> string = e match
     ENOENT -> "no such file or directory"
     EINVAL -> "invalid argument"
     else s"error ${i64(e)}"
-
-// The owner and group of what `path` names; root only.
-chown(path: string, uid: u32, gid: u32) -> Result[unit, Errno] =
-    done(call(SYS_CHOWN, addr(path.bytes), len(path.bytes), u64(uid), u64(gid)))
 
 // --- Signals and process groups --------------------------------------------------------------------
 //
@@ -437,6 +398,9 @@ syscall(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 = call(nr, a0, a1, a
 
 // The same for a call of five arguments (spawn).
 syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 = call5(nr, a0, a1, a2, a3, a4)
+
+// The same for a call of six arguments (execve, which keel.fsys's `exec` hook makes).
+syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 = call6(nr, a0, a1, a2, a3, a4, a5)
 
 // Write a string to standard output, all of it unless the kernel refuses.
 put(s: string) -> i64 = write_bytes(STDOUT, s.bytes)

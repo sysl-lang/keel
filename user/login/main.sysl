@@ -8,18 +8,19 @@
 // prompt (Ctrl-D on an empty line) exits with passwd.CONSOLE_CLOSED, which tells init the console is
 // gone. The password is echoed: keel's console has one line discipline and no way to turn echo off.
 
-import abi.keel.abi.Errno
 import passwd.keel.passwd
 import passwd.keel.passwd.User
 import rt.keel.user
 import sysl.fs
+import sysl.fs.IoError
 import sysl.io.{lines, stdin}
+import sysl.process
 
 session(u: User) -> never
-    user.setgid(u.gid) match
+    process.set_group(u.gid) match
         Ok(_) -> ()
         Err(e) -> refuse(e)
-    user.setuid(u.uid) match
+    process.set_user(u.uid) match
         Ok(_) -> ()
         Err(e) -> refuse(e)
     fs.set_current_dir(u.home) match
@@ -39,8 +40,8 @@ session(u: User) -> never
             Ok((pid, _)) -> if pid == shell then exit(0)
             Err(_) -> exit(0)
 
-refuse(e: Errno) -> never
-    print(s"login: cannot change user: ${user.describe(e)}")
+refuse(e: IoError) -> never
+    print(s"login: cannot change user: $e")
     exit(1)
 
 var input = stdin()

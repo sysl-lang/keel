@@ -1,9 +1,6 @@
 // chown <user>[:<group>] <path>...: give each path to a user, and a group if one is named (otherwise
 // its group stays), each by name (/etc/passwd, /etc/group) or by number. Root only. Exits 1 if any path
 // was refused, 2 for a name nobody has.
-//
-// `sysl.fs` can read an owner (`Meta.owner`, `Meta.group`) but has no call that changes one (FINDINGS.md
-// 63), so the change is keel's own system call, through the runtime.
 
 import passwd.keel.passwd
 import rt.keel.user
@@ -37,10 +34,10 @@ main(args: []string)
                     print(s"chown: $path: $e")
                     failed = true
                     continue
-        user.chown(path, uid, gid) match
+        fs.set_owner(path, uid, gid) match
             Ok(_) -> ()
             Err(e) ->
-                print(s"chown: $path: ${user.describe(e)}")
+                print(s"chown: $path: $e")
                 failed = true
     if failed then exit(1)
 
