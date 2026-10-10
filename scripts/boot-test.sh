@@ -10,6 +10,7 @@
 #   KEEL_OPT=-O0 scripts/boot-test.sh
 #   KEEL_ACCEL=tcg scripts/boot-test.sh   run under TCG (-cpu cortex-a72) instead of HVF
 #   KEEL_SYSL=<path>/bin/sysl scripts/boot-test.sh   build with that compiler instead of `sysl`
+#   KEEL_CSTD=<checkout> scripts/boot-test.sh   link /bin/cstdhello against that cstd (default ~/dev/sysl-lang/cstd)
 #
 # QEMU installs its own SIGALRM handler, so an alarm cannot bound it; the watchdog below kills it by
 # PID instead.
@@ -25,6 +26,7 @@ limit=${KEEL_TIMEOUT:-15}
 opt=${KEEL_OPT:-}
 accel=${KEEL_ACCEL:-hvf}
 compiler=${KEEL_SYSL:-sysl}
+cstd=${KEEL_CSTD:-$HOME/dev/sysl-lang/cstd}
 
 # Every boot prints these, in order. `user_line` is where each boot's own line goes: what the `files`
 # program says about the previous boot's /out.txt.
@@ -274,6 +276,8 @@ session2=(
     'linuxthreads'
     'linuxthreads exec'
     'linuxthreads fds'
+    'cstdhello one two'
+    'echo $?'
     'linuxpoll'
     '@wait linuxpoll: termios round trip; raw mode, waiting for three bytes'
     '@raw abc'
@@ -343,6 +347,13 @@ transcript2=(
     # by one thread; a read in flight keeps its pipe end through another thread's close; nothing left over.
     $'# linuxthreads fds\nlinuxthreads: 4 threads x 2000 rounds of pipe2, dup, openat and close at once: no descriptor shared, every pipe round-tripped\n'
     $'linuxthreads: a read in flight keeps its pipe end through a close; the table ends with 0-2 alone\n'
+    # A C program written against the C library alone: cstd's headers, crt0, printf (floats too), malloc
+    # over brk, atexit, and open/read/write/lseek/fstat/unlink, all over Linux's calls; it exits 0.
+    $'# cstdhello one two\ncstdhello: printf: -42 0x2a \'keel\' 3.142 2.50e-03 1e+21 !%\n'
+    $'cstdhello: argv: 3 cstdhello one two; GREETING=hi among '
+    $' environment strings\ncstdhello: malloc: 3000 blocks checked, 1000 grown by realloc, a '
+    $'-byte block reused the freed run\ncstdhello: files: wrote, read back, sought and unlinked /m9/cstd.txt (16 bytes); then No such file or directory\n'
+    $'cstdhello: getpid and getppid answered a child of the shell\ncstdhello: atexit: 3 handlers ran last-registered first\n# echo $?\n0\n'
     # Milestone 17: a third raw-svc Linux program. ppoll and pselect6 woken by a thread's write, a close and a
     # child's write, timing out, POLLNVAL/POLLERR/EBADF, their signal masks; the clocks; termios, and raw
     # mode driven from here: "abc" with no newline (no echo, so nothing between the two lines), then Ctrl-C
@@ -366,6 +377,7 @@ shutdown=(
 # the `files` program failed, the shell was restarted, or a process was left behind.
 not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login ended by signal"
     "keel: processes left unreaped" "keel: processes still running before init" "linuxpoll: FAILED"
+    "cstdhello: FAILED"
     "keelroot" "wonderland" "nope")
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
@@ -412,6 +424,16 @@ $linux_cc --target=aarch64-linux-gnu -ffreestanding -fno-builtin -nostdlib -stat
     -mno-outline-atomics -c -o $out/linuxpoll.o $root/linux/poll.c
 $linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/linuxpoll $out/linuxpoll.o
 
+# A C program against a C library: cstd's Linux half is archived for aarch64 with the portable half
+# inside it (its `_start` calls the program's `main`), and the program is compiled against cstd's
+# headers alone, with clang's freestanding ones for stddef.h and stdarg.h. Unlike the raw-svc programs
+# it is not -mgeneral-regs-only: printf takes doubles, so the program and cstd use the FP/SIMD
+# registers, which keel has to enable at EL0 and save per thread.
+$compiler build-c $cstd/linux --target aarch64-freestanding ${opt:+$opt} -o $out/libcstd.a
+$linux_cc --target=aarch64-linux-gnu -ffreestanding -nostdinc -isystem "$($linux_cc -print-resource-dir)/include" \
+    -I $cstd/include -static -fno-pic -O2 -c -o $out/cstdhello.o $root/linux/cstdhello.c
+$linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/cstdhello $out/cstdhello.o $out/libcstd.a
+
 rm -rf $fsroot
 mkdir -p $fsroot/dir $fsroot/bin
 for prog in $user_programs; do
@@ -420,6 +442,7 @@ done
 cp $out/linuxhello $fsroot/bin/linuxhello
 cp $out/linuxthreads $fsroot/bin/linuxthreads
 cp $out/linuxpoll $fsroot/bin/linuxpoll
+cp $out/cstdhello $fsroot/bin/cstdhello
 print -n "hello from the disk" > $fsroot/hello.txt
 print "inside a directory" > $fsroot/dir/inner.txt
 mkdir -p $fsroot/m9
