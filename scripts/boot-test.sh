@@ -296,6 +296,7 @@ transcript2=(
     $'# stdsig\nstdsig: watch ok\nstdsig: restart ok\nstdsig: ignore ok\nstdsig: group ok\n'   # sysl.signal and
                                                 # sysl.process groups through keel.fsys's hooks; SA_RESTART
     $'stdsig: session ok\n'                     # set_process_group and new_session (setpgid, setsid 157)
+    $'stdsig: zombie group ok\n'                # an ended, unreaped leader keeps its group joinable
     $'# true | false &\n[1] '                   # a background pipeline that ends by itself: reaped by
     $'[1] exit status 1 true | false\n'         # try_wait (sysl_proc_poll), its last stage's status
     $'# sleep 100 &\n[1] '                      # a background job: its number and process group

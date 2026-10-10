@@ -226,13 +226,15 @@ private signal_group(pgid: u64, sig: u64)
 console_interrupt(pgid: u64) = signal_group(pgid, SIGINT)
 
 // Whether `p` may put a process in group `pgid`: one of its own user's processes is in it (root may
-// join any), and that process is in `p`'s session — a group never spans two.
+// join any), and that process is in `p`'s session — a group never spans two. A process that has ended
+// but is not yet reaped is still a member, as on Linux: a shell joins a pipeline's later stage to the
+// group of a first stage that has already exited and that it has not waited for yet.
 private[proc] group_joinable(p: *Process, pgid: u64) -> bool
     val flags = family.lock()
     var ok = false
     for i in 0..<MAX_PROCS
         val c = table[i]
-        if c != null && c.pgid == pgid && !c.ended && c.sid == p.sid && (p.uid == 0 || c.uid == p.uid)
+        if c != null && c.pgid == pgid && c.sid == p.sid && (p.uid == 0 || c.uid == p.uid)
             ok = true
     family.unlock(flags)
     ok
@@ -261,7 +263,7 @@ private[proc] sys_setpgid(p: *Process, regs: *u64) -> Result[i64, Errno]
 
 // setsid() -> the new session's id: the caller made the leader of a new session numbered by its pid, and
 // of a new group of the same number in it. A caller whose pid already numbers a group — it leads one, or
-// a process it started is still in it — is EPERM, so a group never spans two sessions. keel has one
+// a process it started is still in it, ended but unreaped included — is EPERM, so a group never spans two sessions. keel has one
 // terminal and every descriptor on it reaches it, so leaving the old session leaves the console's
 // foreground group to that session: the new one can set it to none of its own groups (TIOCSPGRP checks
 // the session through `group_joinable`).
@@ -269,7 +271,7 @@ private[proc] sys_setsid(p: *Process) -> Result[i64, Errno]
     val flags = family.lock()
     for i in 0..<MAX_PROCS
         val c = table[i]
-        if c != null && !c.ended && c.pgid == p.pid
+        if c != null && c.pgid == p.pid
             family.unlock(flags)
             return Err(EPERM)
     p.sid = p.pid

@@ -13,6 +13,8 @@
 //   session ok   a child moves into a group of its own and back (`set_process_group`); another starts
 //                a session (`new_session`) and is then refused a second one, a group of its own and
 //                this process's group; this process, leading its group, is refused a session
+//   zombie group ok  a child that leads a group and has ended, unreaped, keeps the group: a second
+//                child joins it; once the first is reaped, a join is refused
 //
 // `stdsig leader`, `stdsig member <group>`, `stdsig regroup <group>` and `stdsig session <group>` are
 // the children: each checks what it was started with and exits 0 if it was right.
@@ -136,7 +138,35 @@ main(args: []string)
         _ -> stop("a group's leader was not refused a session")
     check(process.process_group() == mine, "this process left its group")
     print("stdsig: session ok")
+
+    zombie_group()
+    print("stdsig: zombie group ok")
     user.exit(0)
+
+// A child leading a group of its own exits and is not waited for; until it is reaped it is still that
+// group's member, so a second child may join the group — a pipeline's later stage started after its
+// first stage has ended. Once the first is reaped the group is gone and a join is refused.
+zombie_group()
+    var first = process.spawn("/bin/true", ["first"], group = Group.New).unwrap()
+    val g = first.group()
+    var rounds = 0
+    while !has_ended(g)
+        rounds += 1
+        check(rounds < 1000, s"the child $g never ended")
+        val _ = user.nanosleep(10_000_000)
+    val joined = process.run("/bin/stdsig", ["member", s"$g"], group = Group.Join(g))
+    check(joined.is_ok(), s"joining group $g, whose only member has ended unreaped, was refused")
+    check(joined.unwrap() == Status.Exited(0), "the child that joined an ended leader's group")
+    check(first.wait().unwrap() == Status.Exited(0), "the ended leader")
+    process.spawn("/bin/true", ["late"], group = Group.Join(g)) match
+        Err(IoError.NotPermitted) -> ()
+        _ -> stop(s"group $g was joined after its last member was reaped")
+
+// Whether process `pid` is in the table, ended and not yet reaped.
+has_ended(pid: int) -> bool
+    for info in user.procs().unwrap().view()
+        if int(info.pid) == pid then return info.ended == 1
+    false
 
 // The watch of INT lives for this call, and is the last one, so returning puts INT's default back.
 watching()
