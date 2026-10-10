@@ -271,6 +271,7 @@ session2=(
     'rm /m9/l'
     'linuxhello'
     'linuxthreads'
+    'linuxthreads exec'
     'exit'
     $'\x04'
 )
@@ -327,6 +328,8 @@ transcript2=(
     $'linuxthreads: futex EAGAIN, ETIMEDOUT, ENOSYS; the signal went to the thread not blocking it\n'
     $'linuxthreads: threads ran on different cores at once\n'
     $'linuxthreads: the first thread has exited; exit_group ends the rest\nsh: linuxthreads: exit status 6\n'
+    $'# linuxthreads exec\nlinux: write, getpid and exit_group by Linux\'s numbers; pid '   # execve from a thread
+    $'\nsh: linuxthreads: exit status 7\n'      # that is not the first: the others end first, the pid stays
     $'# exit\nlogin: \n'
     "init: the console closed after 1 sessions; orphans reaped: 0"
     "keel: init exited 0"

@@ -134,14 +134,12 @@ begin_group_exit(p: *Process, sig: u64, fault: u64, code: i64) -> bool
     val s = p.sig
     var wakes = no_wakes()
     val flags = s.lock.lock()
-    if g.exiting && g.exec_thread == null
+    // Already ending — or an `execve` is ending the others, which wins as it does in Linux: the caller
+    // is one of the others.
+    if g.exiting
         s.lock.unlock(flags)
         return false
-    // An `execve` waiting for the others to leave is one of them now: the group's end wins, and it is
-    // woken to find that out.
-    if g.exec_thread != null then g.gone.wake_all()
     g.exiting = true
-    g.exec_thread = null
     p.term_signal = sig
     p.fault = fault
     p.exit_code = code

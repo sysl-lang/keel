@@ -11,6 +11,8 @@
    - a signal sent to the process goes to the one thread not blocking it, waking its futex wait (EINTR);
    - keel's own `procs` (1025) says how many of its threads were ever running at once: at least 2, or the
      threads never ran in parallel;
+   - with an argument (`linuxthreads exec`), a thread that is not the first execs /bin/linuxhello
+     while another spins; execve ends them first, and the pid stays (exec_from_a_thread);
    - then the first thread ends with exit (93) while two others run on, one spinning in user mode, the
      other ending the whole group with exit_group(6): the status the shell reports is 6 only if the
      spinning thread was ended too and the process ended with its last thread.
@@ -28,6 +30,7 @@ typedef unsigned int u32;
 #define SYS_kill 129
 #define SYS_rt_sigaction 134
 #define SYS_rt_sigprocmask 135
+#define SYS_execve 221
 #define SYS_getpid 172
 #define SYS_gettid 178
 #define SYS_procs 1025
@@ -279,7 +282,36 @@ struct proc_info {
 };
 static struct proc_info procs[64];
 
-void _start(void) {
+/* `linuxthreads exec`: a thread that is not the first replaces the program with /bin/linuxhello while
+   another spins in user mode and the first waits in a futex. execve has to end both first (Linux's
+   rule); linuxhello then prints its line with the same pid and exits 7. */
+static const char hello_path[] = "/bin/linuxhello";
+
+static void execer(void *arg) {
+    (void)arg;
+    static const char *argv[] = {hello_path, 0};
+    long r = sc(SYS_execve, (long)hello_path, (long)argv, 0, 0, 0);
+    fail("execve from a thread answered", r);
+}
+
+static void exec_from_a_thread(void) {
+    start(0, spinner);
+    start(1, execer);
+    static volatile u32 never;
+    futex(&never, FUTEX_WAIT, 0, 0);
+    fail("the first thread outlived an execve", 0);
+}
+
+/* The program starts here, with SP at argc (Linux's layout): `_start` hands that to `main_with`. */
+__asm__(".text\n"
+        ".global _start\n"
+        "_start:\n"
+        "    mov x0, sp\n"
+        "    b main_with\n");
+
+void main_with(long *sp) {
+    if (sp[0] > 1)
+        exec_from_a_thread();
     long pid = sc(SYS_getpid, 0, 0, 0, 0, 0);
     if (sc(SYS_gettid, 0, 0, 0, 0, 0) != pid)
         fail("the first thread's id is not the pid", 0);
