@@ -23,7 +23,7 @@ module keel.net
 // (`net_tick`), and the sleeper looks at the clock. That is a 10 ms timeout made of the two mechanisms
 // keel already has; keel has no timed sleep.
 
-import keel.sched.{IrqLock, Thread, WaitQueue, join, spawn}
+import keel.sched.{IrqLock, Thread, WaitQueue, join, poll_notify, spawn}
 import keel.timer
 import sysl.sync.{Atomic, Ordering}
 
@@ -456,6 +456,14 @@ private deliver(s: usize, from: Ip, from_port: u16, data: []const u8)
         sockets[s].queue[slot].bytes[i] = data[i]
     sockets[s].count += 1
     events.wake_all()
+    poll_notify()
+
+// Whether a datagram is queued on `sd`: what `ppoll` sees as readable on a socket.
+socket_readable(sd: usize) -> bool
+    val flags = lock.lock()
+    val r = mine(sd) && sockets[sd].count > 0
+    lock.unlock(flags)
+    r
 
 // The oldest datagram queued on `sd`, copied into `into` (cut to fit), with its length and sender;
 // waits up to `timeout` ms for one, or for ever if `timeout` is 0.

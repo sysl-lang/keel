@@ -6,7 +6,8 @@
 //
 // A wrong name or password says `login incorrect` and asks again. The end of the input at the name
 // prompt (Ctrl-D on an empty line) exits with passwd.CONSOLE_CLOSED, which tells init the console is
-// gone. The password is echoed: keel's console has one line discipline and no way to turn echo off.
+// gone. The password is read with the terminal's echo off (rt's `hidden`, TCGETS/TCSETS): the standard
+// library has no terminal-mode call a freestanding program can reach (FINDINGS 75).
 
 import passwd.keel.passwd
 import passwd.keel.passwd.User
@@ -55,11 +56,12 @@ loop
             exit(passwd.CONSOLE_CLOSED)
     if name == "" then continue
     prints("password: ")
-    val password = reader.getline() match
+    val quiet = user.hidden(0)
+    val line = reader.getline()
+    user.shown(quiet)
+    val password = line match
         Some(p) -> p
-        None ->
-            print("")
-            exit(passwd.CONSOLE_CLOSED)
+        None -> exit(passwd.CONSOLE_CLOSED)
     passwd.user_named(passwd.read_users(), name) match
         Some(u) -> if passwd.opens(u, password) then session(u)
         None -> ()

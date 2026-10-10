@@ -31,6 +31,8 @@ const SYS_GETDENTS64: u64 = 61      // getdents64(fd, buf, len) -> bytes of whol
 const SYS_LSEEK: u64 = 62           // lseek(fd, offset, whence) -> the new offset
 const SYS_READ: u64 = 63            // read(fd, buf, len) -> bytes read; 0 at the end of the file
 const SYS_WRITE: u64 = 64           // write(fd, buf, len) -> bytes written
+const SYS_PSELECT6: u64 = 72        // pselect6(nfds, *read, *write, *except, *Timespec | 0, *[2]u64 {*sigset, 8} | 0) -> ready bits
+const SYS_PPOLL: u64 = 73           // ppoll(*PollFd, nfds, *Timespec | 0, *sigset | 0, 8) -> entries with revents
 const SYS_NEWFSTATAT: u64 = 79      // newfstatat(dirfd, path, *Stat, flags) -> 0; AT_EMPTY_PATH with "" is fstat(dirfd)
 const SYS_FSTAT: u64 = 80           // fstat(fd, *Stat) -> 0
 const SYS_SYNC: u64 = 81            // sync() -> 0: every changed block is on the disk when it returns
@@ -39,6 +41,9 @@ const SYS_EXIT_GROUP: u64 = 94      // exit_group(code) -> never: ends every thr
 const SYS_SET_TID_ADDRESS: u64 = 96 // set_tid_address(*u32) -> the caller's thread id; the word is zeroed and woken at its end
 const SYS_FUTEX: u64 = 98           // futex(*u32, op, val, *Timespec | 0, ...) -> FUTEX_WAIT 0 / FUTEX_WAKE the number woken
 const SYS_NANOSLEEP: u64 = 101      // nanosleep(*Timespec, *Timespec left | 0) -> 0, or EINTR with what was left
+const SYS_CLOCK_GETTIME: u64 = 113  // clock_gettime(clock, *Timespec) -> 0
+const SYS_CLOCK_GETRES: u64 = 114   // clock_getres(clock, *Timespec | 0) -> 0
+const SYS_CLOCK_NANOSLEEP: u64 = 115 // clock_nanosleep(clock, flags, *Timespec, *Timespec left | 0) -> 0; TIMER_ABSTIME
 const SYS_KILL: u64 = 129           // kill(pid | 0 | -1 | -pgid, sig) -> 0
 const SYS_RT_SIGACTION: u64 = 134   // rt_sigaction(sig, *SigAction | 0, *SigAction old | 0, 8) -> 0
 const SYS_RT_SIGPROCMASK: u64 = 135 // rt_sigprocmask(how, *u64 set | 0, *u64 old | 0, 8) -> 0
@@ -49,6 +54,7 @@ const SYS_SETPGID: u64 = 154        // setpgid(pid | 0, pgid | 0) -> 0
 const SYS_GETPGID: u64 = 155        // getpgid(pid | 0) -> the process group
 const SYS_GETSID: u64 = 156         // getsid(pid | 0) -> the session
 const SYS_SETSID: u64 = 157         // setsid() -> the new session's id, the caller's pid; EPERM for a group leader
+const SYS_GETTIMEOFDAY: u64 = 169   // gettimeofday(*Timeval | 0, *timezone | 0) -> 0; the zone is UTC
 const SYS_GETPID: u64 = 172         // getpid() -> pid
 const SYS_GETPPID: u64 = 173        // getppid() -> the parent's pid; 0 for a process the kernel started
 const SYS_GETUID: u64 = 174         // getuid() -> the caller's user id
@@ -227,9 +233,15 @@ const FUTEX_WAKE: u64 = 1
 const FUTEX_PRIVATE_FLAG: u64 = 128
 const FUTEX_CLOCK_REALTIME: u64 = 256
 
-// `ioctl`'s requests on the console: the foreground process group (an `i32` the argument points at),
+// `ioctl`'s requests on the console: its settings (a `Termios`: TCGETS reads them; TCSETS sets them,
+// TCSETSW once output has drained — keel's console writes synchronously, so at once — and TCSETSF after
+// throwing away the input not yet read), the foreground process group (an `i32` the argument points at),
 // and the window's size (a `Winsize`; keel's console answers 24 rows of 80 columns). Any other request
 // is EINVAL; any descriptor but the console's is ENOTTY.
+const TCGETS: u64 = 0x5401
+const TCSETS: u64 = 0x5402
+const TCSETSW: u64 = 0x5403
+const TCSETSF: u64 = 0x5404
 const TIOCGPGRP: u64 = 0x540f
 const TIOCSPGRP: u64 = 0x5410
 const TIOCGWINSZ: u64 = 0x5413
@@ -241,6 +253,118 @@ struct Winsize
     ypixel: u16
 
 @assert(sizeof(Winsize) == 8, "a Winsize is 8 bytes")
+
+// The kernel's `struct termios` (asm-generic termbits.h): four flag words, the line discipline (0, the
+// only one), and NCCS = 19 control characters. A C library's own `struct termios` is longer (musl's
+// has 32 characters and two speeds after them); TCGETS writes, and TCSETS reads, only these 36 bytes.
+const NCCS: usize = 19
+
+struct Termios
+    iflag: u32
+    oflag: u32
+    cflag: u32
+    lflag: u32
+    line: u8
+    cc: [NCCS]u8
+
+@assert(sizeof(Termios) == 36, "a Termios is 36 bytes, as asm-generic's struct termios")
+
+// `cc`'s indices (asm-generic termbits.h). A character of 0 is disabled (_POSIX_VDISABLE).
+const VINTR: usize = 0
+const VQUIT: usize = 1
+const VERASE: usize = 2
+const VKILL: usize = 3
+const VEOF: usize = 4
+const VTIME: usize = 5                  // raw mode: tenths of a second (termbits.h)
+const VMIN: usize = 6                   // raw mode: bytes a read waits for
+const VSTART: usize = 8
+const VSTOP: usize = 9
+const VSUSP: usize = 10
+const VEOL: usize = 11
+const VREPRINT: usize = 12
+const VDISCARD: usize = 13
+const VWERASE: usize = 14
+const VLNEXT: usize = 15
+const VEOL2: usize = 16
+
+// `iflag` (termbits-common.h / termbits.h). keel honours ISTRIP, INLCR, IGNCR and ICRNL; the rest are
+// kept and read back.
+const ISTRIP: u32 = 0x0020
+const INLCR: u32 = 0x0040
+const IGNCR: u32 = 0x0080
+const ICRNL: u32 = 0x0100
+const IXON: u32 = 0x0400
+
+// `oflag`: OPOST with ONLCR (a newline goes out as CR LF) and OCRNL (a CR as a newline).
+const OPOST: u32 = 0x01
+const ONLCR: u32 = 0x04
+const OCRNL: u32 = 0x08
+
+// `cflag`: only read back. B38400 | CS8 | CREAD | HUPCL is what a Linux console starts with.
+const B38400: u32 = 0x000f
+const CS8: u32 = 0x0030
+const CREAD: u32 = 0x0080
+const HUPCL: u32 = 0x0400
+
+// `lflag`. keel honours ISIG (VINTR → SIGINT, VQUIT → SIGQUIT), ICANON (lines, VERASE/VKILL/VEOF/
+// VEOL/VEOL2; off: VMIN/VTIME), ECHO, ECHOE, ECHOK, ECHONL, ECHOCTL and ECHOKE.
+const ISIG: u32 = 0x0001
+const ICANON: u32 = 0x0002
+const ECHO: u32 = 0x0008
+const ECHOE: u32 = 0x0010
+const ECHOK: u32 = 0x0020
+const ECHONL: u32 = 0x0040
+const NOFLSH: u32 = 0x0080
+const ECHOCTL: u32 = 0x0200
+const ECHOKE: u32 = 0x0800
+const IEXTEN: u32 = 0x8000
+
+// What the console starts with: Linux's `tty_std_termios`, the control characters its INIT_C_CC.
+console_termios() -> Termios =
+    Termios(ICRNL | IXON, OPOST | ONLCR, B38400 | CS8 | CREAD | HUPCL,
+        ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN, 0,
+        [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0])
+
+// `ppoll`'s `struct pollfd` (an `int` and two `short`s) and its bits (asm-generic poll.h). A negative
+// descriptor is passed over (revents 0); one that is not open answers POLLNVAL. POLLERR, POLLHUP and
+// POLLNVAL are answered whether asked for or not.
+struct PollFd
+    fd: i32
+    events: u16
+    revents: u16
+
+@assert(sizeof(PollFd) == 8, "a PollFd is 8 bytes")
+
+const POLLIN: u16 = 0x0001
+const POLLPRI: u16 = 0x0002
+const POLLOUT: u16 = 0x0004
+const POLLERR: u16 = 0x0008
+const POLLHUP: u16 = 0x0010
+const POLLNVAL: u16 = 0x0020
+const POLLRDNORM: u16 = 0x0040
+const POLLRDBAND: u16 = 0x0080
+const POLLWRNORM: u16 = 0x0100
+const POLLWRBAND: u16 = 0x0200
+
+// The most entries one `ppoll` takes (EINVAL past it), and the most descriptors a `pselect6` set may
+// name (FD_SETSIZE; any of them past MAX_FDS is not open, EBADF).
+const POLL_MAX: u64 = 64
+const FD_SETSIZE: u64 = 1024
+
+// The clocks (linux/time.h). REALTIME starts at what the PL031 real-time clock read at boot; MONOTONIC
+// is the generic counter (CNTVCT_EL0) from 0 at its start. The coarse ones and MONOTONIC_RAW and
+// BOOTTIME read the same (keel never suspends and nothing slews the counter); the CPU-time clocks are
+// EINVAL.
+const CLOCK_REALTIME: u64 = 0
+const CLOCK_MONOTONIC: u64 = 1
+const CLOCK_PROCESS_CPUTIME_ID: u64 = 2
+const CLOCK_THREAD_CPUTIME_ID: u64 = 3
+const CLOCK_MONOTONIC_RAW: u64 = 4
+const CLOCK_REALTIME_COARSE: u64 = 5
+const CLOCK_MONOTONIC_COARSE: u64 = 6
+const CLOCK_BOOTTIME: u64 = 7
+
+const TIMER_ABSTIME: u64 = 1            // clock_nanosleep: the time is when to wake, not how long
 
 // Descriptors are a table of what each one is: the console, a file, one end of a pipe, or a socket. A
 // new process's 0 to 2 are the console unless its parent gave it something else (`SpawnAttr`); a

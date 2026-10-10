@@ -7,7 +7,8 @@ import abi.keel.abi.{EAGAIN, EFAULT, EINTR, EINVAL, ENOSYS, EPERM, ETIMEDOUT, Er
     SYS_GETPPID, SYS_GETSID, SYS_GETTID, SYS_GETUID, SYS_IOCTL, SYS_KILL, SYS_LSEEK, SYS_MKDIRAT, SYS_NANOSLEEP, SYS_NEWFSTATAT,
     SYS_OPENAT, SYS_PIPE2, SYS_PROCS, SYS_READ, SYS_RECVFROM, SYS_RENAMEAT, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK,
     SYS_RT_SIGRETURN, SYS_SENDTO, SYS_SETGID, SYS_SETPGID, SYS_SETSID, SYS_SETSOCKOPT, SYS_SETUID, SYS_SET_TID_ADDRESS,
-    SYS_SOCKET, SYS_SPAWN, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE, Timespec}
+    SYS_SOCKET, SYS_SPAWN, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE, Timespec, SYS_CLOCK_GETRES,
+    SYS_CLOCK_GETTIME, SYS_CLOCK_NANOSLEEP, SYS_GETTIMEOFDAY, SYS_PPOLL, SYS_PSELECT6}
 import keel.fs
 import keel.mm
 import keel.sched
@@ -83,6 +84,12 @@ private[proc] system_call(regs: *u64) -> Option[u64]
         SYS_GETSID -> sys_getsid(p, regs)
         SYS_IOCTL -> sys_ioctl(p, regs)
         SYS_NANOSLEEP -> sys_nanosleep(p, regs)
+        SYS_CLOCK_NANOSLEEP -> sys_clock_nanosleep(p, regs)
+        SYS_CLOCK_GETTIME -> sys_clock_gettime(p, regs)
+        SYS_CLOCK_GETRES -> sys_clock_getres(p, regs)
+        SYS_GETTIMEOFDAY -> sys_gettimeofday(p, regs)
+        SYS_PPOLL -> sys_ppoll(p, regs)
+        SYS_PSELECT6 -> sys_pselect6(p, regs)
         SYS_SPAWN -> sys_spawn(p, regs)
         SYS_PROCS -> sys_procs(p, regs)
         else Err(ENOSYS)
@@ -90,8 +97,14 @@ private[proc] system_call(regs: *u64) -> Option[u64]
         Ok(v) -> u64(v)
         Err(e) -> u64(-i64(e))
     r match
-        Err(EINTR) if regs[8] != SYS_NANOSLEEP -> Some(first)
+        Err(EINTR) if restartable(regs[8]) -> Some(first)
         _ -> None
+
+// Whether a call that answered EINTR is made again for a handler with SA_RESTART: every call but the
+// ones Linux never restarts that way — the sleeps, whose answer says how long was left, and ppoll and
+// pselect6.
+private restartable(nr: u64) -> bool =
+    nr != SYS_NANOSLEEP && nr != SYS_CLOCK_NANOSLEEP && nr != SYS_PPOLL && nr != SYS_PSELECT6
 
 // exit(code): the calling thread ends; the process ends with its last thread, and its status is the
 // code its first thread passed, as Linux has it.

@@ -22,7 +22,7 @@ module keel.proc
 // O_CLOEXEC is taken and changes nothing — keel has no close-on-exec.
 
 import abi.keel.abi.{EBADF, EDESTADDRREQ, EFAULT, EINTR, EINVAL, EMFILE, ENFILE, EPIPE, Errno, MAX_FDS, O_CLOEXEC,
-    PIPE_ROOM, SIGPIPE}
+    PIPE_ROOM, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, SIGPIPE}
 import keel.console
 import keel.fs
 import keel.mm
@@ -228,6 +228,7 @@ private[proc] release(f: OpenFile)
                 pp.writers -= 1
                 if pp.writers == 0 then val _ = pp.can_read.wake_all()
             if pp.readers == 0 && pp.writers == 0 then pp.in_use = false
+            sched.poll_notify()
             pipe_lock.unlock(flags)
         else ()
 
@@ -309,7 +310,9 @@ private pipe_read(p: *Process, slot: usize, va: u64, len: u64) -> Result[i64, Er
         chunk[i] = pp.bytes[(pp.head + i) % ROOM]
     pp.head = (pp.head + n) % ROOM
     pp.count -= n
-    if n > 0 then val _ = pp.can_write.wake_all()
+    if n > 0
+        val _ = pp.can_write.wake_all()
+        sched.poll_notify()
     pipe_lock.unlock(flags)
     if !mm.copy_to_user(&p.space, va, chunk[0..<n]) then return Err(EFAULT)
     Ok(i64(n))
@@ -358,8 +361,29 @@ private into_pipe(p: *Process, slot: usize, bytes: []const u8) -> (usize, bool)
         pp.count += n
         put += n
         val _ = pp.can_read.wake_all()
+        if WRITE_WAKES_POLLERS then sched.poll_notify()
     pipe_lock.unlock(flags)
     (put, false)
+
+// Off only to show what waking the pollers is for: with it off a write into a pipe leaves a `ppoll` on its
+// read end asleep until its timeout, and the boot test's `linuxpoll` fails its first wait.
+private const WRITE_WAKES_POLLERS: bool = true
+
+// What `ppoll` sees on pipe `slot`'s read end (`read_end`) or write end: Linux's pipe_poll — readable
+// while it holds a byte, POLLHUP once no write end is left; writable while there is room, POLLERR once no
+// read end is left.
+private[proc] pipe_poll(slot: usize, read_end: bool) -> u16
+    val flags = pipe_lock.lock()
+    val pp = &pipes[slot]
+    var mask: u16 = 0
+    if read_end
+        if pp.count > 0 then mask = POLLIN | POLLRDNORM
+        if pp.writers == 0 then mask |= POLLHUP
+    else
+        if pp.count < ROOM then mask = POLLOUT | POLLWRNORM
+        if pp.readers == 0 then mask |= POLLERR
+    pipe_lock.unlock(flags)
+    mask
 
 // The console's write: every page of the buffer is checked against the process's translation tables
 // first — mapped, and mapped for the user — so a bad pointer anywhere in it answers EFAULT and prints
@@ -374,6 +398,7 @@ private console_write(p: *Process, buf: UserAddr, len: u64) -> Result[i64, Errno
         return Ok(i64(len))
 
     if !user_readable(&p.space, buf, len) then return Err(EFAULT)
+    val oflag = console.output_flags()
     console.hold()
     var done: u64 = 0
     while done < len
@@ -386,7 +411,7 @@ private console_write(p: *Process, buf: UserAddr, len: u64) -> Result[i64, Errno
             None -> (mm.PhysAddr(0), false)
         val src: *u8 = ptr_cast(usize(u64(mm.to_virt(pa))))
         for i in 0..<chunk
-            put_byte(src[usize(i)])
+            console.put(src[usize(i)], oflag)
         done += chunk
     console.release()
     Ok(i64(len))

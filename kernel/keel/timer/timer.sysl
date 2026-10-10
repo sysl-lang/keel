@@ -3,6 +3,12 @@ module keel.timer
 // The EL1 virtual timer of the Arm generic timer. It counts the system counter at `CNTFRQ_EL0` ticks
 // a second and raises private interrupt 27 when its countdown (`CNTV_TVAL_EL0`) reaches zero. Under
 // HVF the virtual timer is the one the hypervisor gives the guest.
+//
+// The same counter is the kernel's clock: `now_ns` (CLOCK_MONOTONIC) is it in nanoseconds, and
+// `realtime_ns` (CLOCK_REALTIME) adds the time of day the PL031 real-time clock said at boot. The PL031
+// counts whole seconds, so the wall clock is right to a second and moves with the counter between.
+
+import keel.mm
 
 // The timer's interrupt ID at the GIC.
 const IRQ: u32 = 27
@@ -11,7 +17,46 @@ const IRQ: u32 = 27
 private var period: u64 = 0
 
 // The system counter's frequency, in Hz.
-private frequency() -> u64 = read_sysreg("cntfrq_el0")
+frequency() -> u64 = read_sysreg("cntfrq_el0")
+
+// The system counter.
+private counter() -> u64 = read_sysreg("cntvct_el0")
+
+private const NS: u64 = 1_000_000_000
+
+// Nanoseconds since the system counter started: the monotonic clock, the same on every core. Whole
+// seconds and the rest are converted apart, so the product never overflows (a frequency is below 2^32).
+now_ns() -> u64
+    val c = counter()
+    val f = frequency()
+    (c / f) * NS + (c % f) * NS / f
+
+// How many nanoseconds one counter tick is, rounded up: the clock's resolution.
+resolution_ns() -> u64 = (NS + frequency() - 1) / frequency()
+
+// QEMU virt's PL031 real-time clock. RTCDR counts seconds since the epoch, from the host's clock.
+private const RTC_BASE: u64 = 0x0901_0000
+
+private struct Rtc
+    dr: volatile u32            // 0x00 data: the seconds
+
+private rtc() -> *Rtc = mm.io(mm.PhysAddr(RTC_BASE))
+
+// realtime - monotonic, in nanoseconds; set once, by `start`.
+private var epoch_ns: u64 = 0
+
+// The wall clock: nanoseconds since 1970-01-01 UTC.
+realtime_ns() -> u64 = epoch_ns + now_ns()
+
+// What `realtime_ns` answers for the monotonic time `ns`, and back.
+realtime_of(ns: u64) -> u64 = epoch_ns + ns
+monotonic_of(realtime: u64) -> u64 = if realtime > epoch_ns then realtime - epoch_ns else 0
+
+// Read the real-time clock once and tie the wall clock to the counter.
+private start_realtime()
+    val seconds = u64(rtc().dr)
+    val now = now_ns()
+    epoch_ns = if seconds * NS > now then seconds * NS - now else 0
 
 // Count down `ticks` from now. Writing the countdown also clears a condition already met.
 private set_countdown(ticks: u64)
@@ -27,6 +72,7 @@ private set_control(bits: u64)
 // sets the period, and the others start theirs with `start_this_core`.
 start(ms: u64)
     period = frequency() * ms / 1000
+    start_realtime()
     start_this_core()
 
 // Start this core's timer at the period `start` set.

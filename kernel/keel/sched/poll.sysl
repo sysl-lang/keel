@@ -1,0 +1,73 @@
+module keel.sched
+
+// Waiting for any of several things at once: `ppoll`'s and `pselect6`'s sleep.
+//
+// A poller does not sleep on the queue of each thing it watches — a pipe's, the console's, a socket's —
+// but on one queue for every poller, `pollers`, with a count of events, `generation`, beside it. Every
+// source that something may have become ready on (a pipe written, read or closed, a byte at the console,
+// a datagram for a socket) calls `poll_notify`, which counts an event and wakes every poller. A poller
+// reads the count, looks at its descriptors (keel.proc), and sleeps only if the count still reads the
+// same — so an event between its look and its sleep is never lost, and it looks again only when there
+// has been one. That costs a poller a needless look now and then, when the event was for somebody else;
+// it never costs one a missed wake.
+//
+// A deadline is the nap's mechanism: while anyone polls with one, every tick wakes the queue and each
+// timed poller compares the clock, sleeping again if neither its time nor an event has come. A signal
+// ends the wait, as any interruptible sleep's.
+
+import keel.timer
+import sysl.sync.{Atomic, Ordering}
+
+private var pollers: WaitQueue
+private var poll_guard: IrqLock
+private var generation: u64 = 0                     // under poll_guard
+private var timed_pollers: Atomic[u64] = Atomic(0)
+
+// No deadline: wait until an event or a signal.
+const FOREVER: u64 = 0xffff_ffff_ffff_ffff
+
+// Something a poller may be waiting for may be ready now. Any context, any lock of the source's held
+// (the poll guard is taken last, and a poller never holds it while it looks at a source).
+poll_notify()
+    val flags = poll_guard.lock()
+    generation += 1
+    val _ = pollers.wake_all()
+    poll_guard.unlock(flags)
+
+// The event count, read before a poller looks at its descriptors.
+poll_generation() -> u64
+    val flags = poll_guard.lock()
+    val g = generation
+    poll_guard.unlock(flags)
+    g
+
+enum PollWait
+    Event                       // the count moved past `seen`: look again
+    TimedOut
+    Interrupted                 // a signal for the thread: EINTR
+
+// Sleep until there has been an event since the count read `seen`, the monotonic clock reaches
+// `deadline_ns` (FOREVER for none), or a signal for `p` comes.
+poll_wait(p: *Process, seen: u64, deadline_ns: u64) -> PollWait
+    val flags = poll_guard.lock()
+    val timed = deadline_ns != FOREVER
+    if timed then timed_pollers.add(1)
+    var answer = PollWait.Event
+    loop
+        if generation != seen then break
+        if timed && timer.now_ns() >= deadline_ns
+            answer = PollWait.TimedOut
+            break
+        if !sleep_interruptibly(p, &pollers, &poll_guard)
+            answer = PollWait.Interrupted
+            break
+    if timed then timed_pollers.sub(1)
+    poll_guard.unlock(flags)
+    answer
+
+// The timer interrupt's part (`tick`): wake the pollers with a deadline to look at the clock.
+private[sched] poll_tick()
+    if timed_pollers.load(Ordering.Acquire) == 0 then return
+    val flags = poll_guard.lock()
+    val _ = pollers.wake_all()
+    poll_guard.unlock(flags)

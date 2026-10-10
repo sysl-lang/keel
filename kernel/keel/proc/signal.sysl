@@ -15,14 +15,14 @@ module keel.proc
 // reads the frame back from SP and puts every register back as it was, the flags made safe (EL0, no
 // exception masked: only NZCV is taken from the frame).
 
-import abi.keel.abi.{EFAULT, EINTR, EINVAL, ENOTTY, EPERM, ESRCH, Errno, INIT_PID, MAX_FDS, NSIG, ProcInfo,
-    SA_RESTART, SA_RESTORER, SIGINT, SIGKILL, SIGSEGV, SIGSET_SIZE, SIGSTOP, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_SETMASK,
-    SIG_UNBLOCK, SigAction, SigFrame, TIOCGPGRP, TIOCGWINSZ, TIOCSPGRP, Timespec, Winsize}
+import abi.keel.abi.{EFAULT, EINVAL, ENOTTY, EPERM, ESRCH, Errno, INIT_PID, MAX_FDS, NSIG, ProcInfo,
+    SA_RESTART, SA_RESTORER, SIGINT, SIGKILL, SIGQUIT, SIGSEGV, SIGSET_SIZE, SIGSTOP, SIG_BLOCK, SIG_DFL, SIG_IGN,
+    SIG_SETMASK, SIG_UNBLOCK, SigAction, SigFrame, TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGPGRP, TIOCGWINSZ, TIOCSPGRP,
+    Termios, Winsize, console_termios}
 import keel.console
 import keel.mm
 import keel.sched
 import keel.sched.{Action, Holds, Process, Wakes}
-import keel.timer
 import sysl.buf.{Buf, buf}
 import sysl.sync.Ordering
 
@@ -58,7 +58,7 @@ private const RESTART_CALLS: bool = true
 private[proc] deliver(p: *Process, regs: *u64, again: Option[u64] = None)
     loop
         val (sig, a) = sched.take(p)
-        if sig == 0 then return
+        if sig == 0 then break
         if a.handler == SIG_IGN then continue
         if a.handler == SIG_DFL
             if sched.default_ignores(sig) then continue
@@ -71,7 +71,44 @@ private[proc] deliver(p: *Process, regs: *u64, again: Option[u64] = None)
                 None -> ()
         // A process whose stack cannot take the frame cannot run the handler.
         if !push_frame(p, regs, sig, a) then end(p, SIGSEGV, 0)
-        return
+        break
+    mask_back(p)
+
+// ppoll's and pselect6's signal mask: `set` (keel's numbering) is the calling thread's blocked set for
+// the length of the call. Answers the set it replaced.
+private[proc] mask_for_call(p: *Process, set: u64) -> u64
+    val s = p.sig
+    val flags = s.lock.lock()
+    val t = sched.current()
+    val old = t.user.blocked
+    t.user.blocked = set & ~sched.UNBLOCKABLE
+    s.lock.unlock(flags)
+    old
+
+// The call is over: `old` is the blocked set again — at once, or, when a signal interrupted the call,
+// only once that signal has been delivered under the call's mask (Linux's sigsuspend rule, which is why
+// pselect exists: the mask that let the signal in is the one its handler runs under, and the frame
+// keeps `old` for `rt_sigreturn` to put back).
+private[proc] mask_after_call(p: *Process, old: u64, interrupted: bool)
+    val s = p.sig
+    val flags = s.lock.lock()
+    val t = sched.current()
+    if interrupted
+        t.user.call_mask = true
+        t.user.mask_after = old
+    else
+        t.user.blocked = old
+    s.lock.unlock(flags)
+
+// What `mask_after_call` left for delivery, put back if no handler's frame took it.
+private mask_back(p: *Process)
+    val t = sched.current()
+    if !t.user.call_mask then return
+    val s = p.sig
+    val flags = s.lock.lock()
+    t.user.blocked = t.user.mask_after
+    t.user.call_mask = false
+    s.lock.unlock(flags)
 
 // Make the process resume in `a`'s handler for `sig`, the registers it was going to resume with saved
 // below its stack pointer. False if that is not memory it may write.
@@ -84,7 +121,8 @@ private push_frame(p: *Process, regs: *u64, sig: u64, a: Action) -> bool
     val at = (regs[SP] - u64(sizeof(SigFrame))) & ~u64(15)
     val flags = s.lock.lock()
     val t = sched.current()
-    f.blocked = t.user.blocked
+    f.blocked = if t.user.call_mask then t.user.mask_after else t.user.blocked
+    t.user.call_mask = false
     t.user.blocked = (t.user.blocked | a.mask | sched.bit(sig)) & ~sched.UNBLOCKABLE
     s.lock.unlock(flags)
     val bytes: *u8 = ptr_cast(&f)
@@ -115,7 +153,7 @@ private[proc] sys_rt_sigreturn(p: *Process, regs: *u64) -> Result[i64, Errno]
 
 // A set as keel.sched keeps it (signal n at bit n) and as Linux's `sigset_t` has it (signal n at bit
 // n - 1). Linux's signals from NSIG up, the real-time ones, keel does not have, and a set loses them.
-private from_linux_set(set: u64) -> u64 = (set << 1) & ((u64(1) << NSIG) - 2)
+private[proc] from_linux_set(set: u64) -> u64 = (set << 1) & ((u64(1) << NSIG) - 2)
 private to_linux_set(set: u64) -> u64 = set >> 1
 
 // rt_sigaction(sig, *SigAction | 0, *SigAction old | 0, sigsetsize) -> 0, the kernel's `struct
@@ -220,12 +258,12 @@ private signal_group(pgid: u64, sig: u64)
     family.unlock(flags)
     wakes.wake_all()
 
-// Ctrl-C at the console (keel.console, interrupt context): SIGINT to its foreground group. It runs on
-// keel.trap's interrupt path, so it carries that path's promise itself: the `extern` it is reached
-// through is where the caller's check stops.
+// VINTR or VQUIT typed at the console with ISIG set (keel.console, interrupt context): SIGINT or SIGQUIT
+// to its foreground group. It runs on keel.trap's interrupt path, so it carries that path's promise
+// itself: the `extern` it is reached through is where the caller's check stops.
 @no_alloc
 @export("keel_console_interrupt")
-console_interrupt(pgid: u64) = signal_group(pgid, SIGINT)
+console_interrupt(pgid: u64, sig: u64) = signal_group(pgid, if sig == SIGQUIT then SIGQUIT else SIGINT)
 
 // Whether `p` may put a process in group `pgid`: one of its own user's processes is in it (root may
 // join any), and that process is in `p`'s session — a group never spans two. A process that has ended
@@ -315,14 +353,26 @@ private on_console(p: *Process, fd: u64) -> bool
     sched.unlock_files(p)
     console
 
-// ioctl(fd, request, arg) -> 0, on the console: TIOCGPGRP writes its foreground group (0 for none) to the
-// `i32` at `arg`; TIOCSPGRP makes the group in the `i32` at `arg` the foreground one, which must be a
-// group of the caller's user; TIOCGWINSZ answers 24 rows of 80 columns. ENOTTY for any descriptor but
-// the console, EINVAL for any other request.
+// ioctl(fd, request, arg) -> 0, on the console: TCGETS writes its settings (a `Termios`) to `arg`;
+// TCSETS, TCSETSW and TCSETSF set them from `arg` (TCSETSF throwing away the input not yet read first);
+// TIOCGPGRP writes its foreground group (0 for none) to the `i32` at `arg`; TIOCSPGRP makes the group in
+// the `i32` at `arg` the foreground one, which must be a group of the caller's user; TIOCGWINSZ answers
+// 24 rows of 80 columns. ENOTTY for any descriptor but the console, EINVAL for any other request.
 private[proc] sys_ioctl(p: *Process, regs: *u64) -> Result[i64, Errno]
     if !on_console(p, regs[0]) then return Err(ENOTTY)
     val arg = regs[2]
     regs[1] match
+        TCGETS ->
+            var t = console.settings()
+            val b: *u8 = ptr_cast(&t)
+            if !mm.copy_to_user(&p.space, arg, b[0..<sizeof(Termios)]) then return Err(EFAULT)
+            Ok(0)
+        TCSETS | TCSETSW | TCSETSF ->
+            var t = console_termios()
+            val b: *u8 = ptr_cast(&t)
+            if !mm.copy_from_user(&p.space, arg, b[0..<sizeof(Termios)]) then return Err(EFAULT)
+            console.set_settings(t, regs[1] == TCSETSF)
+            Ok(0)
         TIOCGPGRP ->
             var g = u32(console.foreground_group())
             val b: *u8 = ptr_cast(&g)
@@ -341,25 +391,6 @@ private[proc] sys_ioctl(p: *Process, regs: *u64) -> Result[i64, Errno]
             if !mm.copy_to_user(&p.space, arg, b[0..<sizeof(Winsize)]) then return Err(EFAULT)
             Ok(0)
         else Err(EINVAL)
-
-// nanosleep(*Timespec, *Timespec left | 0) -> 0; EINTR, with what was left, if a signal ended it.
-// Rounded up to the timer's 10 ms.
-private[proc] sys_nanosleep(p: *Process, regs: *u64) -> Result[i64, Errno]
-    var want = Timespec(0, 0)
-    val raw: *u8 = ptr_cast(&want)
-    if !mm.copy_from_user(&p.space, regs[0], raw[0..<sizeof(Timespec)]) then return Err(EFAULT)
-    if want.sec < 0 || want.nsec < 0 || want.nsec >= 1_000_000_000 then return Err(EINVAL)
-    val left_at = regs[1]
-    if left_at != 0 && !mm.user_range(&p.space, left_at, u64(sizeof(Timespec)), true) then return Err(EFAULT)
-    val deadline = timer.now_ms() + u64(want.sec) * 1000 + (u64(want.nsec) + 999_999) / 1_000_000
-    if sched.nap_until(p, deadline) then return Ok(0)
-    if left_at != 0
-        val now = timer.now_ms()
-        val ms = if now < deadline then deadline - now else 0
-        var left = Timespec(i64(ms / 1000), i64(ms % 1000) * 1_000_000)
-        val b: *u8 = ptr_cast(&left)
-        if !mm.copy_to_user(&p.space, left_at, b[0..<sizeof(Timespec)]) then return Err(EFAULT)
-    Err(EINTR)
 
 // procs(*ProcInfo, count) -> how many it filled: the process table, at most `count` of it.
 private[proc] sys_procs(p: *Process, regs: *u64) -> Result[i64, Errno]

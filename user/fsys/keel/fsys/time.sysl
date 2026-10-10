@@ -1,0 +1,20 @@
+module keel.fsys
+
+// `sysl.time` on keel: its two seams, `sysl_wall_us` (`now`) and `sysl_monotonic_us` (`monotonic`),
+// over `clock_gettime` with CLOCK_REALTIME and CLOCK_MONOTONIC. The library's own definitions of these
+// are weak on a freestanding target, so these are the ones a keel program links.
+
+import abi.keel.abi.{CLOCK_MONOTONIC, CLOCK_REALTIME, SYS_CLOCK_GETTIME, Timespec}
+import rt.keel.user.syscall
+
+// `clock` in microseconds; 0 if keel refused it (it has both of these).
+private micros_of(clock: u64) -> long
+    var t = Timespec(0, 0)
+    if syscall(SYS_CLOCK_GETTIME, clock, u64(usize(&t)), 0, 0) < 0 then return 0
+    t.sec * 1_000_000 + t.nsec / 1000
+
+@export("sysl_wall_us")
+wall_us() -> long = micros_of(CLOCK_REALTIME)
+
+@export("sysl_monotonic_us")
+monotonic_us() -> long = micros_of(CLOCK_MONOTONIC)

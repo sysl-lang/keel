@@ -173,7 +173,8 @@ session1=(
     $'\x04'
 )
 transcript1=(
-    $'login: root\npassword: keelroot\n'        # init ran login; root's password opens root's account
+    $'login: root\npassword: \n'        # init ran login; root's password opens root's account, read
+                                                # with echo off (milestone 17): no password is ever on screen
     $'# echo hello\nhello\n'                    # a program from /bin with its argv, in root's shell
     $'# pwd\n/\n'                               # the built-in pwd, from root's home, the root
     $'# mkdir /t\n# cd /t\n# pwd\n/t\n'         # mkdir, and cd — the shell's own directory
@@ -190,19 +191,19 @@ transcript1=(
     $'# orphan\n# false\nsh: false: exit status 1\n'   # a failing command's status is said
     $'# nosuch\nsh: nosuch: not found\n'        # ...and a missing one's
     $'# whoami\nroot\n# exit\n'
-    $'login: alice\npassword: nope\nlogin incorrect\n'   # init ran login again; a wrong password is refused
-    $'login: alice\npassword: wonderland\n'
+    $'login: alice\npassword: \nlogin incorrect\n'   # init ran login again; a wrong password is refused
+    $'login: alice\npassword: \n'
     $'$ id\nuid=1000(alice) gid=100(users)\n'   # alice's ids, named from /etc/passwd and /etc/group
     $'$ pwd\n/home/alice\n'                     # login went to her home directory
     $'$ cat /etc/secret\ncat: /etc/secret: permission denied\nsh: cat: exit status 1\n'   # mode 600, root's
-    $'$ login\nlogin: root\npassword: keelroot\nlogin: cannot change user: operation not permitted\n'   # setgid/setuid: root only
+    $'$ login\nlogin: root\npassword: \nlogin: cannot change user: operation not permitted\n'   # setgid/setuid: root only
     $'sh: login: exit status 1\n'
-    $'$ su\npassword: nope\nsu: incorrect password\nsh: su: exit status 1\n'
-    $'$ su\npassword: keelroot\n# id\nuid=0(root) gid=0(root)\n'   # su is set-user-ID root
+    $'$ su\npassword: \nsu: incorrect password\nsh: su: exit status 1\n'
+    $'$ su\npassword: \n# id\nuid=0(root) gid=0(root)\n'   # su is set-user-ID root
     $'# cat /etc/secret\nfor root\'s eyes only\n# exit\n'   # root reads it; exit is back to alice
     $'$ echo note > note\n$ chmod 600 note\n$ ls -l\n-rw------- alice         5 note\n'   # chmod, by the owner
     $'$ chown root note\nchown: note: operation not permitted\nsh: chown: exit status 1\n'   # chown: root only
-    $'$ su\npassword: keelroot\n# chown root:root /home/alice/note\n# exit\n'
+    $'$ su\npassword: \n# chown root:root /home/alice/note\n# exit\n'
     $'$ ls -l\n-rw------- root          5 note\n'   # it is root's now...
     $'$ cat note\ncat: note: permission denied\nsh: cat: exit status 1\n'   # ...so alice cannot read it
     $'$ whoami\nalice\n'
@@ -273,11 +274,17 @@ session2=(
     'linuxthreads'
     'linuxthreads exec'
     'linuxthreads fds'
+    'linuxpoll'
+    '@wait linuxpoll: termios round trip; raw mode, waiting for three bytes'
+    '@raw abc'
+    '@wait ISIG off, Ctrl-C is a byte'
+    '@intr'
+    '@wait termios restored'
     'exit'
     $'\x04'
 )
 transcript2=(
-    $'login: root\npassword: keelroot\n'
+    $'login: root\npassword: \n'
     $'# cat /m9/kept\ndata\n'                   # the file the first boot's shell wrote, read back
     $'# rm /m9/kept\n# ls /m9\nbig.bin\nbig.copy\ncopy.txt\n'
     $'# echo tyxz\b \b\b \bpo\ntypo\n'          # the line the shell got is the edited one
@@ -304,6 +311,7 @@ transcript2=(
                                                 # sysl.process groups through keel.fsys's hooks; SA_RESTART
     $'stdsig: session ok\n'                     # set_process_group and new_session (setpgid, setsid 157)
     $'stdsig: zombie group ok\n'                # an ended, unreaped leader keeps its group joinable
+    $'stdsig: time ok\n'                        # sysl.time's monotonic and now, through keel.fsys's seams
     $'# true | false &\n[1] '                   # a background pipeline that ends by itself: reaped by
     $'[1] exit status 1 true | false\n'         # try_wait (sysl_proc_poll), its last stage's status
     $'# sleep 100 &\n[1] '                      # a background job: its number and process group
@@ -335,7 +343,15 @@ transcript2=(
     # by one thread; a read in flight keeps its pipe end through another thread's close; nothing left over.
     $'# linuxthreads fds\nlinuxthreads: 4 threads x 2000 rounds of pipe2, dup, openat and close at once: no descriptor shared, every pipe round-tripped\n'
     $'linuxthreads: a read in flight keeps its pipe end through a close; the table ends with 0-2 alone\n'
-    $'# exit\nlogin: \n'
+    # Milestone 17: a third raw-svc Linux program. ppoll and pselect6 woken by a thread's write, a close and a
+    # child's write, timing out, POLLNVAL/POLLERR/EBADF, their signal masks; the clocks; termios, and raw
+    # mode driven from here: "abc" with no newline (no echo, so nothing between the two lines), then Ctrl-C
+    # with ISIG off, read as a byte rather than sent as SIGINT.
+    $'# linuxpoll\nlinuxpoll: ppoll woke on a thread\'s write and at its close (POLLHUP), timed out on time, POLLNVAL and POLLERR\n'
+    $'linuxpoll: pselect6 woke on a child\'s write; a blocked SIGUSR1 came in through the call\'s mask alone: EINTR, handled, blocked again\n'
+    $'linuxpoll: CLOCK_MONOTONIC advanced across nanosleep; clock_nanosleep TIMER_ABSTIME woke after its time; CLOCK_REALTIME is the RTC\'s date\n'
+    $'linuxpoll: termios round trip; raw mode, waiting for three bytes\nlinuxpoll: raw read "abc" with no newline and no echo; ISIG off, Ctrl-C is a byte\n'
+    $'linuxpoll: read Ctrl-C as 0x03; VTIME timed out an idle read; termios restored\n# exit\nlogin: \n'
     "init: the console closed after 1 sessions; orphans reaped: 0"
     "keel: init exited 0"
     "keel: every process reaped"
@@ -349,7 +365,8 @@ shutdown=(
 # Printed only if something went wrong: the access after a failed bounds check went ahead, a check in
 # the `files` program failed, the shell was restarted, or a process was left behind.
 not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login ended by signal"
-    "keel: processes left unreaped" "keel: processes still running before init")
+    "keel: processes left unreaped" "keel: processes still running before init" "linuxpoll: FAILED"
+    "keelroot" "wonderland" "nope")
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
     init sh mkdir rm rmdir mv false ppid orphan udpecho login su id whoami chmod chown env wc grep head true forktest
@@ -391,6 +408,9 @@ $linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/
 $linux_cc --target=aarch64-linux-gnu -ffreestanding -fno-builtin -nostdlib -static -fno-pic -O2 -mgeneral-regs-only \
     -mno-outline-atomics -c -o $out/linuxthreads.o $root/linux/threads.c
 $linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/linuxthreads $out/linuxthreads.o
+$linux_cc --target=aarch64-linux-gnu -ffreestanding -fno-builtin -nostdlib -static -fno-pic -O2 -mgeneral-regs-only \
+    -mno-outline-atomics -c -o $out/linuxpoll.o $root/linux/poll.c
+$linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/linuxpoll $out/linuxpoll.o
 
 rm -rf $fsroot
 mkdir -p $fsroot/dir $fsroot/bin
@@ -399,6 +419,7 @@ for prog in $user_programs; do
 done
 cp $out/linuxhello $fsroot/bin/linuxhello
 cp $out/linuxthreads $fsroot/bin/linuxthreads
+cp $out/linuxpoll $fsroot/bin/linuxpoll
 print -n "hello from the disk" > $fsroot/hello.txt
 print "inside a directory" > $fsroot/dir/inner.txt
 mkdir -p $fsroot/m9
@@ -436,11 +457,14 @@ nic=(-netdev user,id=n0,hostfwd=udp:127.0.0.1:$udp_port-:7,hostfwd=udp:127.0.0.1
      -device virtio-net-device,netdev=n0)
 
 # Type the session named $1 at the console: QEMU's standard input is the FIFO $3, and $2 is its output
-# so far. Each element is a line, sent with its newline, except two directives:
+# so far. Each element is a line, sent with its newline, except three directives:
 #   @wait <text>   send nothing more until <text> has been printed after what the last @wait matched,
 #                  so a byte reaches the console only once the program it is meant for is running
 #   @intr          Ctrl-C, alone: the console turns it into SIGINT for its foreground process group
+#   @raw <text>    <text> with no newline, for a program reading the console in raw mode
 # A @wait that is never satisfied gives up after the boot's time limit; the boot fails on its own then.
+# The console's output has Linux's ONLCR (a newline goes out as CR LF); the CRs are dropped before any
+# text is compared, here and after the boot.
 feed() {
     local item want text rest before offset=0 waited fd
     zmodload zsh/mapfile
@@ -452,7 +476,7 @@ feed() {
             while (( waited < limit * 10 )); do
                 # The output as it stands, trailing newlines and all (`$(<file)` would drop them); an
                 # empty file reads as unset.
-                text=${mapfile[$2]-}
+                text=${${mapfile[$2]-}//$'\r'/}
                 rest=${text:$offset}
                 if [[ $rest == *$want* ]]; then
                     before=${rest%%$want*}
@@ -464,6 +488,8 @@ feed() {
             done
         elif [[ $item == '@intr' ]]; then
             print -rn -- $'\x03' >&$fd
+        elif [[ $item == '@raw '* ]]; then
+            print -rn -- "${item#@raw }" >&$fd
         else
             print -r -- "$item" >&$fd
         fi
@@ -514,6 +540,7 @@ boot() {
     rm -f $fifo
     wait $kclient 2> /dev/null || true
     wait $uclient 2> /dev/null || true
+    perl -pi -e 's/\r//g' $log
 
     print -r -- "--- QEMU output, boot $name ($accel${opt:+, $opt}) ---"
     cat $log

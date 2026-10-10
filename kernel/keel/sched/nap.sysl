@@ -1,8 +1,9 @@
 module keel.sched
 
-// Sleeping for a time: `nanosleep`'s wait. A napping thread sleeps on one queue, which every core's
-// timer tick wakes while anyone is on it; each sleeper looks at the clock and sleeps again until its
-// own deadline has passed. A tick is 10 ms, so that is the resolution. A signal ends a nap early.
+// Sleeping for a time: `nanosleep`'s and `clock_nanosleep`'s wait. A napping thread sleeps on one queue,
+// which every core's timer tick wakes while anyone is on it; each sleeper looks at the clock and sleeps
+// again until its own deadline has passed. A tick is 10 ms, so that is the resolution. A signal ends a
+// nap early.
 
 import keel.timer
 import sysl.sync.{Atomic, Ordering}
@@ -11,13 +12,13 @@ private var naps: WaitQueue
 private var nap_guard: IrqLock
 private var nappers: Atomic[u64] = Atomic(0)
 
-// Sleep until the clock reads `deadline_ms` (keel.timer's `now_ms`). False if a signal for `p` ended
-// the nap first.
-nap_until(p: *Process, deadline_ms: u64) -> bool
+// Sleep until the monotonic clock (keel.timer's `now_ns`) reads `deadline_ns`. False if a signal for
+// `p` ended the nap first.
+nap_until(p: *Process, deadline_ns: u64) -> bool
     val flags = nap_guard.lock()
     nappers.add(1)
     var whole = true
-    while timer.now_ms() < deadline_ms
+    while timer.now_ns() < deadline_ns
         if !sleep_interruptibly(p, &naps, &nap_guard)
             whole = false
             break

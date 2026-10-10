@@ -15,7 +15,7 @@ import abi.keel.abi.{AF_INET, ANY_CHILD, AT_FDCWD, AT_REMOVEDIR, EACCES, EINTR, 
     SYS_MKDIRAT, SYS_NANOSLEEP, SYS_NEWFSTATAT, SYS_OPENAT, SYS_PIPE2, SYS_PROCS, SYS_READ, SYS_RECVFROM,
     SYS_RENAMEAT, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK, SYS_SENDTO, SYS_SETSOCKOPT, SYS_SOCKET,
     SYS_SPAWN, SYS_SYNC, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE, SigAction, SockAddrIn, SpawnAttr, Stat, TIOCGPGRP,
-    TIOCSPGRP, Timespec, Timeval, WNOHANG, empty_stat, sock_addr_in}
+    TIOCSPGRP, Timespec, Timeval, WNOHANG, empty_stat, sock_addr_in, ECHO, TCGETS, TCSETS, Termios, console_termios}
 import sysl.buf.{Buf, buf}
 import sysl.slices.{as_mut_ptr, as_ptr}
 
@@ -393,6 +393,41 @@ tcgetpgrp(fd: u64) -> Result[u64, Errno]
     var g: u32 = 0
     done(call(SYS_IOCTL, fd, TIOCGPGRP, u64(usize(&g)), 0))?
     Ok(u64(g))
+
+// The terminal's settings and setting them (TCGETS, TCSETS); `fd` must be the console (ENOTTY).
+tcgetattr(fd: u64) -> Result[Termios, Errno]
+    var t = console_termios()
+    done(call(SYS_IOCTL, fd, TCGETS, u64(usize(&t)), 0))?
+    Ok(t)
+
+tcsetattr(fd: u64, t: Termios) -> Result[unit, Errno]
+    var given = t
+    done(call(SYS_IOCTL, fd, TCSETS, u64(usize(&given)), 0))
+
+// What `shown` needs to put back: the settings echo was turned off from.
+struct Hidden
+    fd: u64
+    saved: Option[Termios]
+
+// Turn the terminal's echo off on `fd` for something not to be shown, a password: what `shown` takes to
+// turn it back on. A descriptor that is not the terminal is left as it is.
+hidden(fd: u64) -> Hidden
+    tcgetattr(fd) match
+        Ok(t) ->
+            var quiet = t
+            quiet.lflag = quiet.lflag & ~ECHO
+            if tcsetattr(fd, quiet).is_err() then return Hidden(fd, None)
+            Hidden(fd, Some(t))
+        Err(_) -> Hidden(fd, None)
+
+// Echo back on, as `hidden` found it; the newline the hidden line ended with was not echoed, so it is
+// written here (C's getpass does the same).
+shown(h: Hidden)
+    h.saved match
+        Some(t) ->
+            val _ = tcsetattr(h.fd, t)
+            val _ = put("\n")
+        None -> ()
 
 // Sleep `nanos` nanoseconds (the kernel's tick is 10 ms). Err(EINTR) and what was left if a signal
 // ended it first.

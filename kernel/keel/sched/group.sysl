@@ -41,9 +41,11 @@ struct UserSide
     futex_addr: u64
     futex_woken: bool
     futex_next: *Thread
+    call_mask: bool             // ppoll/pselect6 replaced `blocked` for the call and were interrupted:
+    mask_after: u64             // ...the set to put back once the signal has been delivered
 
 no_user() -> UserSide = UserSide(0, Context([0; 12], 0, 0), 0, 0, Atomic(0), null, null, 0, null, null, 0, false,
-    null)
+    null, false, 0)
 
 // A process's threads.
 struct Threads

@@ -1,41 +1,59 @@
 module keel.console
 
-// The console: what a program reads from descriptor 0 and writes to 1 and 2, over the PL011.
+// The console: what a program reads from descriptor 0 and writes to 1 and 2, over the PL011 — a
+// terminal with Linux's settings (`Termios`, `ioctl` TCGETS/TCSETS), so a program built for Linux can
+// turn echo off or read a byte at a time.
 //
 // **Input** arrives by interrupt. The handler (`interrupt`, IRQ context: it must never sleep) moves
-// each received byte into `raw`, a ring of RING bytes, and wakes whoever is waiting for one; when the
-// ring is full it masks the receive interrupt instead, so the bytes stay in the UART and a sender that
-// waits for room waits (QEMU's character back end does; real hardware would overrun).
+// each received byte into `raw`, a ring of RING bytes, and wakes whoever is waiting for one — readers,
+// and pollers (keel.sched's `poll_notify`); when the ring is full it masks the receive interrupt
+// instead, so the bytes stay in the UART and a sender that waits for room waits (QEMU's character back
+// end does; real hardware would overrun).
 //
 // **Line discipline** runs in the reading thread, not in the interrupt: `read` takes bytes from the
-// ring one at a time and builds a line — echoing what it keeps, `\b \b` for a backspace (DEL or
-// Ctrl-H), a newline for CR or LF (a CR LF pair is one), Ctrl-D at the start of a line the end of the
-// input — and answers only once the line is whole. So a byte is echoed when a program reads it, not
-// when it was typed: typeahead appears in order with the output of the program before it, rather than
-// in the middle of it. A Unix terminal echoes on arrival; this console makes the opposite choice,
-// because its input is often piped from a script and the transcript is what is read back.
+// ring one at a time, maps them as `iflag` says (ICRNL, IGNCR, INLCR, ISTRIP) and, in canonical mode
+// (ICANON), builds a line — echoing what it keeps if ECHO is set, VERASE rubbing out a character, VKILL
+// the line, a newline (or VEOL, VEOL2) ending it, VEOF at the start of a line the end of the input — and
+// answers only once the line is whole. So a byte is echoed when a program reads it, not when it was
+// typed: typeahead appears in order with the output of the program before it, rather than in the middle
+// of it, and a program that turns ECHO off before it reads a password keeps the password off the screen
+// even if it was typed ahead. A Unix terminal echoes on arrival; this console makes the opposite
+// choice, because its input is often piped from a script and the transcript is what is read back.
 //
-// One reader cooks a line at a time (`cooked`, a sleeping Mutex); a line longer than a read asked for
-// is handed out over several reads. A signal ends a read that is waiting for input (EINTR); the part of
+// **Raw mode** (ICANON off) hands bytes out as they come, VMIN and VTIME deciding how long a read waits:
+// for VMIN bytes, for VTIME tenths of a second, between bytes, or not at all — POSIX's four cases. A
+// timed read sleeps on the readers' queue, which the timer's tick wakes while anyone is timed
+// (`console_tick`).
+//
+// One reader reads at a time (`cooked`, a sleeping Mutex); a line longer than a read asked for is
+// handed out over several reads. A signal ends a read that is waiting for input (EINTR); the part of
 // the line already typed is kept for the next read.
 //
-// **Ctrl-C is the exception to "the reader cooks"**: the handler takes it out of the input as it
-// arrives and sends SIGINT to the console's foreground process group (`set_foreground`), since the
-// program it is meant to stop is usually not reading. It is not echoed (the echo would be written from
-// interrupt context, under a lock the threads take with interrupts on) and the input typed before it
-// is not thrown away. The sending is keel.proc's, reached through `keel_console_interrupt` because
-// keel.proc imports this module; that function is `@no_alloc` itself, as everything on keel.trap's
-// interrupt path is.
+// **Output** goes out as `oflag` says: with OPOST and ONLCR a newline is CR LF, as on Linux; an echo is
+// output too.
+//
+// **VINTR and VQUIT (Ctrl-C, Ctrl-\) are the exception to "the reader cooks"** when ISIG is set: the
+// handler takes them out of the input as they arrive and sends SIGINT or SIGQUIT to the console's
+// foreground process group (`set_foreground`), since the program they are meant to stop is usually not
+// reading. They are not echoed (the echo would be written from interrupt context, under a lock the
+// threads take with interrupts on) and the input typed before them is not thrown away — as if NOFLSH
+// were set. With ISIG off they are ordinary bytes. The sending is keel.proc's, reached through
+// `keel_console_interrupt` because keel.proc imports this module; that function is `@no_alloc` itself,
+// as everything on keel.trap's interrupt path is.
 
+import abi.keel.abi.{ECHO, ECHOCTL, ECHOE, ECHOK, ECHOKE, ECHONL, ICANON, ICRNL, IGNCR, INLCR, ISIG, ISTRIP, OCRNL,
+    ONLCR, OPOST, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, SIGINT, SIGQUIT, Termios, VEOF, VEOL, VEOL2, VERASE, VINTR,
+    VKILL, VMIN, VQUIT, VTIME, console_termios}
 import keel.cpu
 import keel.gic
 import keel.mm
 import keel.pl011
 import keel.sched
-import keel.sched.{IrqLock, Mutex, Process, WaitQueue}
+import keel.sched.{FOREVER, IrqLock, Mutex, Process, WaitQueue}
+import keel.timer
 import sysl.sync.{Atomic, Ordering, SpinLock}
 
-extern "keel_console_interrupt" interrupt_group(pgid: u64)
+extern "keel_console_interrupt" interrupt_group(pgid: u64, sig: u64)
 
 private var foreground: Atomic[u64] = Atomic(0)
 
@@ -43,11 +61,18 @@ private var foreground: Atomic[u64] = Atomic(0)
 set_foreground(pgid: u64) = foreground.store(pgid, Ordering.Release)
 foreground_group() -> u64 = foreground.load(Ordering.Acquire)
 
-// Send SIGINT for each Ctrl-C a drain took out of the input. Called with no lock held.
-private interrupted(n: u64)
-    if n == 0 then return
+// What a drain took out of the input for ISIG: how many VINTRs and VQUITs.
+private struct Signalled
+    intr: u64
+    quit: u64
+
+// Send SIGINT and SIGQUIT for what a drain took out of the input. Called with no lock held.
+private interrupted(n: Signalled)
+    if n.intr == 0 && n.quit == 0 then return
     val pgid = foreground_group()
-    if pgid != 0 then interrupt_group(pgid)
+    if pgid == 0 then return
+    if n.intr != 0 then interrupt_group(pgid, SIGINT)
+    if n.quit != 0 then interrupt_group(pgid, SIGQUIT)
 
 private const RING: usize = 4096
 private const LINE: usize = 256
@@ -65,12 +90,22 @@ private var readers: WaitQueue
 private var ready: bool
 private var core: u64
 
+// The settings, under `guard` (the interrupt reads ISIG, VINTR and VQUIT). Set at `init`.
+private var tio: Termios
+
+// Under `guard`: the reader left bytes of a whole line for the next read (what `poll` must count as
+// input though the ring is empty).
+private var line_left: bool
+
+// How many readers wait with a deadline (raw mode's VTIME); the tick wakes `readers` only while this is
+// not zero.
+private var timed_readers: Atomic[u64] = Atomic(0)
+
 // The line being cooked, or the rest of one not yet read.
 private struct Line
     text: [LINE]u8
     len: usize                  // bytes of `text` in the line
     at: usize                   // the next byte to hand out; at == len: there is no line
-    after_cr: bool              // the last byte ended a line with CR, so an LF right after it is that same end
     partial: bool               // a line is being cooked: `text[0..<len]` is what was typed of it so far
 
 private var cooked: Mutex[Line]
@@ -82,9 +117,10 @@ hold() = out.lock()
 release() = out.unlock()
 
 // Start taking input: the UART's receive interrupt, routed to this core, and whatever is already
-// waiting in the UART.
+// waiting in the UART. The settings start as a Linux console's.
 init()
     core = cpu.core_id()
+    tio = console_termios()
     ready = true
     gic.enable_spi(pl011.IRQ, core)
     pl011.enable_receive()
@@ -103,12 +139,39 @@ interrupt()
     guard.unlock(flags)
     interrupted(n)
 
-private const ETX: u8 = 3                       // Ctrl-C
+// The timer interrupt's part: wake the readers waiting with a deadline to look at the clock.
+console_tick()
+    if timed_readers.load(Ordering.Acquire) == 0 then return
+    val flags = guard.lock()
+    val _ = readers.wake_all()
+    guard.unlock(flags)
 
-// Move what the UART holds into the ring, and wake the readers. The caller holds `guard`. Answers how
-// many Ctrl-Cs it took out, which the caller sends once it has let go of `guard`.
-private drain_locked() -> u64
-    var intr: u64 = 0
+// The settings as they stand.
+settings() -> Termios
+    val flags = guard.lock()
+    val t = tio
+    guard.unlock(flags)
+    t
+
+// New settings, from TCSETS (TCSETSW is the same: output is written synchronously, so it has always
+// drained). `flush` (TCSETSF) throws away the input received and not yet read first.
+set_settings(t: Termios, flush: bool)
+    val flags = guard.lock()
+    if flush
+        ring.head = 0
+        ring.count = 0
+    tio = t
+    guard.unlock(flags)
+    sched.poll_notify()
+
+// Whether `c` is the control character `t.cc[i]`; 0 is disabled (_POSIX_VDISABLE).
+private is(c: u8, t: Termios, i: usize) -> bool = t.cc[i] != 0 && c == t.cc[i]
+
+// Move what the UART holds into the ring, and wake the readers and pollers. The caller holds `guard`.
+// Answers the VINTRs and VQUITs it took out, which the caller sends once it has let go of `guard`.
+private drain_locked() -> Signalled
+    var n = Signalled(0, 0)
+    val isig = (tio.lflag & ISIG) != 0
     pl011.clear_receive()
     loop
         if ring.count == RING
@@ -117,26 +180,41 @@ private drain_locked() -> u64
             break
         pl011.take_byte() match
             Some(b) ->
-                if b == ETX
-                    intr += 1
+                if isig && is(b, tio, VINTR)
+                    n.intr += 1
+                else if isig && is(b, tio, VQUIT)
+                    n.quit += 1
                 else
                     ring.bytes[(ring.head + ring.count) % RING] = b
                     ring.count += 1
             None -> break
     val _ = readers.wake_all()
-    intr
+    sched.poll_notify()
+    n
 
-// The next byte from the ring, sleeping until there is one; None if a signal for `p` came first.
-private next_byte(p: *Process) -> Option[u8]
+// What waiting for a byte came to.
+private enum Wait
+    Byte(b: u8)
+    TimedOut
+    Signal                      // a signal for the reader
+
+// The next byte from the ring, sleeping until there is one, until the monotonic clock reaches
+// `deadline` (FOREVER: no deadline; 0: do not sleep at all), or until a signal for `p` comes.
+private next_byte(p: *Process, deadline: u64) -> Wait
     val flags = guard.lock()
-    while ring.count == 0
+    val timed = deadline != FOREVER
+    if timed then timed_readers.add(1)
+    var w = Wait.TimedOut
+    loop
+        if ring.count > 0
+            w = Wait.Byte(take_locked())
+            break
+        if timed && timer.now_ns() >= deadline then break
         if !sched.sleep_interruptibly(p, &readers, &guard)
-            guard.unlock(flags)
-            return None
-    val b = ring.bytes[ring.head]
-    ring.head = (ring.head + 1) % RING
-    ring.count -= 1
-    var n: u64 = 0
+            w = Wait.Signal
+            break
+    if timed then timed_readers.sub(1)
+    var n = Signalled(0, 0)
     if ring.paused && ring.count < RING / 2
         // What waited in the UART meanwhile may have had its interrupt acknowledged already.
         ring.paused = false
@@ -144,80 +222,220 @@ private next_byte(p: *Process) -> Option[u8]
         n = drain_locked()
     guard.unlock(flags)
     interrupted(n)
-    Some(b)
+    w
+
+private take_locked() -> u8
+    val b = ring.bytes[ring.head]
+    ring.head = (ring.head + 1) % RING
+    ring.count -= 1
+    b
 
 private const CR: u8 = 13
 private const LF: u8 = 10
 private const BS: u8 = 8
 private const DEL: u8 = 127
-private const EOT: u8 = 4                       // Ctrl-D
 
-private echo(b: u8)
-    hold()
+// A received byte as `iflag` has it: stripped to 7 bits, CR dropped or made a newline, a newline made a
+// CR; None when it is dropped.
+private mapped(b: u8, t: Termios) -> Option[u8]
+    val c = if (t.iflag & ISTRIP) != 0 then b & 0x7f else b
+    if c == CR
+        if (t.iflag & IGNCR) != 0 then return None
+        if (t.iflag & ICRNL) != 0 then return Some(LF)
+    else if c == LF && (t.iflag & INLCR) != 0
+        return Some(CR)
+    Some(c)
+
+// One byte to the UART as `oflag` says; the caller holds the output lock.
+private emit(b: u8, oflag: u32)
+    if (oflag & OPOST) != 0
+        if b == LF && (oflag & ONLCR) != 0
+            pl011.put_byte(CR)
+        else if b == CR && (oflag & OCRNL) != 0
+            pl011.put_byte(LF)
+            return
     pl011.put_byte(b)
+
+// The output flags, for a writer to pass to `put`.
+output_flags() -> u32
+    val flags = guard.lock()
+    val o = tio.oflag
+    guard.unlock(flags)
+    o
+
+// A program's byte to the screen; the caller holds the output lock (`hold`).
+put(b: u8, oflag: u32) = emit(b, oflag)
+
+// Whether ECHOCTL shows `c` as ^X: a control character other than TAB and newline, and DEL.
+private shown_as_caret(c: u8, t: Termios) -> bool =
+    (t.lflag & ECHOCTL) != 0 && ((c < 32 && c != 9 && c != LF) || c == DEL)
+
+private echo(c: u8, t: Termios)
+    hold()
+    if shown_as_caret(c, t)
+        emit(u8('^'), t.oflag)
+        emit(c ^ 0x40, t.oflag)
+    else
+        emit(c, t.oflag)
     release()
 
-// Rub out the last character on the screen: back, a space over it, back again.
-private rub_out()
+// Rub out the character `c` on the screen: back, a space over it, back again — twice for a ^X.
+private rub_out(c: u8, t: Termios)
+    val times = if shown_as_caret(c, t) then 2 else 1
     hold()
-    pl011.put_byte(BS)
-    pl011.put_byte(u8(' '))
-    pl011.put_byte(BS)
+    for _ in 0..<times
+        emit(BS, t.oflag)
+        emit(u8(' '), t.oflag)
+        emit(BS, t.oflag)
     release()
 
 enum Cooked
     Whole                       // a line, in `l`
-    End                         // the end of the input (Ctrl-D on an empty line)
+    End                         // the end of the input (VEOF on an empty line)
     Interrupted                 // a signal for the reader; what was typed stays in `l` for the next read
 
-// Cook one line into `l`, carrying on with the one a signal interrupted, if there is one.
+// Cook one line into `l`, carrying on with the one a signal interrupted, if there is one. The settings
+// are read again for every byte, so a change made while a reader waits applies to what comes next.
 private cook(l: *Line, p: *Process) -> Cooked
     if !l.partial
         l.len = 0
         l.at = 0
     l.partial = true
     loop
-        val b = next_byte(p) match
-            Some(b) -> b
-            None -> return Interrupted
-        if b == LF && l.after_cr
-            l.after_cr = false
-            continue
-        l.after_cr = b == CR
-        if b == CR || b == LF
-            l.text[l.len] = LF
-            l.len += 1
-            echo(LF)
-            l.partial = false
-            return Whole
-        if b == BS || b == DEL
+        val b = next_byte(p, FOREVER) match
+            Byte(b) -> b
+            Signal -> return Interrupted
+            TimedOut -> continue
+        val t = settings()
+        val c = mapped(b, t) match
+            Some(c) -> c
+            None -> continue
+        val echoing = (t.lflag & ECHO) != 0
+        if is(c, t, VERASE)
             if l.len > 0
                 l.len -= 1
-                rub_out()
+                if echoing
+                    if (t.lflag & ECHOE) != 0 then rub_out(l.text[l.len], t) else echo(c, t)
             continue
-        if b == EOT
+        if is(c, t, VKILL)
+            if echoing && (t.lflag & ECHOE) != 0 && (t.lflag & ECHOKE) != 0
+                while l.len > 0
+                    l.len -= 1
+                    rub_out(l.text[l.len], t)
+            else
+                if echoing then echo(c, t)
+                if echoing && (t.lflag & ECHOK) != 0 then echo(LF, t)
+            l.len = 0
+            continue
+        if is(c, t, VEOF)
             l.partial = false
             if l.len == 0 then return End
             return Whole
-        // Room is kept for the newline; a line too long for it keeps its first LINE - 1 bytes.
-        if l.len < LINE - 1 && (b >= 32 || b == 9)
-            l.text[l.len] = b
+        if c == LF || is(c, t, VEOL) || is(c, t, VEOL2)
+            l.text[l.len] = c
             l.len += 1
-            echo(b)
+            if echoing || (c == LF && (t.lflag & ECHONL) != 0) then echo(c, t)
+            l.partial = false
+            return Whole
+        // Room is kept for the line's end; a line too long for it keeps its first LINE - 1 bytes.
+        if l.len < LINE - 1
+            l.text[l.len] = c
+            l.len += 1
+            if echoing then echo(c, t)
 
-// read(0, …) for process `p`, whose descriptor 0 is the console: up to `len` bytes of the current line
-// into its memory at `va`, once there is a whole line; 0 at the end of the input; None if a signal
-// interrupted the wait. The range has been checked by the caller.
+// read(0, …) for process `p`, whose descriptor 0 is the console: up to `len` bytes into its memory at
+// `va` — in canonical mode of the current line, once there is a whole line; in raw mode as VMIN and
+// VTIME say. 0 at the end of the input (or a raw read that timed out); None if a signal interrupted the
+// wait. The range has been checked by the caller.
 read(p: *Process, va: u64, len: u64) -> Option[u64]
     if len == 0 then return Some(0)
     val l = cooked.lock()
     defer cooked.unlock()
+    val t = settings()
+    val answer = if (t.lflag & ICANON) != 0 then canonical_read(l, p, va, len) else raw_read(l, p, va, len, t)
+    val flags = guard.lock()
+    line_left = l.at < l.len && !l.partial
+    guard.unlock(flags)
+    answer
+
+private canonical_read(l: *Line, p: *Process, va: u64, len: u64) -> Option[u64]
     if l.at == l.len || l.partial
         cook(l, p) match
             Whole -> ()
             End -> return Some(0)
             Interrupted -> return None
+    hand_out(l, p, va, len)
+
+// Up to `len` bytes of what `l` holds from `l.at`.
+private hand_out(l: *Line, p: *Process, va: u64, len: u64) -> Option[u64]
     val n = if len < u64(l.len - l.at) then usize(len) else l.len - l.at
     if !mm.copy_to_user(&p.space, va, l.text[l.at..<l.at + n]) then return Some(0)
     l.at += n
     Some(u64(n))
+
+private const TENTH_NS: u64 = 100_000_000
+
+// A raw read: what a canonical read left first, then bytes as they come. VMIN 0 and VTIME 0: what is
+// there, waiting for nothing. VMIN 0: what is there once one byte is, waiting at most VTIME. VTIME 0:
+// at least VMIN bytes, waiting as long as that takes. Both: at least VMIN, the clock restarting at each
+// byte and a gap of VTIME ending the read early — but the first byte is waited for without a limit.
+private raw_read(l: *Line, p: *Process, va: u64, len: u64, t: Termios) -> Option[u64]
+    if l.partial
+        // A line half typed in canonical mode is input like any other now.
+        l.partial = false
+        l.at = 0
+    if l.at < l.len then return hand_out(l, p, va, len)
+    var got: [LINE]u8 = [0; LINE]
+    val want = if len < u64(LINE) then usize(len) else LINE
+    val vmin = if usize(t.cc[VMIN]) < want then usize(t.cc[VMIN]) else want
+    val vtime = u64(t.cc[VTIME]) * TENTH_NS
+    val first_deadline = if vmin == 0 && vtime > 0 then timer.now_ns() + vtime else 0
+    var n: usize = 0
+    while n < want
+        var deadline = FOREVER
+        if vmin == 0
+            deadline = if n == 0 && vtime > 0 then first_deadline else 0
+        else if n >= vmin
+            deadline = 0
+        else if vtime > 0 && n > 0
+            deadline = timer.now_ns() + vtime
+        var stop = false
+        next_byte(p, deadline) match
+            Byte(b) ->
+                val s = settings()
+                mapped(b, s) match
+                    Some(c) ->
+                        got[n] = c
+                        n += 1
+                        if (s.lflag & ECHO) != 0 then echo(c, s)
+                    None -> ()
+            TimedOut -> stop = true
+            Signal ->
+                if n == 0 then return None
+                stop = true
+        if stop then break
+    if !mm.copy_to_user(&p.space, va, got[0..<n]) then return Some(0)
+    Some(u64(n))
+
+// What `ppoll` sees on the console: always writable; readable when a read would not wait — in canonical
+// mode a whole line (or VEOF) is in, in raw mode VMIN bytes (one, when VTIME is set: Linux's rule).
+poll_mask() -> u16
+    val flags = guard.lock()
+    var readable = line_left
+    if !readable
+        if (tio.lflag & ICANON) == 0
+            val vmin = usize(tio.cc[VMIN])
+            val need = if tio.cc[VTIME] == 0 && vmin > 0 then vmin else 1
+            readable = ring.count >= need
+        else
+            for i in 0..<ring.count
+                val b = ring.bytes[(ring.head + i) % RING]
+                val c = mapped(b, tio) match
+                    Some(c) -> c
+                    None -> continue
+                if c == LF || is(c, tio, VEOF) || is(c, tio, VEOL) || is(c, tio, VEOL2)
+                    readable = true
+                    break
+    guard.unlock(flags)
+    val w = POLLOUT | POLLWRNORM
+    if readable then w | POLLIN | POLLRDNORM else w

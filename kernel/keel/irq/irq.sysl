@@ -26,6 +26,7 @@ dispatch()
         timer.rearm()
         ticks.add(1, Ordering.Relaxed)
         net.net_tick()
+        console.console_tick()
         sched.tick()
     else if id == gic.RESCHEDULE
         sched.reschedule_requested()

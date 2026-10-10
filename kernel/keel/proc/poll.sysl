@@ -1,0 +1,193 @@
+module keel.proc
+
+// ppoll and pselect6: wait until one of several descriptors is ready, a time has passed, or a signal
+// comes.
+//
+// Both make a list of `PollFd`s (pselect6 from its three bit sets) and go round one loop: read keel.sched's
+// event count, look at every descriptor with the table locked (`scan` — the console's, a pipe end's and
+// a socket's own locks are taken inside the table's, the order descriptors.sysl names), and if nothing is
+// ready sleep in keel.sched's `poll_wait` until the count moves, the deadline passes or a signal comes. A
+// source that may have made something ready — a pipe written, read or closed, a byte at the console, a
+// datagram — counts an event, so the sleep is woken by the thing waited for rather than by the clock.
+// Nothing is held across the sleep: a descriptor another thread closes meanwhile answers POLLNVAL at
+// the next look.
+//
+// What is ready (Linux's own answers): a file, always; a pipe's read end while it holds a byte, POLLHUP
+// once no write end is left; its write end while there is room, POLLERR once no read end is left; a
+// socket readable while a datagram is queued, always writable; the console as keel.console says
+// (`poll_mask`). Neither call is made again after a handler (SA_RESTART does not apply, as on Linux);
+// both write the time left back to their timeout, as Linux does.
+//
+// A signal mask given to either is the calling thread's for the call alone, and when a signal ends the
+// call it is that mask the handler runs under; the thread's own comes back after (signal.sysl's
+// `mask_for_call`/`mask_after_call`).
+
+import abi.keel.abi.{EBADF, EFAULT, EINTR, EINVAL, Errno, MAX_FDS, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT,
+    POLLPRI, POLLRDBAND, POLLRDNORM, POLLWRBAND, POLLWRNORM, POLL_MAX, PollFd, SIGSET_SIZE}
+import keel.console
+import keel.mm
+import keel.net
+import keel.sched
+import keel.sched.{FOREVER, Holds, PollWait, Process}
+import keel.timer
+
+private const ENTRIES: usize = usize(POLL_MAX)
+
+// select's sets as poll's bits (Linux's POLLIN_SET, POLLOUT_SET and POLLEX_SET).
+private const READ_SET: u16 = POLLRDNORM | POLLRDBAND | POLLIN | POLLHUP | POLLERR
+private const WRITE_SET: u16 = POLLWRBAND | POLLWRNORM | POLLOUT | POLLERR
+private const EXCEPT_SET: u16 = POLLPRI
+
+// What descriptor `fd` of a locked table is ready for, of `events` (POLLERR and POLLHUP whether asked
+// for or not); POLLNVAL if it is not open, 0 for a negative one.
+private ready(t: *sched.Files, fd: i32, events: u16) -> u16
+    if fd < 0 then return 0
+    val f = slot_in(t, u64(fd)) match
+        Ok(f) -> f
+        Err(_) -> return POLLNVAL
+    val mask: u16 = f.holds match
+        Console -> console.poll_mask()
+        File -> POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM
+        PipeRead -> pipe_poll(usize(f.ino), true)
+        PipeWrite -> pipe_poll(usize(f.ino), false)
+        Socket -> if net.socket_readable(usize(f.ino)) then POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM else POLLOUT | POLLWRNORM
+        else POLLNVAL
+    mask & (events | POLLERR | POLLHUP | POLLNVAL)
+
+// One look at every entry: its `revents` filled in, and how many are ready. For poll an entry is ready
+// with any `revents`; for select (`strict`) only with one of the bits its sets asked for.
+private scan(p: *Process, fds: []PollFd, strict: bool) -> u64
+    val t = sched.lock_files(p)
+    var n: u64 = 0
+    for i in 0..<fds.len
+        fds[i].revents = ready(t, fds[i].fd, fds[i].events)
+        val counted = if strict then fds[i].revents & fds[i].events else fds[i].revents
+        if counted != 0 then n += 1
+    sched.unlock_files(p)
+    n
+
+private enum Outcome
+    Found(n: u64)               // how many are ready; 0 when the deadline passed first
+    Signal
+
+// Look, and sleep until there is something to look at again, until something is ready or the monotonic
+// clock reaches `deadline` (FOREVER: no limit).
+private wait_for(p: *Process, fds: []PollFd, strict: bool, deadline: u64) -> Outcome
+    loop
+        val seen = sched.poll_generation()
+        val n = scan(p, fds, strict)
+        if n > 0 || timer.now_ns() >= deadline then return Outcome.Found(n)
+        if sched.poll_wait(p, seen, deadline) == PollWait.Interrupted then return Outcome.Signal
+
+// The deadline a timeout at `va` sets (0: none, FOREVER), from now.
+private deadline_at(p: *Process, va: u64) -> Result[u64, Errno]
+    if va == 0 then return Ok(FOREVER)
+    Ok(after(timer.now_ns(), timespec_at(p, va)?))
+
+// The mask at `set_at` (a Linux sigset of `size` bytes), if one is given.
+private call_set(p: *Process, set_at: u64, size: u64) -> Result[Option[u64], Errno]
+    if set_at == 0 then return Ok(None)
+    if size != SIGSET_SIZE then return Err(EINVAL)
+    var set: u64 = 0
+    val b: *u8 = ptr_cast(&set)
+    if !mm.copy_from_user(&p.space, set_at, b[0..<8]) then return Err(EFAULT)
+    Ok(Some(from_linux_set(set)))
+
+// The wait, under `mask` if one is given: how many are ready, or EINTR.
+private polled(p: *Process, fds: []PollFd, strict: bool, deadline: u64, mask: Option[u64]) -> Result[u64, Errno]
+    val old = mask match
+        Some(m) -> Some(mask_for_call(p, m))
+        None -> None
+    val o = wait_for(p, fds, strict, deadline)
+    val interrupted = o match
+        Signal -> true
+        _ -> false
+    old match
+        Some(b) -> mask_after_call(p, b, interrupted)
+        None -> ()
+    o match
+        Found(n) -> Ok(n)
+        Signal -> Err(EINTR)
+
+// What was left of a timeout, written back over it (Linux does; a timeout of 0 is left alone, and a
+// timeout in memory the caller may not write is not an error).
+private time_left(p: *Process, va: u64, deadline: u64)
+    if va == 0 || deadline == FOREVER then return
+    val now = timer.now_ns()
+    val _ = put_timespec(p, va, if now < deadline then deadline - now else 0)
+
+// ppoll(*PollFd, nfds, *Timespec | 0, *sigset | 0, sigsetsize) -> how many entries have revents; 0 when
+// the time ran out. At most POLL_MAX entries (EINVAL); revents are written back whatever the answer.
+private[proc] sys_ppoll(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[1] > POLL_MAX then return Err(EINVAL)
+    val n = usize(regs[1])
+    var list: [ENTRIES]PollFd = [PollFd(0, 0, 0); ENTRIES]
+    val raw: *u8 = ptr_cast(&list)
+    if n > 0 && !mm.copy_from_user(&p.space, regs[0], raw[0..<n * sizeof(PollFd)]) then return Err(EFAULT)
+    val deadline = deadline_at(p, regs[2])?
+    val mask = call_set(p, regs[3], regs[4])?
+    val r = polled(p, list[0..<n], false, deadline, mask)
+    for i in 0..<n
+        val b: *u8 = ptr_cast(&list[i].revents)
+        if !mm.copy_to_user(&p.space, regs[0] + u64(i * sizeof(PollFd) + 6), b[0..<2]) then return Err(EFAULT)
+    time_left(p, regs[2], deadline)
+    Ok(i64(r?))
+
+// pselect6(nfds, *read | 0, *write | 0, *except | 0, *Timespec | 0, *{*sigset, sigsetsize} | 0) -> how
+// many bits are set in the sets written back; 0 when the time ran out. Descriptors from nfds up are not
+// looked at, nor (as Linux past its table's size) any from 64 up; a descriptor named that is not open
+// is EBADF. The sets are written back only on success.
+private[proc] sys_pselect6(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if i64(regs[0]) < 0 then return Err(EINVAL)
+    val nfds = if regs[0] > 64 then 64 else usize(regs[0])
+    var sets: [3]u64 = [0, 0, 0]
+    for k in 0..<3
+        if nfds > 0 && regs[1 + k] != 0
+            val b: *u8 = ptr_cast(&sets[k])
+            if !mm.copy_from_user(&p.space, regs[1 + k], b[0..<8]) then return Err(EFAULT)
+    var list: [ENTRIES]PollFd = [PollFd(0, 0, 0); ENTRIES]
+    var n: usize = 0
+    for fd in 0..<nfds
+        val bit = u64(1) << u64(fd)
+        var events: u16 = 0
+        if (sets[0] & bit) != 0 then events |= READ_SET
+        if (sets[1] & bit) != 0 then events |= WRITE_SET
+        if (sets[2] & bit) != 0 then events |= EXCEPT_SET
+        if events == 0 then continue
+        if u64(fd) >= MAX_FDS then return Err(EBADF)
+        list[n] = PollFd(i32(fd), events, 0)
+        n += 1
+    if !all_open(p, list[0..<n]) then return Err(EBADF)
+    val deadline = deadline_at(p, regs[4])?
+    var mask: Option[u64] = None
+    if regs[5] != 0
+        var data: [2]u64 = [0, 0]
+        val b: *u8 = ptr_cast(&data)
+        if !mm.copy_from_user(&p.space, regs[5], b[0..<16]) then return Err(EFAULT)
+        mask = call_set(p, data[0], data[1])?
+    val _ = polled(p, list[0..<n], true, deadline, mask)?
+    var out: [3]u64 = [0, 0, 0]
+    var bits: i64 = 0
+    for i in 0..<n
+        val e = list[i]
+        val bit = u64(1) << u64(e.fd)
+        val asked: [3]u16 = [READ_SET, WRITE_SET, EXCEPT_SET]
+        for k in 0..<3
+            if (sets[k] & bit) != 0 && (e.revents & asked[k]) != 0
+                out[k] |= bit
+                bits += 1
+    for k in 0..<3
+        if nfds > 0 && regs[1 + k] != 0
+            val b: *u8 = ptr_cast(&out[k])
+            if !mm.copy_to_user(&p.space, regs[1 + k], b[0..<8]) then return Err(EFAULT)
+    time_left(p, regs[4], deadline)
+    Ok(bits)
+
+// Whether every entry names an open descriptor.
+private all_open(p: *Process, fds: []PollFd) -> bool
+    val t = sched.lock_files(p)
+    var ok = true
+    for i in 0..<fds.len
+        if t.slots[usize(fds[i].fd)].holds == Holds.Free then ok = false
+    sched.unlock_files(p)
+    ok

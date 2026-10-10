@@ -4,7 +4,7 @@
 // keel has one uid per process and only root may change it, so /bin/su is set-user-ID root on the disk
 // (mkfs's owners file): it starts as root whoever runs it, checks the password, and gives root up for
 // the target's group and uid before the shell starts. A wrong password exits 1 having changed nothing.
-// The password is echoed, as login's is.
+// The password is read with echo off, as login's is.
 
 import passwd.keel.passwd
 import rt.keel.user
@@ -26,7 +26,10 @@ main(args: []string)
     prints("password: ")
     var input = stdin()
     var reader = lines(&input)
-    val password = reader.getline() match
+    val quiet = user.hidden(0)
+    val line = reader.getline()
+    user.shown(quiet)
+    val password = line match
         Some(p) -> p
         None -> exit(1)
     if !passwd.opens(u, password)

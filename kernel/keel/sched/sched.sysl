@@ -281,6 +281,7 @@ tick()
     if !started then return
     nap_tick()
     futex_tick()
+    poll_tick()
     val c = this_cpu()
     if c.slice > 0 then c.slice -= 1
     if c.slice == 0 then c.need_resched = true

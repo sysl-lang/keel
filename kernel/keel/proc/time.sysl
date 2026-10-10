@@ -1,0 +1,100 @@
+module keel.proc
+
+// Clocks and sleeping by them: clock_gettime, clock_getres, gettimeofday, nanosleep and
+// clock_nanosleep, all over keel.timer's two readings — the monotonic clock (the generic counter, in
+// nanoseconds) and the wall clock (that, plus the time the PL031 said at boot). A sleep is a nap
+// (keel.sched's `nap_until`) to a monotonic deadline, woken at the timer's 10 ms tick, so it is never
+// short and is up to a tick long; a signal ends it with EINTR and, for a relative sleep, what was left.
+
+import abi.keel.abi.{CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_REALTIME,
+    CLOCK_REALTIME_COARSE, EFAULT, EINTR, EINVAL, Errno, TIMER_ABSTIME, Timespec, Timeval}
+import keel.mm
+import keel.sched
+import keel.sched.{FOREVER, Process}
+import keel.timer
+
+private const NS: u64 = 1_000_000_000
+
+// The coarse clocks' resolution: the timer's tick.
+private const TICK_NS: u64 = 10_000_000
+
+// The reading of `clock` in nanoseconds; EINVAL for a clock keel does not have.
+private reading(clock: u64) -> Result[u64, Errno] = clock match
+    CLOCK_REALTIME | CLOCK_REALTIME_COARSE -> Ok(timer.realtime_ns())
+    CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME -> Ok(timer.now_ns())
+    else Err(EINVAL)
+
+private timespec(ns: u64) -> Timespec = Timespec(i64(ns / NS), i64(ns % NS))
+
+// The Timespec at `va` in `p`'s memory, as nanoseconds: EFAULT if it is not there, EINVAL if it is not a
+// time (a negative second or a nanosecond count past 999,999,999). A time too long to count is FOREVER.
+private[proc] timespec_at(p: *Process, va: u64) -> Result[u64, Errno]
+    var t = Timespec(0, 0)
+    val b: *u8 = ptr_cast(&t)
+    if !mm.copy_from_user(&p.space, va, b[0..<sizeof(Timespec)]) then return Err(EFAULT)
+    if t.sec < 0 || t.nsec < 0 || t.nsec >= i64(NS) then return Err(EINVAL)
+    if u64(t.sec) >= (FOREVER - NS) / NS then return Ok(FOREVER)
+    Ok(u64(t.sec) * NS + u64(t.nsec))
+
+private[proc] put_timespec(p: *Process, va: u64, ns: u64) -> Result[unit, Errno]
+    var t = timespec(ns)
+    val b: *u8 = ptr_cast(&t)
+    if !mm.copy_to_user(&p.space, va, b[0..<sizeof(Timespec)]) then return Err(EFAULT)
+    Ok(())
+
+// `now` plus `ns`, FOREVER when that does not fit.
+private[proc] after(now: u64, ns: u64) -> u64 = if ns >= FOREVER - now then FOREVER else now + ns
+
+// clock_gettime(clock, *Timespec) -> 0
+private[proc] sys_clock_gettime(p: *Process, regs: *u64) -> Result[i64, Errno]
+    put_timespec(p, regs[1], reading(regs[0])?)?
+    Ok(0)
+
+// clock_getres(clock, *Timespec | 0) -> 0: a counter tick for the fine clocks, the timer's tick for
+// the coarse ones.
+private[proc] sys_clock_getres(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val _ = reading(regs[0])?
+    val coarse = regs[0] == CLOCK_REALTIME_COARSE || regs[0] == CLOCK_MONOTONIC_COARSE
+    if regs[1] != 0 then put_timespec(p, regs[1], if coarse then TICK_NS else timer.resolution_ns())?
+    Ok(0)
+
+// gettimeofday(*Timeval | 0, *timezone | 0) -> 0: the wall clock in microseconds; the zone, if asked
+// for, is UTC (minutes west 0, no daylight saving).
+private[proc] sys_gettimeofday(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[0] != 0
+        val now = timer.realtime_ns()
+        var tv = Timeval(i64(now / NS), i64(now % NS / 1000))
+        val b: *u8 = ptr_cast(&tv)
+        if !mm.copy_to_user(&p.space, regs[0], b[0..<sizeof(Timeval)]) then return Err(EFAULT)
+    if regs[1] != 0
+        var zone: [2]i32 = [0, 0]
+        val z: *u8 = ptr_cast(&zone)
+        if !mm.copy_to_user(&p.space, regs[1], z[0..<8]) then return Err(EFAULT)
+    Ok(0)
+
+// nanosleep(*Timespec, *Timespec left | 0) -> 0; EINTR, with what was left, if a signal ended it. By
+// the monotonic clock.
+private[proc] sys_nanosleep(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val want = timespec_at(p, regs[0])?
+    sleep_until(p, after(timer.now_ns(), want), regs[1])
+
+// clock_nanosleep(clock, flags, *Timespec, *Timespec left | 0) -> 0: sleep for the time, or with
+// TIMER_ABSTIME until `clock` reads it. REALTIME, MONOTONIC and BOOTTIME (EINVAL for any other); an
+// absolute sleep interrupted by a signal writes nothing back, as Linux's.
+private[proc] sys_clock_nanosleep(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val clock = regs[0]
+    if clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC && clock != CLOCK_BOOTTIME then return Err(EINVAL)
+    val t = timespec_at(p, regs[2])?
+    if (regs[1] & TIMER_ABSTIME) == 0 then return sleep_until(p, after(timer.now_ns(), t), regs[3])
+    val deadline = if clock == CLOCK_REALTIME && t != FOREVER then timer.monotonic_of(t) else t
+    sleep_until(p, deadline, 0)
+
+// Nap until the monotonic clock reads `deadline`; EINTR if a signal ends it, the time left written to
+// `left_at` unless that is 0.
+private sleep_until(p: *Process, deadline: u64, left_at: u64) -> Result[i64, Errno]
+    if left_at != 0 && !mm.user_range(&p.space, left_at, u64(sizeof(Timespec)), true) then return Err(EFAULT)
+    if sched.nap_until(p, deadline) then return Ok(0)
+    if left_at != 0
+        val now = timer.now_ns()
+        put_timespec(p, left_at, if now < deadline then deadline - now else 0)?
+    Err(EINTR)

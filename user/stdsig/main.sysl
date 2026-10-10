@@ -15,6 +15,8 @@
 //                this process's group; this process, leading its group, is refused a session
 //   zombie group ok  a child that leads a group and has ended, unreaped, keeps the group: a second
 //                child joins it; once the first is reaped, a join is refused
+//   time ok      `sysl.time.monotonic` advances across a 100 ms sleep by 100 ms to 3 s; `sysl.time.now`
+//                is past 2020
 //
 // `stdsig leader`, `stdsig member <group>`, `stdsig regroup <group>` and `stdsig session <group>` are
 // the children: each checks what it was started with and exits 0 if it was right.
@@ -26,6 +28,7 @@ import sysl.process
 import sysl.process.{Group, Status, Stdio}
 import sysl.signal
 import sysl.text.parse_int
+import sysl.time
 
 stop(what: string) -> never
     print(s"user: FAILED: $what")
@@ -141,7 +144,21 @@ main(args: []string)
 
     zombie_group()
     print("stdsig: zombie group ok")
+
+    clocks()
+    print("stdsig: time ok")
     user.exit(0)
+
+// `sysl.time`'s two clocks through keel.fsys's seams: `monotonic` advances by about what a 100 ms sleep
+// took (the sleep is keel's own call: the standard library has none a freestanding program reaches,
+// FINDINGS 74), and `now` is a wall clock past 2020 — the PL031's, not 0.
+clocks()
+    val before = time.monotonic()
+    check(user.nanosleep(100_000_000).is_ok(), "nanosleep")
+    val took = time.monotonic() - before
+    check(took >= time.millis(100) && took < time.seconds(3), s"100 ms by sysl.time.monotonic took ${took.us} us")
+    val wall = time.now()
+    check(wall.us > 1_577_836_800_000_000, s"sysl.time.now is ${wall.us} us after the epoch, before 2020")
 
 // A child leading a group of its own exits and is not waited for; until it is reaped it is still that
 // group's member, so a second child may join the group — a pipeline's later stage started after its
