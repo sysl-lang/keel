@@ -5,8 +5,8 @@ module keel.sched
 // sleeps are in modules keel.proc imports (keel.console) as well as in keel.proc itself.
 //
 // **Sending** (`post`) sets the signal's bit in `pending` under the process's own `lock` — unless its
-// action is to ignore it, when it is thrown away — and answers where the process's thread is asleep,
-// if it is asleep in a system call that a signal ends (`sleep_interruptibly`). The sender wakes that
+// action is to ignore it, when it is thrown away — and answers where a thread of the process that does
+// not block it is asleep in a system call that a signal ends (`sleep_interruptibly`). The sender wakes that
 // queue only after letting go of every lock it held (`Wakes.wake_all`): the queue's guard may be one
 // of them (`wait` sleeps under the process table's own lock).
 //

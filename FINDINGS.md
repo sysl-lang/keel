@@ -2539,6 +2539,55 @@ Stopgap (used): `i64(Errno.ENOENT)`, qualified, in the spawn and exec hooks' `PA
 Clean form: in a file that imports a name, another file's `private` declaration of that name is not a
 candidate, whatever kind of thing the import names.
 
+## Milestone 16: threads in a process
+
+## 73. `sysl.posix.threads` has no hook layer, so a program for a target with system calls and no C library cannot start a thread
+
+Milestone 16 gives keel `clone` with musl's thread flags, `futex`, TLS and `exit`/`exit_group` by
+Linux's numbers. A keel program written in sysl would reach them through the standard library's
+threads, as it reaches files through `sysl.fs` and processes through `sysl.process`. It cannot: the
+one threads module, `sysl.posix.threads` (`library/sysl/posix/threads/threads.sysl`), is `@requires(posix)`
+and names pthreads by symbol —
+
+    private[sysl] extern "pthread_create" c_pthread_create(...)
+    private[sysl] extern "pthread_join" c_pthread_join(t: usize, result: **u8) -> int
+    private[sysl] extern "pthread_self" c_pthread_self() -> usize
+    private[sysl] extern "sched_yield" c_sched_yield() -> int
+
+and `mutex.sysl`/`channel.sysl` beside it do the same for `pthread_mutex_*`/`pthread_cond_*`. There is
+no `sysl.thread.sys` (or `sysl.posix.threads.sys`) module of `extern` hooks that "no module here
+defines", the shape `sysl.fs.sys`'s header describes ("a program for a target with system calls and no
+C library: the program, with an `@export` per hook"). So keel.fsys, which answers `sysl.fs`, `sysl.io`,
+`sysl.process`, `sysl.signal`, `sysl.net` and `sysl.env`, has nothing to answer for threads:
+
+    import sysl.posix.threads
+
+    spawn[Counter](&work, &counter)      // in a user/<prog> built --target aarch64-freestanding
+
+reaches `pthread_create` itself, which only a program impersonating libc could define (FINDINGS 65's
+shape again). Not written: milestone 16 proves the calls with a raw-svc C program (`linux/threads.c`),
+and the C library half (pthreads) is cstd's.
+
+Clean form: a hook layer in the house style that `sysl.posix.threads` (or a `sysl.thread` above it)
+is written over — `sysl_thread_spawn(entry, arg, stack, stack_len, *tid) -> int`,
+`sysl_thread_join(tid) -> int`, `sysl_thread_self() -> u64`, `sysl_thread_yield() -> int`, and the
+futex pair `sysl_futex_wait(*u32, expected, timeout_ns) -> int` / `sysl_futex_wake(*u32, n) -> int`
+that a `Mutex`/`Condvar` written in sysl needs — answered by pthreads on a hosted target and by an
+`@export` over `clone`/`futex` on a freestanding one. Its stack and TLS have to be the program's to
+give (a freestanding runtime owns neither allocator conventions nor a TLS layout the compiler knows),
+which is the design question this finding leaves open.
+
+## What worked in milestone 16
+
+- **No sysl gap in the kernel half.** The thread group is a `&sync Threads` box hung off `Process`
+  (`[16]Option[&sync Thread]` for joining beside `[16]*Thread` raw members for the signal and exit
+  paths, which may not take counts), the per-thread state a plain `UserSide` struct inside `Thread`,
+  and a `@crossing(f)` on `spawn_user` let `clone_thread` pass a closure capturing `*Process`, a
+  `UserRegs` and a `u64` with no complaint. `Option[&sync Thread]` slots are moved out under an
+  `IrqLock` and joined after it is let go with ordinary code.
+- **Module storage arrays of `WaitQueue` and `*Thread` with no initializer** (`futex.sysl`'s buckets)
+  are zero-filled as `nap.sysl`'s single queue is.
+
 ## What worked in milestone 15b
 
 - **The whole design fitted the existing shapes.** The signal state is a `&sync Signals` box beside

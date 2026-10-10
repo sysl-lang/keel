@@ -151,7 +151,7 @@ private[proc] sys_rt_sigaction(p: *Process, regs: *u64) -> Result[i64, Errno]
     Ok(0)
 
 // rt_sigprocmask(how, *u64 set | 0, *u64 old | 0, sigsetsize) -> 0. With no set, `how` is not looked at
-// and the blocked set is only read.
+// and the blocked set is only read. The set is the calling thread's own.
 private[proc] sys_rt_sigprocmask(p: *Process, regs: *u64) -> Result[i64, Errno]
     val how = regs[0]
     val set_at = regs[1]

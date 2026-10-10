@@ -208,6 +208,10 @@ private[sched] switch_locked()
         if ready.empty() then return
         if prev == c.idle then prev.state = Ready else make_ready_locked(prev)
     var next = ready.pop()
+    if !PARALLEL_THREADS && next != null && next.process != null && next.process.running > 0 &&
+            prev.user.counted != next.process
+        ready.push(next)
+        next = null
     if next == null then next = c.idle
     if next == prev
         prev.state = Running
@@ -229,6 +233,11 @@ private[sched] switch_locked()
 // Off only to show what switching TPIDR_EL0 is for: with it off a thread finds in it whatever the
 // thread before it on that core left, and /bin/linuxthreads's TLS check fails.
 private const TLS_SWITCH: bool = true
+
+// Off only to show that the boot test can tell: with it off a core takes no thread of a process another
+// core is running a thread of, so a process's threads are serialised, `procs` says at most 1 ran at once,
+// and /bin/linuxthreads fails its parallel check.
+private const PARALLEL_THREADS: bool = true
 
 // A thread of a process leaving a core, and one arriving: how many of the process's threads are running
 // at once, and on which cores any has run (`procs` reports both; the boot test's proof that a process's

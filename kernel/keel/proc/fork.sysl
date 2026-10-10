@@ -2,8 +2,9 @@ module keel.proc
 
 // `clone` (as fork) and `execve`.
 //
-// **clone** with flags SIGCHLD and no new stack — the combination a C library's `fork` makes, and the
-// only one keel takes (anything else is EINVAL) — copies the calling process: its address space
+// **clone** with musl's pthread_create flags makes a thread of the calling process (`clone_thread`).
+// With flags SIGCHLD and no new stack — the combination a C library's `fork` makes, and the other one
+// keel takes (anything else is EINVAL) — it copies the calling process: its address space
 // copy-on-write (keel.mm's cow.sysl), every descriptor (each counted open once more, so a pipe sees one
 // more reader or writer and a socket one more holder; a descriptor's offset is copied, not shared, as
 // everywhere in keel), its current directory, uid and gid, and its environment. The child's thread
@@ -14,7 +15,8 @@ module keel.proc
 // **execve** replaces the calling process's image: the same pid, parent, descriptors and current
 // directory; a new address space loaded from the file, the arguments and the environment laid on its
 // stack as `spawn` lays them, and the uid of the file's owner when it is set-user-ID, as `spawn` honours
-// it. There is no close-on-exec flag. Everything that can fail — the path, the file, the permission,
+// it. Every other thread of the process is ended first, as Linux does, and the caller becomes its first
+// (its id the pid). There is no close-on-exec flag. Everything that can fail — the path, the file, the permission,
 // the load, the room for the arguments — is done before the old image is touched, so a failed
 // `execve` returns its error to a caller exactly as it was.
 

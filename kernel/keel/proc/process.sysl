@@ -9,16 +9,17 @@ import keel.sched
 import keel.sched.{Context, Cred, OpenFile, Process}
 import sysl.sync.{Atomic, Ordering}
 
-// User processes: made from an ELF image, run by a kernel thread of their own, ended by `exit`, by a
-// fault, or by `kill`.
+// User processes: made from an ELF image, run by kernel threads of their own — one to start with, more
+// by `clone` (fork.sysl; keel.sched's group.sysl) — and ended when the last of them ends: by `exit`, or
+// all at once by `exit_group`, a fatal signal, a fault, or `kill`.
 //
-// The process's thread enters user mode from `run` and stays there: every system call, interrupt and
-// fault it takes is handled on its kernel stack, below `run`'s frame, and returns to EL0. When the
-// process ends, `keel_leave_user` (user.sysl) unwinds straight back to `run`, which drops the address
-// space from TTBR0, closes its files, tells the process table (family.sysl) and returns, and the thread
-// ends as any kernel thread does. Whoever started the process waits for it — the kernel with `wait`,
-// a parent process with the `wait` system call — and that joins the thread and frees the address
-// space.
+// Each thread enters user mode from `run` and stays there: every system call, interrupt and fault it
+// takes is handled on its kernel stack, below `run`'s frame, and returns to EL0. When the thread ends,
+// `keel_leave_user` (user.sysl) unwinds straight back to `run`, which drops the address space from
+// TTBR0, zeroes and wakes the word `set_tid_address` named, and — for the last thread out — closes the
+// process's files and tells the process table (family.sysl); then the thread ends as any kernel thread
+// does. Whoever started the process waits for it — the kernel with `wait`, a parent process with the
+// `wait` system call — and that joins its threads and frees the address space.
 
 private var next_pid: Atomic[u64] = Atomic(1)
 
