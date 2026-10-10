@@ -125,6 +125,15 @@ tpidr_el0() -> u64 = read_sysreg("tpidr_el0")
 
 set_tpidr_el0(v: u64) = write_sysreg("tpidr_el0", v)
 
+// Stop trapping FP/SIMD instructions on this core: CPACR_EL1.FPEN = 0b11. There is no setting that
+// opens the unit to EL0 alone, so EL1 may use it too — which only keel.sched's save and load code does;
+// everything else the kernel runs is compiled `general_regs_only`.
+enable_fp()
+    write_sysreg("cpacr_el1", read_sysreg("cpacr_el1") | FPEN)
+    isb()
+
+private const FPEN: u64 = u64(3) << 20
+
 // MPIDR_EL1's affinity level 0: which core of its cluster this is. QEMU's `virt` numbers its cores
 // 0, 1, 2, ... there.
 core_id() -> u64 = read_sysreg("mpidr_el1") & 0xff

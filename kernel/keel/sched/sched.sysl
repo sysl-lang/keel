@@ -82,6 +82,7 @@ init()
     val c = &cpus[usize(cpu.core_id())]
     c.id = cpu.core_id()
     c.reaper = Reaper(null, 0)
+    cpu.enable_fp()
 
     val boot: &sync Thread = Thread(Context([0; 12], 0, 0), next_id.add(1), Running, null, None, None, None,
         empty_wait_queue(), Reaper(null, 0), 0, null, 0, no_user())
@@ -109,6 +110,7 @@ init_secondary()
     c.reaper = Reaper(null, 0)
     c.current = null
     cpu.set_tpidr(u64(usize(c)))
+    cpu.enable_fp()
 
     val idle: &sync Thread = Thread(Context([0; 12], 0, 0), next_id.add(1), Running, null, None, None, None,
         empty_wait_queue(), Reaper(null, 0), 0, null, 0, no_user())
@@ -225,6 +227,11 @@ private[sched] switch_locked()
     if TLS_SWITCH
         prev.user.tls = cpu.tpidr_el0()
         cpu.set_tpidr_el0(next.user.tls)
+    // The FP/SIMD registers hold the user thread's own values whenever it is on a core (the kernel never
+    // uses them), so they are saved as a user thread leaves and loaded as one arrives; a kernel thread
+    // has none and leaves them as they are.
+    if prev.process != null then save_fp(&prev.user.fp)
+    if FP_RESTORE && next.process != null then load_fp(&next.user.fp)
     count_out(prev)
     count_in(next, c.id)
     switch_context(&prev.ctx, &next.ctx)
@@ -233,6 +240,10 @@ private[sched] switch_locked()
 // Off only to show what switching TPIDR_EL0 is for: with it off a thread finds in it whatever the
 // thread before it on that core left, and /bin/linuxthreads's TLS check fails.
 private const TLS_SWITCH: bool = true
+
+// Off only to show what loading a thread's FP/SIMD registers is for: with it off a thread resumes with
+// whatever the thread before it on that core left there, and /bin/linuxfp's threads compute wrong sums.
+private const FP_RESTORE: bool = true
 
 // Off only to show that the boot test can tell: with it off a core takes no thread of a process another
 // core is running a thread of, so a process's threads are serialised, `procs` says at most 1 ran at once,

@@ -1,6 +1,6 @@
 module keel.proc
 
-import abi.keel.abi.{SIGBUS, SIGFPE, SIGILL, SIGKILL, SIGSEGV, SIGTRAP}
+import abi.keel.abi.{FpRegs, SIGBUS, SIGFPE, SIGILL, SIGKILL, SIGSEGV, SIGTRAP, no_fp}
 import keel.console
 import keel.cpu
 import keel.fs
@@ -112,14 +112,14 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
         mm.free_space(&raw.space)
         return Err(NoRoom)
     val regs = fresh_regs(l.entry, sp, 0)
-    start_first_thread(raw, () -> run(raw, regs), 0, 0)
+    start_first_thread(raw, () -> run(raw, regs), 0, 0, no_fp())
     Ok(p)
 
-// Start a new process's first thread, whose id is the pid, with TPIDR_EL0 `tls` and the blocked set
-// `blocked`. A process with no threads yet always has room for one.
+// Start a new process's first thread, whose id is the pid, with TPIDR_EL0 `tls`, the blocked set
+// `blocked` and the FP/SIMD registers `fp`. A process with no threads yet always has room for one.
 @crossing(f)
-private[proc] start_first_thread(p: *Process, f: &sync Fn() -> unit, tls: u64, blocked: u64)
-    sched.spawn_user(p, f, p.pid, tls, blocked) match
+private[proc] start_first_thread(p: *Process, f: &sync Fn() -> unit, tls: u64, blocked: u64, fp: FpRegs)
+    sched.spawn_user(p, f, p.pid, tls, blocked, fp) match
         Some(_) -> ()
         None -> panic("keel: a new process had no room for its first thread")
 

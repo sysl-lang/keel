@@ -274,6 +274,7 @@ session2=(
     'linuxthreads'
     'linuxthreads exec'
     'linuxthreads fds'
+    'linuxfp'
     'linuxpoll'
     '@wait linuxpoll: termios round trip; raw mode, waiting for three bytes'
     '@raw abc'
@@ -343,6 +344,15 @@ transcript2=(
     # by one thread; a read in flight keeps its pipe end through another thread's close; nothing left over.
     $'# linuxthreads fds\nlinuxthreads: 4 threads x 2000 rounds of pipe2, dup, openat and close at once: no descriptor shared, every pipe round-tripped\n'
     $'linuxthreads: a read in flight keeps its pipe end through a close; the table ends with 0-2 alone\n'
+    # FP/SIMD at EL0: a raw-svc Linux program built without -mgeneral-regs-only. A new process's q registers,
+    # FPSR and FPCR are zero; eight threads on four cores each carry their own through a long chain of SIMD
+    # adds, across preemption and migration; a fork's child goes on from the parent's; a handler that
+    # overwrites them all leaves the interrupted chain exact; execve (of itself, `linuxfp fresh`) zeroes them.
+    $'# linuxfp\nlinuxfp: a new process starts with every q register, FPSR and FPCR zero\n'
+    $'linuxfp: 8 threads x 1000000 rounds through q0-q31 on 4 cores: every sum exact, FPCR and FPSR their own\n'
+    $'linuxfp: fork: parent and child each carried the q registers on; both sums exact\n'
+    $'linuxfp: a handler that overwrote q0-q31, FPSR and FPCR left the interrupted sums exact\n'
+    $'linuxfp: execve zeroed every q register, FPSR and FPCR\n'
     # Milestone 17: a third raw-svc Linux program. ppoll and pselect6 woken by a thread's write, a close and a
     # child's write, timing out, POLLNVAL/POLLERR/EBADF, their signal masks; the clocks; termios, and raw
     # mode driven from here: "abc" with no newline (no echo, so nothing between the two lines), then Ctrl-C
@@ -366,6 +376,7 @@ shutdown=(
 # the `files` program failed, the shell was restarted, or a process was left behind.
 not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login ended by signal"
     "keel: processes left unreaped" "keel: processes still running before init" "linuxpoll: FAILED"
+    "linuxfp: FAILED"
     "keelroot" "wonderland" "nope")
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
@@ -411,6 +422,10 @@ $linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/
 $linux_cc --target=aarch64-linux-gnu -ffreestanding -fno-builtin -nostdlib -static -fno-pic -O2 -mgeneral-regs-only \
     -mno-outline-atomics -c -o $out/linuxpoll.o $root/linux/poll.c
 $linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/linuxpoll $out/linuxpoll.o
+# The one built WITHOUT -mgeneral-regs-only: it computes in the FP/SIMD registers on purpose.
+$linux_cc --target=aarch64-linux-gnu -ffreestanding -fno-builtin -nostdlib -static -fno-pic -O2 \
+    -mno-outline-atomics -c -o $out/linuxfp.o $root/linux/fp.c
+$linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/linuxfp $out/linuxfp.o
 
 rm -rf $fsroot
 mkdir -p $fsroot/dir $fsroot/bin
@@ -420,6 +435,7 @@ done
 cp $out/linuxhello $fsroot/bin/linuxhello
 cp $out/linuxthreads $fsroot/bin/linuxthreads
 cp $out/linuxpoll $fsroot/bin/linuxpoll
+cp $out/linuxfp $fsroot/bin/linuxfp
 print -n "hello from the disk" > $fsroot/hello.txt
 print "inside a directory" > $fsroot/dir/inner.txt
 mkdir -p $fsroot/m9

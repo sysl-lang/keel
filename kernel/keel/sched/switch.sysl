@@ -1,10 +1,14 @@
 module keel.sched
 
+import abi.keel.abi.{FpRegs, no_fp}
+
 // The context switch. A thread that gives up the processor does it by calling `keel_switch`, as an
 // ordinary function, so all it has to keep is what a call preserves: x19 to x29, the link register and
 // the stack pointer. Everything else is already saved by the caller's own code, or — for a thread
 // preempted in an interrupt — by the vector code, in a `trap.Frame` on that thread's stack, below
-// the call into the scheduler. No FP/SIMD state exists to save (`codegen.general_regs_only`).
+// the call into the scheduler. The kernel's own code never uses the FP/SIMD registers
+// (`codegen.general_regs_only`), so what they hold is always the user thread's; `switch_locked` saves and
+// loads them with `keel_fp_save`/`keel_fp_load` below.
 //
 //   keel_switch(from, to)    store the callee-saved registers and SP into *from, load them from *to,
 //                            and return — into whatever `to` was doing when it last called this.
@@ -60,6 +64,78 @@ struct Context
 // Where in `regs` the start code finds its argument (x19) and where the first switch returns to (x30).
 private const ARG_REG: usize = 0
 private const LINK_REG: usize = 11
+
+// The FP/SIMD registers of the thread on this core, to and from memory: the only kernel code that
+// touches them. q0-q31, FPSR and FPCR, laid out as keel.abi's `FpRegs` (16-aligned, so `stp`/`ldp` of
+// q registers never straddle). Each clobbers x1 and nothing else a call does not already.
+//
+//   keel_fp_save(to)      store this core's FP/SIMD registers into *to
+//   keel_fp_load(from)    load them from *from
+asm
+    [aarch64]
+        ".arch_extension fp"
+        ".arch_extension simd"
+        ".globl keel_fp_save"
+        "keel_fp_save:"
+        "stp q0, q1, [x0, #0]"
+        "stp q2, q3, [x0, #32]"
+        "stp q4, q5, [x0, #64]"
+        "stp q6, q7, [x0, #96]"
+        "stp q8, q9, [x0, #128]"
+        "stp q10, q11, [x0, #160]"
+        "stp q12, q13, [x0, #192]"
+        "stp q14, q15, [x0, #224]"
+        "stp q16, q17, [x0, #256]"
+        "stp q18, q19, [x0, #288]"
+        "stp q20, q21, [x0, #320]"
+        "stp q22, q23, [x0, #352]"
+        "stp q24, q25, [x0, #384]"
+        "stp q26, q27, [x0, #416]"
+        "stp q28, q29, [x0, #448]"
+        "stp q30, q31, [x0, #480]"
+        "mrs x1, fpsr"
+        "str w1, [x0, #512]"
+        "mrs x1, fpcr"
+        "str w1, [x0, #516]"
+        "ret"
+        ".globl keel_fp_load"
+        "keel_fp_load:"
+        "ldp q0, q1, [x0, #0]"
+        "ldp q2, q3, [x0, #32]"
+        "ldp q4, q5, [x0, #64]"
+        "ldp q6, q7, [x0, #96]"
+        "ldp q8, q9, [x0, #128]"
+        "ldp q10, q11, [x0, #160]"
+        "ldp q12, q13, [x0, #192]"
+        "ldp q14, q15, [x0, #224]"
+        "ldp q16, q17, [x0, #256]"
+        "ldp q18, q19, [x0, #288]"
+        "ldp q20, q21, [x0, #320]"
+        "ldp q22, q23, [x0, #352]"
+        "ldp q24, q25, [x0, #384]"
+        "ldp q26, q27, [x0, #416]"
+        "ldp q28, q29, [x0, #448]"
+        "ldp q30, q31, [x0, #480]"
+        "ldr w1, [x0, #512]"
+        "msr fpsr, x1"
+        "ldr w1, [x0, #516]"
+        "msr fpcr, x1"
+        "ret"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+@assert(sizeof(FpRegs) == 528, "keel_fp_save stores 32 q registers from 0 and FPSR, FPCR at 512, 516")
+@assert(offsetof(FpRegs, fpcr) == 516, "keel_fp_save stores FPCR at 516")
+@assert(alignof(FpRegs) == 16, "keel_fp_save's q stores want 16-byte alignment")
+
+extern "keel_fp_save" save_fp(to: *FpRegs)
+extern "keel_fp_load" load_fp(from: *FpRegs)
+
+// The calling thread's FP/SIMD registers as they are now (it is a user thread in a system call: they
+// are its user mode's).
+current_fp() -> FpRegs
+    var f = no_fp()
+    save_fp(&f)
+    f
 
 // A context whose first switch enters `keel_thread_start` on `stack_top` with `arg` in x19.
 private[sched] fresh_context(stack_top: u64, arg: u64) -> Context

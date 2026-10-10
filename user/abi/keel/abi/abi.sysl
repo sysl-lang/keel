@@ -157,10 +157,26 @@ struct SigAction
 
 @assert(sizeof(SigAction) == 32, "a SigAction is 32 bytes")
 
+// A thread's FP/SIMD registers, laid out as Linux's `struct user_fpsimd_state`: q0 to q31 (each two
+// words, the low one first), then FPSR and FPCR. Every user thread has its own; a new process starts
+// with them all zero, `clone` and `fork` copy the caller's, `execve` zeroes them.
+@align(16)
+struct FpRegs
+    q: [64]u64
+    fpsr: u32
+    fpcr: u32
+    reserved: [2]u32
+
+@assert(sizeof(FpRegs) == 528, "FpRegs is user_fpsimd_state: 32 q registers, FPSR, FPCR, 8 bytes reserved")
+@assert(offsetof(FpRegs, fpsr) == 512, "FPSR follows the 32 q registers")
+
+no_fp() -> FpRegs = FpRegs([0; 64], 0, 0, [0; 2])
+
 // What delivering a signal to a handler puts on the stack, at the stack pointer the handler starts
 // with: the registers as they were — x0 to x30, then where the program was (ELR), its flags (SPSR) and
-// its stack pointer — the blocked set to restore, and the signal. This frame is keel's own, not Linux's
-// `rt_sigframe`.
+// its stack pointer — the blocked set to restore, the signal, and the FP/SIMD registers, so a handler
+// that computes in them leaves the interrupted code's values as they were. This frame is keel's own,
+// not Linux's `rt_sigframe`.
 struct SigFrame
     x: [31]u64
     pc: u64
@@ -168,8 +184,10 @@ struct SigFrame
     sp: u64
     blocked: u64
     sig: u64
+    fp: FpRegs
 
-@assert(sizeof(SigFrame) == 288, "a SigFrame is 288 bytes, a multiple of 16")
+@assert(offsetof(SigFrame, fp) == 288, "the FP/SIMD registers follow the 36 words, 16-aligned")
+@assert(sizeof(SigFrame) == 816, "a SigFrame is 816 bytes, a multiple of 16")
 
 // A time as `nanosleep` takes it.
 struct Timespec

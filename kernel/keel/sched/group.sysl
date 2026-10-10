@@ -19,6 +19,7 @@ module keel.sched
 // Everything here is under the process's signal lock (`Process.sig.lock`): a sender looking for a thread
 // to wake walks `members` under it.
 
+import abi.keel.abi.{FpRegs, no_fp}
 import keel.cpu
 import keel.mm
 import sysl.sync.{Atomic, Ordering}
@@ -43,9 +44,10 @@ struct UserSide
     futex_next: *Thread
     call_mask: bool             // ppoll/pselect6 replaced `blocked` for the call and were interrupted:
     mask_after: u64             // ...the set to put back once the signal has been delivered
+    fp: FpRegs                  // its FP/SIMD registers while it is off its core (sched.sysl switches them)
 
 no_user() -> UserSide = UserSide(0, Context([0; 12], 0, 0), 0, 0, Atomic(0), null, null, 0, null, null, 0, false,
-    null, false, 0)
+    null, false, 0, no_fp())
 
 // A process's threads.
 struct Threads
@@ -58,10 +60,11 @@ struct Threads
 
 no_threads() -> &sync Threads = Threads([None; MAX_THREADS], [null; MAX_THREADS], 0, false, null, empty_wait_queue())
 
-// Start a thread of `p` running `f`, as thread `tid`, with TPIDR_EL0 `tls` and the blocked set
-// `blocked`. None when `p` has MAX_THREADS already, or is ending.
+// Start a thread of `p` running `f`, as thread `tid`, with TPIDR_EL0 `tls`, the blocked set `blocked`
+// and the FP/SIMD registers `fp` (all zero for a new program; the caller's for `fork` and `clone`).
+// None when `p` has MAX_THREADS already, or is ending.
 @crossing(f)
-spawn_user(p: *Process, f: &sync Fn() -> unit, tid: u64, tls: u64, blocked: u64) -> Option[&sync Thread]
+spawn_user(p: *Process, f: &sync Fn() -> unit, tid: u64, tls: u64, blocked: u64, fp: FpRegs) -> Option[&sync Thread]
     val t = new_thread(Some(f))
     val raw: *Thread = &*t
     raw.process = p
@@ -69,6 +72,7 @@ spawn_user(p: *Process, f: &sync Fn() -> unit, tid: u64, tls: u64, blocked: u64)
     raw.user.tid = tid
     raw.user.tls = tls
     raw.user.blocked = blocked
+    raw.user.fp = fp
     val g = p.threads
     val s = p.sig
     var old: Option[&sync Thread] = None
