@@ -14,10 +14,10 @@ module keel.fs
 // an operation that fails half way through can leave a block or an inode allocated and unnamed, which
 // mkfs's check reports.
 
-import abi.keel.abi.{AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, DIRENT64_NAME, DT_DIR, DT_REG,
+import abi.keel.abi.{AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, DIRENT64_NAME, DT_DIR, DT_REG,
     EBADF, EBUSY, EEXIST, EFAULT, EINVAL, EISDIR, EMFILE, ENAMETOOLONG, ENOENT, ENOTDIR, EOPNOTSUPP, EPERM, ENOTEMPTY,
     ERANGE, ESPIPE, Errno, FIRST_FILE_FD, MAX_FDS, O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_TRUNC,
-    O_WRONLY, PATH_ROOM, SEEK_CUR, SEEK_END, SEEK_SET, Stat, UMASK}
+    O_WRONLY, PATH_ROOM, SEEK_CUR, SEEK_END, SEEK_SET, Stat}
 import keel.mm
 import keel.sched.{Cred, Holds, OpenFile, Process, cred_of, lock_files, unlock_files}
 import ondisk.keel.ondisk
@@ -27,7 +27,7 @@ import ondisk.keel.ondisk.{BLOCK_SIZE, DIRENT_SIZE, Dirent, Inode, KIND_DIR, KIN
 private const MAX_PATH: usize = usize(PATH_ROOM)
 private const CHUNK: usize = 512
 
-// openat(dirfd, path, flags, mode) -> fd. A file made by O_CREAT gets `mode` less UMASK.
+// openat(dirfd, path, flags, mode) -> fd. A file made by O_CREAT gets `mode` less the process's umask.
 sys_openat(p: *Process, regs: *u64) -> Result[i64, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
     val path = path_at(p, regs[0], regs[1], room[..])?
@@ -52,7 +52,7 @@ sys_openat(p: *Process, regs: *u64) -> Result[i64, Errno]
             ino
         Err(ENOENT) ->
             if (flags & O_CREAT) == 0 then return Err(ENOENT)
-            create(st, path, KIND_FILE, who, regs[3])?
+            create(st, path, KIND_FILE, who, regs[3] & ~u64(p.umask))?
         Err(e) -> return Err(e)
     var i = read_inode(st, ino)?
     if (flags & O_DIRECTORY) != 0 && i.kind != KIND_DIR then return Err(ENOTDIR)
@@ -188,13 +188,13 @@ sys_newfstatat(p: *Process, regs: *u64) -> Result[i64, Errno]
     val s = stat_of(ino, read_inode(st, ino)?)
     stat_out(p, regs[2], s)
 
-// mkdirat(dirfd, path, mode) -> 0: a directory of `mode` less UMASK.
+// mkdirat(dirfd, path, mode) -> 0: a directory of `mode` less the process's umask.
 sys_mkdirat(p: *Process, regs: *u64) -> Result[i64, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
     val path = path_at(p, regs[0], regs[1], room[..])?
     val st = lock()
     defer unlock()
-    val _ = create(st, path, KIND_DIR, cred_of(p), regs[2])?
+    val _ = create(st, path, KIND_DIR, cred_of(p), regs[2] & ~u64(p.umask))?
     Ok(0)
 
 // getdents64(fd, buf, len) -> bytes: as many whole `linux_dirent64` records as fit, from where the last
@@ -353,7 +353,7 @@ sys_sync() -> Result[i64, Errno]
 // --- Shared by the calls above --------------------------------------------------------------------
 
 // Make a file or a directory at `path`, which must not exist, owned by `who`, with the permission bits
-// of `mode` less UMASK; its parent must exist and let `who` write and search it.
+// of `mode` (the caller has taken its umask off); its parent must exist and let `who` write and search it.
 private create(st: *State, path: []const u8, kind: u16, who: Cred, mode: u64) -> Result[u32, Errno]
     val (dir_ino, name) = parent_of(st, path, who)?
     if dots(name) then return Err(EEXIST)
@@ -363,7 +363,7 @@ private create(st: *State, path: []const u8, kind: u16, who: Cred, mode: u64) ->
         Some(_) -> return Err(EEXIST)
         None -> ()
     allowed(&dir, who, MAY_WRITE | MAY_EXEC)?
-    val ino = new_inode(st, kind, who, u16(mode & u64(PERMISSION_BITS) & ~u64(UMASK)))?
+    val ino = new_inode(st, kind, who, u16(mode & u64(PERMISSION_BITS)))?
     if kind == KIND_DIR
         var d = read_inode(st, ino)?
         add_entry(st, &d, ".".bytes, ino, KIND_DIR)?
@@ -480,6 +480,30 @@ sys_faccessat(p: *Process, regs: *u64) -> Result[i64, Errno]
     var i = read_inode(st, ino)?
     allowed(&i, who, u16(regs[2]))?
     Ok(0)
+
+// faccessat2(dirfd, path, how, flags) -> faccessat's answer. AT_EACCESS is the same check (one user id
+// per process) and AT_SYMLINK_NOFOLLOW changes nothing (no links).
+sys_faccessat2(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if (regs[3] & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0 then return Err(EINVAL)
+    sys_faccessat(p, regs)
+
+// readlinkat(dirfd, path, buf, len) -> EINVAL for anything that is there, since nothing on a keel disk is
+// a symbolic link; ENOENT and the rest as the walk to it answers.
+sys_readlinkat(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var args: [3]u64 = [regs[0], regs[1], 0]
+    sys_faccessat(p, &args[0])?
+    Err(EINVAL)
+
+// utimensat(dirfd, path | 0, *times, flags) -> 0 once the path (or, with no path, the descriptor) is
+// found: the disk keeps no times, so there is nothing to set (FORMAT.md).
+sys_utimensat(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[1] == 0
+        val t = lock_files(p)
+        val open = regs[0] < MAX_FDS && t.slots[usize(regs[0])].holds != Holds.Free
+        unlock_files(p)
+        return if open then Ok(0) else Err(EBADF)
+    var args: [3]u64 = [regs[0], regs[1], 0]
+    sys_faccessat(p, &args[0])
 
 // fchmodat(dirfd, path, mode) -> 0: the set-user-ID and rwx bits of `mode` (others are EINVAL), by the
 // owner or root (EPERM).

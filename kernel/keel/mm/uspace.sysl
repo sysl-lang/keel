@@ -8,7 +8,8 @@ import sysl.sync.SpinLock
 //   0 .. USER_BASE                     never mapped, so a null pointer (and anything near it) faults
 //   USER_BASE ..                       the program's segments, where its ELF image says (user/user.ld
 //                                      links at USER_BASE), then the heap, which `brk` grows upward
-//   .. stack_bottom - PAGE             the heap's limit
+//   .. MMAP_BASE                       the heap's limit
+//   MMAP_BASE .. mmap_top()            what `mmap` hands out (mmap.sysl), top-down
 //   stack_bottom - PAGE                the guard page: never mapped, so running off the stack faults
 //   stack_bottom .. USER_STACK_TOP     the stack, USER_STACK_PAGES pages, mapped from the start
 //   USER_STACK_TOP .. 2^48             unmapped
@@ -29,8 +30,35 @@ const PAGE_SIZE: u64 = 4096
 
 stack_bottom() -> u64 = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE
 
-// The highest address a segment or the heap may reach: the bottom of the guard page.
-heap_limit() -> u64 = stack_bottom() - PAGE_SIZE
+// How far the stack may grow, as Linux's default RLIMIT_STACK: 8 MiB. Below stack_bottom() its pages are
+// mapped the first time the program touches them (a translation fault, keel.proc's `user_sync`). A
+// system call is not the program touching them: `user_range` does not grow the stack, and a pointer
+// below what is mapped is EFAULT — as on Linux since 6.5, whose get_user_pages stopped expanding stacks.
+const USER_STACK_MAX: u64 = 8 * 1024 * 1024
+
+stack_limit() -> u64 = USER_STACK_TOP - USER_STACK_MAX
+
+// Off only to show what growing is for: without it the stack is its first 64 KiB and no more, and
+// busybox's interactive shell, whose line editor keeps its buffers on the stack, dies of SIGSEGV.
+private const GROW_STACK: bool = true
+
+// Map a zeroed page for the stack at `va` if it lies where the stack may grow and nothing is mapped
+// there yet; whether the page is there now.
+grow_stack(s: *Space, va: u64) -> bool
+    if !GROW_STACK || va < stack_limit() || va >= USER_STACK_TOP then return false
+    val flags = cpu.irq_save()
+    grow_lock.lock()
+    val page = va & ~(PAGE_SIZE - 1)
+    val done = page_in_use(s, page) || map_user_page(s, page, UserProt(true, false)).is_some()
+    grow_lock.unlock()
+    cpu.irq_restore(flags)
+    done
+
+// Two threads of a process may fault below its stack at once: one maps the page, the other finds it.
+private var grow_lock: SpinLock = SpinLock(0)
+
+// The highest address a segment or the heap may reach: where mmap's window begins (mmap.sysl).
+heap_limit() -> u64 = MMAP_BASE
 
 // One process's translation tables.
 struct Space
@@ -104,6 +132,8 @@ user_translate(s: *Space, va: u64) -> Option[(PhysAddr, bool)]
         None -> return None
     if *slot == 0 then return None
     val leaf: LeafDesc = cpu.from_word(*slot)
+    // A PROT_NONE page (mmap.sysl) is there, but not the program's to use.
+    if leaf.ap != UserRw && leaf.ap != UserRo then return None
     Some((frame_addr(leaf.oa) + (va & (PAGE_SIZE - 1)), leaf.ap == UserRw))
 
 // Copy `dst.len` bytes in from user address `va` of space `s`, or answer false and copy nothing when

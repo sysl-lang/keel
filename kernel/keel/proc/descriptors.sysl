@@ -18,11 +18,13 @@ module keel.proc
 // it unless it is ignored or handled.
 //
 // What is simplified: a second descriptor on a file (dup3, dup, a child's) copies the offset rather
-// than sharing it, which is the same for the shell's `>` and `>>` (a fresh file, and O_APPEND); and
-// O_CLOEXEC is taken and changes nothing — keel has no close-on-exec.
+// than sharing it, which is the same for the shell's `>` and `>>` (a fresh file, and O_APPEND).
+// Close-on-exec is a descriptor's own mark (O_CLOEXEC in its slot's flags), closed by execve.
 
-import abi.keel.abi.{EBADF, EDESTADDRREQ, EFAULT, EINTR, EINVAL, EMFILE, ENFILE, EPIPE, Errno, MAX_FDS, O_CLOEXEC,
-    PIPE_ROOM, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, SIGPIPE}
+import abi.keel.abi.{EBADF, EDESTADDRREQ, EFAULT, EINTR, EINVAL, EMFILE, ENFILE, EPIPE, ESPIPE, Errno, FD_CLOEXEC,
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, MAX_FDS, O_ACCMODE, O_APPEND, O_CLOEXEC,
+    O_LARGEFILE, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, PIPE_ROOM, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM,
+    POLLWRNORM, SIGPIPE}
 import keel.console
 import keel.fs
 import keel.mm
@@ -161,21 +163,115 @@ private[proc] sys_dup3(p: *Process, regs: *u64) -> Result[i64, Errno]
     val old = slot_in(t, regs[0])?
     if to >= MAX_FDS then return Err(EBADF)
     if to == regs[0] then return Err(EINVAL)
-    val o = *old
+    val o = with_cloexec(*old, (regs[2] & O_CLOEXEC) != 0)
     duplicate(o)
     release(t.slots[usize(to)])
     t.slots[usize(to)] = o
     Ok(i64(to))
 
-// dup(old) -> the lowest free descriptor, now standing for what `old` does.
+// dup(old) -> the lowest free descriptor, now standing for what `old` does (not close-on-exec).
 private[proc] sys_dup(p: *Process, regs: *u64) -> Result[i64, Errno]
     val t = sched.lock_files(p)
     defer sched.unlock_files(p)
     val old = slot_in(t, regs[0])?
     val to = lowest_free(t, OPEN_FILES)?
-    t.slots[to] = *old
+    t.slots[to] = with_cloexec(*old, false)
     duplicate(*old)
     Ok(i64(to))
+
+// A descriptor's close-on-exec mark is O_CLOEXEC in its slot's flags: per descriptor, as Linux's
+// FD_CLOEXEC is, so a copy (dup, dup3, F_DUPFD) sets it afresh.
+private with_cloexec(f: OpenFile, on: bool) -> OpenFile
+    var out = f
+    out.flags = if on then f.flags | u32(O_CLOEXEC) else f.flags & ~u32(O_CLOEXEC)
+    out
+
+// Close every descriptor marked close-on-exec: an execve has replaced the program.
+private[proc] close_on_exec(p: *Process)
+    val t = sched.lock_files(p)
+    for fd in 0..<OPEN_FILES
+        if t.slots[fd].holds != Holds.Free && (u64(t.slots[fd].flags) & O_CLOEXEC) != 0
+            release(t.slots[fd])
+            t.slots[fd] = sched.free_file()
+    sched.unlock_files(p)
+
+// fcntl(fd, cmd, arg): F_DUPFD and F_DUPFD_CLOEXEC (the lowest free descriptor >= arg), F_GETFD and
+// F_SETFD (FD_CLOEXEC), F_GETFL (the access mode, O_APPEND and O_NONBLOCK as given, and O_LARGEFILE, as
+// a 64-bit Linux reports) and F_SETFL (O_APPEND and O_NONBLOCK; the second changes nothing). Every other
+// command is EINVAL.
+private[proc] sys_fcntl(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val cmd = regs[1]
+    val arg = regs[2]
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
+    val f = slot_in(t, regs[0])?
+    if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC
+        if arg >= MAX_FDS then return Err(EINVAL)
+        for fd in usize(arg)..<OPEN_FILES
+            if t.slots[fd].holds == Holds.Free
+                t.slots[fd] = with_cloexec(*f, cmd == F_DUPFD_CLOEXEC)
+                duplicate(*f)
+                return Ok(i64(fd))
+        return Err(EMFILE)
+    if cmd == F_GETFD then return Ok(if (u64(f.flags) & O_CLOEXEC) != 0 then i64(FD_CLOEXEC) else 0)
+    if cmd == F_SETFD
+        *f = with_cloexec(*f, (arg & FD_CLOEXEC) != 0)
+        return Ok(0)
+    if cmd == F_GETFL then return Ok(i64(status_flags(*f)))
+    if cmd == F_SETFL
+        val keep = u64(f.flags) & ~(O_APPEND | O_NONBLOCK)
+        f.flags = u32(keep | (arg & (O_APPEND | O_NONBLOCK)))
+        return Ok(0)
+    Err(EINVAL)
+
+// What F_GETFL reports: a file's access mode and flags as opened; a pipe end its direction; the console
+// and a socket read-write.
+private status_flags(f: OpenFile) -> u64
+    val kept = u64(f.flags) & (O_APPEND | O_NONBLOCK)
+    val mode = f.holds match
+        File -> u64(f.flags) & O_ACCMODE
+        PipeRead -> O_RDONLY
+        PipeWrite -> O_WRONLY
+        else O_RDWR
+    mode | kept | O_LARGEFILE
+
+// readv(fd, *iovec, count), writev(fd, *iovec, count) -> the bytes moved: each `struct iovec` {base,
+// len} in turn through read or write, stopping at the first short one, as Linux's do. An error after
+// some bytes moved answers the bytes.
+private[proc] sys_readv(p: *Process, regs: *u64) -> Result[i64, Errno] = vectored(p, regs, false)
+private[proc] sys_writev(p: *Process, regs: *u64) -> Result[i64, Errno] = vectored(p, regs, true)
+
+private const IOV_MAX: u64 = 1024
+
+private vectored(p: *Process, regs: *u64, writing: bool) -> Result[i64, Errno]
+    val count = regs[2]
+    if count > IOV_MAX then return Err(EINVAL)
+    var done: u64 = 0
+    for i in 0..<count
+        var iov: [2]u64 = [0, 0]
+        val raw: *u8 = ptr_cast(&iov[0])
+        if !mm.copy_from_user(&p.space, regs[1] + i * 16, raw[0..<16]) then return Err(EFAULT)
+        if iov[1] == 0 then continue
+        var one: [3]u64 = [regs[0], iov[0], iov[1]]
+        val r = if writing then sys_write(p, &one[0]) else sys_read(p, &one[0])
+        val n = r match
+            Ok(n) -> u64(n)
+            Err(e) -> return if done > 0 then Ok(i64(done)) else Err(e)
+        done += n
+        if n < iov[1] then break
+    Ok(i64(done))
+
+// pread64(fd, buf, len, offset) -> bytes read from `offset` of a file; the descriptor's own offset does
+// not move. A pipe, the console or a socket is ESPIPE.
+private[proc] sys_pread64(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
+    val f = slot_in(t, regs[0])?
+    if f.holds != Holds.File then return Err(ESPIPE)
+    if i64(regs[3]) < 0 then return Err(EINVAL)
+    var copy = *f
+    copy.offset = regs[3]
+    fs.sys_read(p, &copy, regs)
 
 // pipe2(*[2]i32, flags) -> 0, with the read end's descriptor and then the write end's written out. The
 // only flag is O_CLOEXEC; a pipe that never waits (O_NONBLOCK) keel does not have. The two descriptors
@@ -187,8 +283,8 @@ private[proc] sys_pipe2(p: *Process, regs: *u64) -> Result[i64, Errno]
     val r = lowest_free(t, OPEN_FILES)?
     val w = lowest_free(t, r)?
     val slot = new_pipe()?
-    val read_end = OpenFile(Holds.PipeRead, u32(slot), 0, 0)
-    val write_end = OpenFile(Holds.PipeWrite, u32(slot), 0, 0)
+    val read_end = OpenFile(Holds.PipeRead, u32(slot), u32(regs[1] & O_CLOEXEC), 0)
+    val write_end = OpenFile(Holds.PipeWrite, u32(slot), u32(regs[1] & O_CLOEXEC), 0)
     var both: [2]u32 = [u32(r), u32(w)]
     val b: *u8 = ptr_cast(&both[0])
     if !mm.copy_to_user(&p.space, regs[0], b[0..<8])

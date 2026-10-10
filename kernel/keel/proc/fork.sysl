@@ -46,7 +46,7 @@ private[proc] sys_clone(p: *Process, regs: *u64) -> Result[i64, Errno]
     // thread has the forking thread's blocked set, TLS pointer and FP/SIMD registers.
     val child: &sync Process = Process(new_pid(), space, p.heap_base, p.brk, sched.no_threads(),
         sched.copied_signals(p.sig), 0, 0, 0, sched.no_files(), p.cwd, p.cwd_len, p.pid, false, None, p.uid,
-        p.gid, copied_env(p), p.pgid, p.sid, 0, p.name, 0, 0, 0)
+        p.gid, copied_env(p), p.pgid, p.sid, 0, p.name, 0, 0, 0, p.umask)
     val raw: *Process = &*child
     copy_all(p, raw)
     if !enter(child)
@@ -113,7 +113,8 @@ private[proc] sys_execve(p: *Process, regs: *u64) -> Result[i64, Errno]
     var l = load(image.bytes.view()) match
         Ok(l) -> l
         Err(e) -> return Err(errno_of(e))
-    val sp = lay_out_args(&l.space, args.view(), env.view()) match
+    val aux = Aux(l.phdr, l.phnum, l.entry, image.run_as.uid, image.run_as.gid)
+    val sp = lay_out_args(&l.space, args.view(), env.view(), path[0..<path_len], aux) match
         Some(sp) -> sp
         None ->
             mm.free_space(&l.space)
@@ -149,6 +150,7 @@ private[proc] sys_execve(p: *Process, regs: *u64) -> Result[i64, Errno]
     p.name = name_from(args.view())
     // A handler's address means nothing in the new program; an ignored signal stays ignored.
     sched.reset_handlers(p.sig)
+    close_on_exec(p)
     replace_regs(regs, fresh_regs(l.entry, sp, 0))
     Ok(0)
 

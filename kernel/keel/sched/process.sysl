@@ -37,6 +37,7 @@ struct Process
     running: u64                // how many of its threads are on a core now; under the scheduler's lock
     parallel: u64               // the most that ever were at once
     cores: u64                  // a bit for each core any of its threads has run on
+    umask: u32                  // the permission bits a file or directory it makes does not get; inherited
 
 // Room for a process's name in its record (keel.abi's ProcInfo.name).
 const NAME_ROOM: usize = 16

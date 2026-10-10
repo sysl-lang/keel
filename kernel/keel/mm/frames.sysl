@@ -165,6 +165,9 @@ private in_use_index(f: Frame) -> u64
     if !is_set(i) then panic("keel: a shared frame is not in use")
     i
 
+// How many frames the allocator manages, free or not; set once at boot.
+frames_total() -> u64 = frame_count
+
 // How many frames are free right now.
 frames_free() -> u64
     val flags = cpu.irq_save()

@@ -281,6 +281,34 @@ session2=(
     '@wait ISIG off, Ctrl-C is a byte'
     '@intr'
     '@wait termios restored'
+    'busybox echo hello from busybox'
+    'busybox uname -a'
+    'busybox ls -l /'
+    'busybox cat /etc/passwd | busybox wc -l'
+    "busybox printf 'pear\\napple\\npear\\nfig\\napple\\n' > /m9/fruit"
+    'busybox sort /m9/fruit'
+    'busybox sort /m9/fruit | busybox uniq -c'
+    "busybox sh -c 'for i in 1 2 3; do echo \$i; done'"
+    "busybox sh -c 'false || echo fallback; echo \$?'"
+    "busybox sh -c 'busybox ls / | busybox grep bin'"
+    'busybox sleep 0.1'
+    'busybox date -u +%Y'
+    "busybox stat -c '%s %n' /hello.txt"
+    'busybox du -s /dir'
+    "busybox sh -c 'echo sleeping; exec busybox sleep 100'"
+    $'@wait \nsleeping\n'
+    '@intr'
+    'busybox rm /m9/fruit'
+    'busybox find /etc | busybox sort'
+    'busybox md5sum /hello.txt'
+    'busybox sha256sum /m9/big.bin'
+    "busybox seq 3 | busybox tr '\\n' ' '"
+    'busybox expr 6 * 7'
+    'busybox sh'
+    'echo interactive $((6 * 7))'
+    'cd /etc; pwd'
+    'exit 3'
+    'echo $?'
     'exit'
     $'\x04'
 )
@@ -361,7 +389,48 @@ transcript2=(
     $'linuxpoll: pselect6 woke on a child\'s write; a blocked SIGUSR1 came in through the call\'s mask alone: EINTR, handled, blocked again\n'
     $'linuxpoll: CLOCK_MONOTONIC advanced across nanosleep; clock_nanosleep TIMER_ABSTIME woke after its time; CLOCK_REALTIME is the RTC\'s date\n'
     $'linuxpoll: termios round trip; raw mode, waiting for three bytes\nlinuxpoll: raw read "abc" with no newline and no echo; ISIG off, Ctrl-C is a byte\n'
-    $'linuxpoll: read Ctrl-C as 0x03; VTIME timed out an idle read; termios restored\n# exit\nlogin: \n'
+    $'linuxpoll: read Ctrl-C as 0x03; VTIME timed out an idle read; termios restored\n'
+    # Milestone 18: Alpine's static musl busybox 1.37.0, unmodified, from keel's own shell. A static PIE,
+    # loaded at 0x400000 and relocating itself from the auxiliary vector; uname answers keel's own names
+    # (busybox adds "Linux", its compiled-in OS name); ls colours its names because isatty(1) holds on the
+    # console; the owner is a number because keel's /etc/passwd has six fields and musl's getpwuid wants
+    # Linux's seven, while /etc/group is Linux's format.
+    $'# busybox echo hello from busybox\nhello from busybox\n'
+    $'# busybox uname -a\nkeel keel 0.18 milestone 18 aarch64 Linux\n'
+    $'# busybox ls -l /\ntotal 68\n'
+    $'drwxr-xr-x    2 0        root          1504 Jan  1  1970 \e[1;34mbin\e[m\n'
+    $'drwxr-xr-x    2 0        root            96 Jan  1  1970 \e[1;34mdir\e[m\n'
+    $'drwxr-xr-x    2 0        root           160 Jan  1  1970 \e[1;34metc\e[m\n'
+    $'-rw-r--r--    1 0        root            19 Jan  1  1970 \e[0;0mhello.txt\e[m\n'
+    $'drwxr-xr-x    3 0        root            96 Jan  1  1970 \e[1;34mhome\e[m\n'
+    $'drwxr-xr-x    2 0        root           224 Jan  1  1970 \e[1;34mm9\e[m\n'
+    $'-rw-r--r--    1 0        root         45022 Jan  1  1970 \e[0;0mout.txt\e[m\n'
+    # cat's sendfile (71) is ENOSYS on keel; busybox falls back to read and write, as it does on Linux
+    # for a descriptor sendfile refuses.
+    $'# busybox cat /etc/passwd | busybox wc -l\n2\n'
+    $'# busybox printf \'pear\\napple\\npear\\nfig\\napple\\n\' > /m9/fruit\n'
+    $'# busybox sort /m9/fruit\napple\napple\nfig\npear\npear\n'
+    $'# busybox sort /m9/fruit | busybox uniq -c\n      2 apple\n      1 fig\n      2 pear\n'
+    # busybox's own shell (ash): a loop, ||, $?, and a pipeline it forks and execs itself.
+    $'# busybox sh -c \'for i in 1 2 3; do echo $i; done\'\n1\n2\n3\n'
+    $'# busybox sh -c \'false || echo fallback; echo $?\'\nfallback\n0\n'
+    $'# busybox sh -c \'busybox ls / | busybox grep bin\'\nbin\n'
+    $'# busybox sleep 0.1\n# busybox date -u +%Y\n'"$(date -u +%Y)"$'\n'
+    $'# busybox stat -c \'%s %n\' /hello.txt\n19 /hello.txt\n'
+    $'# busybox du -s /dir\n8\t/dir\n'
+    # Ctrl-C reaches the busybox sleep ash exec'd: it is in the console's foreground group.
+    $'# busybox sh -c \'echo sleeping; exec busybox sleep 100\'\nsleeping\nsh: busybox: killed by signal 2\n'
+    $'# busybox rm /m9/fruit\n'
+    $'# busybox find /etc | busybox sort\n/etc\n/etc/group\n/etc/passwd\n/etc/secret\n'
+    # The sums are the host's, over the same bytes the script puts on the disk below.
+    $'# busybox md5sum /hello.txt\n'"$(print -n 'hello from the disk' | md5 -q)"$'  /hello.txt\n'
+    $'# busybox sha256sum /m9/big.bin\n'"$(perl -e 'srand(9); print map { chr(int(rand(256))) } 1..204800' | shasum -a 256 | cut -d' ' -f1)"$'  /m9/big.bin\n'
+    $'# busybox seq 3 | busybox tr \'\\n\' \' \'\n1 2 3 # busybox expr 6 * 7\n42\n'
+    # busybox's shell, interactive: its line editor puts the console in raw mode and echoes for itself;
+    # ~ is HOME (root's is /), and `exit 3` comes back to keel's shell as the job's status.
+    $'# busybox sh\n~ # echo interactive $((6 * 7))\ninteractive 42\n~ # cd /etc; pwd\n/etc\n'
+    $'/etc # exit 3\nsh: busybox: exit status 3\n# echo $?\n3\n'
+    $'# exit\nlogin: \n'
     "init: the console closed after 1 sessions; orphans reaped: 0"
     "keel: init exited 0"
     "keel: every process reaped"
@@ -427,8 +496,37 @@ $linux_cc --target=aarch64-linux-gnu -ffreestanding -fno-builtin -nostdlib -stat
     -mno-outline-atomics -c -o $out/linuxfp.o $root/linux/fp.c
 $linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/linuxfp $out/linuxfp.o
 
+# Milestone 18: a static aarch64 musl busybox, UNMODIFIED — Alpine's own `busybox-static` package (an
+# apk is a gzip'd tar; the program is bin/busybox.static, a static PIE). It is fetched once into a
+# directory of its own under scratch/, both the package and the program are checked against the
+# sha256s below, and it is never run on the host. The test fails, saying so, if it is not there and
+# cannot be fetched.
+busybox_url=https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/busybox-static-1.37.0-r31.apk
+busybox_apk_sha256=965777e06b94bf11981d5f4ecdfcd577879f4b0dda544294d1dd3f72b217bc75
+busybox_sha256=999cb969d09093a71716cfc747bb53cdada3f332c05eb5046c56e0f66a4d6d22
+busybox_dir=$out/busybox-1.37.0-r31
+busybox=$busybox_dir/bin/busybox.static
+if [[ ! -f $busybox ]]; then
+    rm -rf $busybox_dir
+    mkdir -p $busybox_dir
+    if ! curl -sfL -o $busybox_dir/busybox-static.apk $busybox_url; then
+        print -r -- "FAIL: busybox is not in $busybox_dir and could not be fetched from $busybox_url"
+        return 1
+    fi
+    if [[ $(shasum -a 256 $busybox_dir/busybox-static.apk) != "$busybox_apk_sha256 "* ]]; then
+        print -r -- "FAIL: $busybox_url is not the package this test was written against (sha256)"
+        return 1
+    fi
+    tar -xzf $busybox_dir/busybox-static.apk -C $busybox_dir bin/busybox.static
+fi
+if [[ $(shasum -a 256 $busybox) != "$busybox_sha256 "* ]]; then
+    print -r -- "FAIL: $busybox is not busybox 1.37.0-r31's bin/busybox.static (sha256)"
+    return 1
+fi
+
 rm -rf $fsroot
 mkdir -p $fsroot/dir $fsroot/bin
+cp $busybox $fsroot/bin/busybox
 for prog in $user_programs; do
     cp $out/user/$prog.elf $fsroot/bin/$prog
 done
