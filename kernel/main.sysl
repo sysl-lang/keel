@@ -87,10 +87,13 @@ kmain(dtb_pa: u64) -> never
     timer.start(10)
     enable_irqs()
 
-    while irq.ticks.load(Ordering.Acquire) < 3
+    // The count that ended the wait is the one printed: a later read could already see a fourth tick.
+    var seen = irq.ticks.load(Ordering.Acquire)
+    while seen < 3
         wait_for_interrupt()
+        seen = irq.ticks.load(Ordering.Acquire)
 
-    print("keel: tick", irq.ticks.load(Ordering.Acquire))
+    print("keel: tick", seen)
 
     // The low half has no translation table any more, so reading the kernel's own physical address
     // there is a translation fault at level 0. The trap handler reports it and steps over the load.
