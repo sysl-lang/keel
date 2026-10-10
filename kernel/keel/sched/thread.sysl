@@ -37,6 +37,7 @@ struct Thread
     preemptions: u64                            // times the timer took the processor away
     process: *Process                           // the user process this thread runs, or null
     ttbr0: u64                                  // what TTBR0 holds while it runs; 0: the kernel's empty table
+    user: UserSide                              // what it is as one of a process's threads (group.sysl)
 
 // A new thread running `f`, which starts as soon as a core is free for it. Everything `f` captured
 // is reached from another thread, so `f` is a `&sync Fn`: the compiler refuses a closure capturing
@@ -57,7 +58,7 @@ private[sched] new_thread(entry: Option[&sync Fn() -> unit]) -> &sync Thread
         Some(s) -> s
         None -> panic("keel: no stack for a new thread")
     val t: &sync Thread = Thread(Context([0; 12], 0, 0), next_id.add(1), Ready, null, Some(s), entry, None,
-        empty_wait_queue(), Reaper(null, 0), 0, null, 0)
+        empty_wait_queue(), Reaper(null, 0), 0, null, 0, no_user())
     val p: *Thread = &*t
     p.ctx = fresh_context(u64(s.top), u64(usize(p)))
     p.me = Some(t)
@@ -110,7 +111,7 @@ join(t: &sync Thread)
 
 // A dead thread's stack goes back, its closure and its self-reference are dropped; the box itself
 // goes when the last handle does.
-private reap(p: *Thread)
+private[sched] reap(p: *Thread)
     p.stack match
         Some(s) ->
             p.stack = None

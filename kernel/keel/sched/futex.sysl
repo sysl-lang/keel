@@ -1,0 +1,113 @@
+module keel.sched
+
+// Futexes: a thread sleeps until another wakes it at the same user address — the one system call a C
+// library's mutexes, condition variables and `pthread_join` are built on (milestone 16).
+//
+// A waiter is keyed by its process and the address (keel has no memory shared between processes, so a
+// private futex and a shared one are the same thing). `futex_wait` reads the word and, if it still
+// holds what the caller expected, records itself on its bucket's list and sleeps on the bucket's queue,
+// all under `guard`; `futex_wake` takes `guard`, marks up to `n` waiters on that key woken and wakes the
+// bucket's queue. A waiter goes back to sleep unless it was marked, so the others on a bucket only lose
+// a wake-up; the mark, made under the same lock as the read, is what makes a wake between a waiter's read
+// and its sleep impossible to miss.
+//
+// A timeout is the nap's: while anyone waits with one, every tick wakes every bucket, and each timed
+// waiter looks at the clock (10 ms resolution). A signal ends a wait as it ends any interruptible sleep.
+
+import keel.mm
+import keel.timer
+import sysl.sync.{Atomic, Ordering}
+
+private const BUCKETS: usize = 32
+
+private var futex_guard: IrqLock
+private var queues: [BUCKETS]WaitQueue
+private var waiters: [BUCKETS]*Thread
+private var timed: Atomic[u64] = Atomic(0)
+
+// Off only to show what marking a waiter is for: with it off `futex_wake` counts the waiters it should
+// wake but wakes none for good — each goes back to sleep — and /bin/linuxthreads hangs in its join.
+private const WAKES_MARK: bool = true
+
+// How a wait ended.
+enum FutexWait
+    Woken
+    Differs                     // the word did not hold what was expected: EAGAIN
+    TimedOut
+    Interrupted                 // a signal: EINTR
+    Unreadable                  // the address is not the process's memory: EFAULT
+
+private bucket_of(p: *Process, addr: u64) -> usize = usize(((addr >> 2) ^ (u64(usize(p)) >> 6)) % u64(BUCKETS))
+
+// Wait on the 32-bit word at `addr` in `p` — the calling thread's process — while it holds `expected`;
+// until `deadline_ms` (keel.timer's clock; 0: no deadline).
+futex_wait(p: *Process, addr: u64, expected: u32, deadline_ms: u64) -> FutexWait
+    val me = current()
+    val b = bucket_of(p, addr)
+    var word: u32 = 0
+    val raw: *u8 = ptr_cast(&word)
+    val flags = futex_guard.lock()
+    if !mm.copy_from_user(&p.space, addr, raw[0..<4])
+        futex_guard.unlock(flags)
+        return Unreadable
+    if word != expected
+        futex_guard.unlock(flags)
+        return Differs
+    me.user.futex_key = p
+    me.user.futex_addr = addr
+    me.user.futex_woken = false
+    me.user.futex_next = waiters[b]
+    waiters[b] = me
+    if deadline_ms != 0 then timed.add(1)
+    var out = Woken
+    loop
+        if me.user.futex_woken then break
+        if deadline_ms != 0 && timer.now_ms() >= deadline_ms
+            out = TimedOut
+            break
+        if !sleep_interruptibly(p, &queues[b], &futex_guard)
+            if !me.user.futex_woken then out = Interrupted
+            break
+    unlink(b, me)
+    if deadline_ms != 0 then timed.sub(1)
+    futex_guard.unlock(flags)
+    out
+
+// Take `t` off bucket `b`'s list. Under `guard`.
+private unlink(b: usize, t: *Thread)
+    if waiters[b] == t
+        waiters[b] = t.user.futex_next
+    else
+        var at = waiters[b]
+        while at != null
+            if at.user.futex_next == t
+                at.user.futex_next = t.user.futex_next
+                break
+            at = at.user.futex_next
+    t.user.futex_next = null
+    t.user.futex_key = null
+    t.user.futex_addr = 0
+
+// Wake at most `n` of `p`'s threads waiting on `addr`; answers how many.
+futex_wake(p: *Process, addr: u64, n: u64) -> u64
+    val b = bucket_of(p, addr)
+    var woken: u64 = 0
+    val flags = futex_guard.lock()
+    var t = waiters[b]
+    while t != null && woken < n
+        if t.user.futex_key == p && t.user.futex_addr == addr && !t.user.futex_woken
+            if WAKES_MARK then t.user.futex_woken = true
+            woken += 1
+        t = t.user.futex_next
+    if woken > 0
+        val _ = queues[b].wake_all()
+    futex_guard.unlock(flags)
+    woken
+
+// The timer interrupt's part (`tick`): wake every bucket while anyone waits with a deadline.
+private[sched] futex_tick()
+    if timed.load(Ordering.Acquire) == 0 then return
+    val flags = futex_guard.lock()
+    for b in 0..<BUCKETS
+        val _ = queues[b].wake_all()
+    futex_guard.unlock(flags)

@@ -37,24 +37,24 @@ struct Action
 const SIG_DFL: u64 = 0
 const SIG_IGN: u64 = 1
 
+// The process's half: what is pending for the process as a whole, and the actions. Each thread's half —
+// its blocked set, what is pending for it alone, where it sleeps — is its `Thread.user` (group.sysl),
+// under this same `lock`.
 struct Signals
     lock: IrqLock
     pending: Atomic[u64]        // a bit per signal; written under `lock`, read without it on the way to EL0
-    blocked: u64                // under `lock`
     actions: [SIGNALS]Action
-    sleep_queue: *WaitQueue     // where the process's thread is asleep interruptibly, or null; under `lock`
-    sleep_guard: *IrqLock       // that queue's guard
 
 private no_action() -> Action = Action(SIG_DFL, 0, 0, 0)
 
-// A new program's signals: every action the default, nothing blocked or pending.
-fresh_signals() -> &sync Signals = Signals(irq_lock(), Atomic(0), 0, [no_action(); SIGNALS], null, null)
+// A new program's signals: every action the default, nothing pending.
+fresh_signals() -> &sync Signals = Signals(irq_lock(), Atomic(0), [no_action(); SIGNALS])
 
-// A forked child's: its parent's actions and blocked set, nothing pending.
+// A forked child's: its parent's actions, nothing pending. (Its thread starts with the forking thread's
+// blocked set.)
 copied_signals(from: &sync Signals) -> &sync Signals
     val s = fresh_signals()
     val flags = from.lock.lock()
-    s.blocked = from.blocked
     for i in 0..<SIGNALS
         s.actions[i] = from.actions[i]
     from.lock.unlock(flags)
@@ -86,11 +86,13 @@ ignores(s: &sync Signals, sig: u64) -> bool
     val h = s.actions[usize(sig)].handler
     h == SIG_IGN || (h == SIG_DFL && default_ignores(sig))
 
-// The pending signals that may be delivered now.
-deliverable(s: &sync Signals) -> u64 = s.pending.load(Ordering.Acquire) & ~(s.blocked & ~UNBLOCKABLE)
+// The pending signals — the process's and the thread's own — that may be delivered to thread `t` now.
+deliverable(t: *Thread, s: &sync Signals) -> u64 =
+    (s.pending.load(Ordering.Acquire) | t.user.pending.load(Ordering.Acquire)) & ~(t.user.blocked & ~UNBLOCKABLE)
 
-// Make `sig` pending for `p`, unless `p` ignores it; answer the queue `p`'s thread sleeps on, if a sleep
-// should end for it. The caller wakes it (`Wakes`) once it holds no lock.
+// Make `sig` pending for `p` as a whole, unless `p` ignores it; answer the queue one of its threads that
+// does not block it sleeps on, if a sleep should end for it (the first such thread; any thread not
+// blocking it takes it on its way to user mode). The caller wakes it (`Wakes`) once it holds no lock.
 post(p: *Process, sig: u64) -> Sleeper
     val s = p.sig
     val flags = s.lock.lock()
@@ -99,17 +101,30 @@ post(p: *Process, sig: u64) -> Sleeper
         return Sleeper(null, null)
     s.pending.store(s.pending.load(Ordering.Relaxed) | bit(sig), Ordering.Release)
     var w = Sleeper(null, null)
-    if (deliverable(s) & bit(sig)) != 0 then w = Sleeper(s.sleep_queue, s.sleep_guard)
+    val g = p.threads
+    for i in 0..<MAX_THREADS
+        val t = g.members[i]
+        if t == null || t.user.sleep_queue == null then continue
+        if (deliverable(t, s) & bit(sig)) != 0
+            w = Sleeper(t.user.sleep_queue, t.user.sleep_guard)
+            break
     s.lock.unlock(flags)
     w
 
-// Take the lowest-numbered deliverable signal off `p`'s pending set and answer it with its action;
-// 0 when there is none.
+// Make `sig` pending for thread `t` of `p` alone (how a group's other threads are ended), and answer
+// where it sleeps. Under `p`'s signal lock, which the caller holds.
+private[sched] post_to_thread_locked(t: *Thread, sig: u64) -> Sleeper
+    t.user.pending.store(t.user.pending.load(Ordering.Relaxed) | bit(sig), Ordering.Release)
+    Sleeper(t.user.sleep_queue, t.user.sleep_guard)
+
+// Take the lowest-numbered signal deliverable to the calling thread of `p` — its own pending set first,
+// then the process's — and answer it with its action; 0 when there is none.
 take(p: *Process) -> (u64, Action)
     val s = p.sig
-    if deliverable(s) == 0 then return (0, no_action())
+    val t = current()
+    if deliverable(t, s) == 0 then return (0, no_action())
     val flags = s.lock.lock()
-    val ready = deliverable(s)
+    val ready = deliverable(t, s)
     var sig: u64 = 0
     for i in 1..<SIGNALS
         if (ready & bit(u64(i))) != 0
@@ -117,7 +132,11 @@ take(p: *Process) -> (u64, Action)
             break
     var a = no_action()
     if sig != 0
-        s.pending.store(s.pending.load(Ordering.Relaxed) & ~bit(sig), Ordering.Release)
+        val own = t.user.pending.load(Ordering.Relaxed)
+        if (own & bit(sig)) != 0
+            t.user.pending.store(own & ~bit(sig), Ordering.Release)
+        else
+            s.pending.store(s.pending.load(Ordering.Relaxed) & ~bit(sig), Ordering.Release)
         a = s.actions[usize(sig)]
     s.lock.unlock(flags)
     (sig, a)
@@ -132,18 +151,19 @@ struct Sleeper
 // an ordinary wake. Either way the guard is held again on return.
 sleep_interruptibly(p: *Process, q: *WaitQueue, guard: *IrqLock) -> bool
     val s = p.sig
+    val t = current()
     val flags = s.lock.lock()
-    if deliverable(s) != 0
+    if deliverable(t, s) != 0
         s.lock.unlock(flags)
         return false
-    s.sleep_queue = q
-    s.sleep_guard = guard
+    t.user.sleep_queue = q
+    t.user.sleep_guard = guard
     s.lock.unlock(flags)
     q.sleep(guard)
     val again = s.lock.lock()
-    s.sleep_queue = null
-    s.sleep_guard = null
-    val woken_for_signal = deliverable(s) != 0
+    t.user.sleep_queue = null
+    t.user.sleep_guard = null
+    val woken_for_signal = deliverable(t, s) != 0
     s.lock.unlock(again)
     !woken_for_signal
 

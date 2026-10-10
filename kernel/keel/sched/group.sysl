@@ -1,0 +1,195 @@
+module keel.sched
+
+// A process's threads (milestone 16): Linux's thread group. Every user thread — a process's first, and
+// each one `clone` makes with CLONE_THREAD — is started by `spawn_user`, which puts it in its process's
+// `Threads` before it can run, and leaves it through `thread_ended` on its way out. The process ends when
+// its last thread does.
+//
+// **What is each thread's own** is `Thread.user`: its id (`gettid`; the first thread's is the pid), the
+// context `keel_enter_user` saved (where leaving user mode returns to), its TLS pointer (TPIDR_EL0,
+// switched with the thread), its blocked set, the signals sent to it alone, where it sleeps
+// interruptibly, the address `set_tid_address` named, and its futex wait (futex.sysl).
+//
+// **Ending the group** — `exit_group`, a fatal signal, a fault — is `begin_group_exit`: the first caller
+// records how the process ended, marks it `exiting` and makes SIGKILL pending for every other thread
+// alone, waking any that sleeps; each takes it on its way to user mode (a running one at the next tick at
+// the latest) and leaves. A second caller finds the group already ending and only leaves. `execve` does
+// the same for every thread but its own and waits until it is the only one (`end_other_threads`).
+//
+// Everything here is under the process's signal lock (`Process.sig.lock`): a sender looking for a thread
+// to wake walks `members` under it.
+
+import keel.cpu
+import keel.mm
+import sysl.sync.{Atomic, Ordering}
+
+// The most threads one process may have at once; `clone` answers EAGAIN past it.
+const MAX_THREADS: usize = 16
+
+// A thread's part as one of a process's threads; a kernel thread's is all zero.
+struct UserSide
+    tid: u64                    // gettid; 0 for a kernel thread
+    ctx: Context                // what `keel_enter_user` saved, which `keel_leave_user` returns to
+    tls: u64                    // TPIDR_EL0 while the thread is off its core (sched.sysl switches it)
+    blocked: u64                // the signals it blocks (a bit per signal, keel's numbering)
+    pending: Atomic[u64]        // signals sent to it alone
+    sleep_queue: *WaitQueue     // where it sleeps interruptibly, or null; under the process's signal lock
+    sleep_guard: *IrqLock       // that queue's guard
+    clear_tid: u64              // set_tid_address / CLONE_CHILD_CLEARTID: zeroed and woken when it ends
+    counted: *Process           // the process `count_in` counted it running for (sched.sysl)
+    futex_key: *Process         // the futex it waits on, if any (futex.sysl)
+    futex_addr: u64
+    futex_woken: bool
+    futex_next: *Thread
+
+no_user() -> UserSide = UserSide(0, Context([0; 12], 0, 0), 0, 0, Atomic(0), null, null, 0, null, null, 0, false,
+    null)
+
+// A process's threads.
+struct Threads
+    boxes: [MAX_THREADS]Option[&sync Thread]    // every thread it started and has not yet joined
+    members: [MAX_THREADS]*Thread               // the ones still in it: not yet `thread_ended`
+    live: u64                                   // how many members there are
+    exiting: bool                               // the group is ending (or `execve` is ending the others)
+    exec_thread: *Thread                        // the thread an `execve` is ending the others for
+    gone: WaitQueue                             // that thread waits here for the others to leave
+
+no_threads() -> &sync Threads = Threads([None; MAX_THREADS], [null; MAX_THREADS], 0, false, null, empty_wait_queue())
+
+// Start a thread of `p` running `f`, as thread `tid`, with TPIDR_EL0 `tls` and the blocked set
+// `blocked`. None when `p` has MAX_THREADS already, or is ending.
+@crossing(f)
+spawn_user(p: *Process, f: &sync Fn() -> unit, tid: u64, tls: u64, blocked: u64) -> Option[&sync Thread]
+    val t = new_thread(Some(f))
+    val raw: *Thread = &*t
+    raw.process = p
+    raw.ttbr0 = mm.ttbr0_of(&p.space)
+    raw.user.tid = tid
+    raw.user.tls = tls
+    raw.user.blocked = blocked
+    val g = p.threads
+    val s = p.sig
+    var old: Option[&sync Thread] = None
+    var placed = false
+    val flags = s.lock.lock()
+    if !g.exiting
+        for i in 0..<MAX_THREADS
+            if g.members[i] != null then continue
+            // A slot whose thread has left is taken over; that thread is joined below.
+            old = g.boxes[i]
+            g.boxes[i] = Some(t)
+            g.members[i] = raw
+            g.live += 1
+            placed = true
+            break
+    s.lock.unlock(flags)
+    old match
+        Some(o) -> join(o)
+        None -> ()
+    if !placed
+        reap(raw)
+        return None
+    val irq = cpu.irq_save()
+    lock.lock()
+    make_ready_locked(raw)
+    lock.unlock()
+    cpu.irq_restore(irq)
+    Some(t)
+
+// Join every thread `p` started: all of them have ended, or are about to. Answers how often the timer
+// took the processor from them.
+join_threads(p: *Process) -> u64
+    val g = p.threads
+    var preempted: u64 = 0
+    for i in 0..<MAX_THREADS
+        g.boxes[i] match
+            Some(t) ->
+                join(t)
+                preempted += t.preemptions
+            None -> ()
+        g.boxes[i] = None
+    preempted
+
+// The calling thread, a thread of `p`, has left user mode for good. True when it was the last: the
+// process has ended.
+thread_ended(p: *Process) -> bool
+    val me = current()
+    val g = p.threads
+    val s = p.sig
+    val flags = s.lock.lock()
+    for i in 0..<MAX_THREADS
+        if g.members[i] == me then g.members[i] = null
+    g.live -= 1
+    val last = g.live == 0
+    if g.exec_thread != null && g.live == 1 then g.gone.wake_all()
+    s.lock.unlock(flags)
+    last
+
+// The calling thread of `p` ends the whole group, by `sig` (0: `exit_group`) with `code`, for `fault`:
+// recorded only if the group was not already ending. The other threads are sent SIGKILL. Answers false
+// if the group was already ending, when nothing is recorded.
+begin_group_exit(p: *Process, sig: u64, fault: u64, code: i64) -> bool
+    val me = current()
+    val g = p.threads
+    val s = p.sig
+    var wakes = no_wakes()
+    val flags = s.lock.lock()
+    if g.exiting && g.exec_thread == null
+        s.lock.unlock(flags)
+        return false
+    // An `execve` waiting for the others to leave is one of them now: the group's end wins, and it is
+    // woken to find that out.
+    if g.exec_thread != null then g.gone.wake_all()
+    g.exiting = true
+    g.exec_thread = null
+    p.term_signal = sig
+    p.fault = fault
+    p.exit_code = code
+    for i in 0..<MAX_THREADS
+        val t = g.members[i]
+        if t != null && t != me then wakes.add(post_to_thread_locked(t, SIGKILL))
+    s.lock.unlock(flags)
+    wakes.wake_all()
+    true
+
+// `exit` from thread `me` of `p`: the first thread's code is the process's, unless the group is ending.
+leader_exit(p: *Process, code: i64)
+    val me = current()
+    val s = p.sig
+    val flags = s.lock.lock()
+    if !p.threads.exiting && me.user.tid == p.pid then p.exit_code = code
+    s.lock.unlock(flags)
+
+// `execve`'s part: end every other thread of `p` and wait until the caller is the only one. False if the
+// group is already ending (the caller must leave as well).
+end_other_threads(p: *Process) -> bool
+    val me = current()
+    val g = p.threads
+    val s = p.sig
+    var wakes = no_wakes()
+    val flags = s.lock.lock()
+    if g.exiting
+        s.lock.unlock(flags)
+        return false
+    if g.live == 1
+        s.lock.unlock(flags)
+        return true
+    g.exiting = true
+    g.exec_thread = me
+    for i in 0..<MAX_THREADS
+        val t = g.members[i]
+        if t != null && t != me then wakes.add(post_to_thread_locked(t, SIGKILL))
+    s.lock.unlock(flags)
+    wakes.wake_all()
+    val again = s.lock.lock()
+    while g.exec_thread == me && g.live > 1
+        g.gone.sleep(&s.lock)
+    val alone = g.exec_thread == me
+    if alone
+        g.exiting = false
+        g.exec_thread = null
+    s.lock.unlock(again)
+    alone
+
+// How many threads `p` has now.
+thread_count(p: *Process) -> u64 = p.threads.live

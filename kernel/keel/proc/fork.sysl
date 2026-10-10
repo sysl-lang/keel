@@ -18,8 +18,8 @@ module keel.proc
 // the load, the room for the arguments — is done before the old image is touched, so a failed
 // `execve` returns its error to a caller exactly as it was.
 
-import abi.keel.abi.{ARGS_ROOM, E2BIG, EAGAIN, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOMEM, ENV_ROOM, Errno,
-    PATH_ROOM, SIGCHLD}
+import abi.keel.abi.{ARGS_ROOM, CLONE_CHILD_CLEARTID, CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_THREAD_OPTIONS,
+    CLONE_THREAD_SET, E2BIG, EAGAIN, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOMEM, ENV_ROOM, Errno, PATH_ROOM, SIGCHLD}
 import keel.cpu
 import keel.fs
 import keel.mm
@@ -29,18 +29,21 @@ import sysl.buf.{Buf, buf}
 
 private const MAX_EXEC_PATH: usize = usize(PATH_ROOM)
 
-// clone(flags, stack, parent_tid, tls, child_tid) -> the child's pid; 0 in the child. Only flags
-// SIGCHLD with stack 0 — a fork — is taken; the three addresses mean nothing without other flags.
+// clone(flags, stack, parent_tid, tls, child_tid) -> the child's pid or thread id; 0 in the child. Two
+// shapes are taken: flags SIGCHLD with stack 0 — a fork, where the three addresses mean nothing — and a
+// thread (`clone_thread`); anything else is EINVAL.
 private[proc] sys_clone(p: *Process, regs: *u64) -> Result[i64, Errno]
-    if regs[0] != SIGCHLD || regs[1] != 0 then return Err(EINVAL)
+    val flags = regs[0]
+    if (flags & ~CLONE_THREAD_OPTIONS) == CLONE_THREAD_SET then return clone_thread(p, regs, flags)
+    if flags != SIGCHLD || regs[1] != 0 then return Err(EINVAL)
     val space = mm.fork_space(&p.space) match
         Some(s) -> s
         None -> return Err(ENOMEM)
-    // The child has its parent's signal actions and blocked set, nothing pending, its process group and
-    // its session.
-    val child: &sync Process = Process(new_pid(), space, p.heap_base, p.brk, Context([0; 12], 0, 0),
-        sched.copied_signals(p.sig), 0, 0, None, 0, sched.no_files(), p.cwd, p.cwd_len, p.pid, false, None, p.uid,
-        p.gid, copied_env(p), p.pgid, p.sid, 0, p.name)
+    // The child has its parent's signal actions, nothing pending, its process group and its session; its
+    // thread has the forking thread's blocked set and TLS pointer.
+    val child: &sync Process = Process(new_pid(), space, p.heap_base, p.brk, sched.no_threads(),
+        sched.copied_signals(p.sig), 0, 0, 0, sched.no_files(), p.cwd, p.cwd_len, p.pid, false, None, p.uid,
+        p.gid, copied_env(p), p.pgid, p.sid, 0, p.name, 0, 0, 0)
     val raw: *Process = &*child
     for fd in 0..<sched.OPEN_FILES
         raw.files[fd] = p.files[fd]
@@ -51,8 +54,33 @@ private[proc] sys_clone(p: *Process, regs: *u64) -> Result[i64, Errno]
         return Err(EAGAIN)
     var regs_copy = saved_regs(regs)
     regs_copy.x[0] = 0
-    child.thread = Some(sched.spawn(() -> run(raw, regs_copy)))
+    start_first_thread(raw, () -> run(raw, regs_copy), cpu.tpidr_el0(), sched.current().user.blocked)
     Ok(i64(raw.pid))
+
+// A new thread of the calling process — `flags` is CLONE_THREAD_SET and any of CLONE_THREAD_OPTIONS, what
+// musl's pthread_create passes. It shares everything the process holds; it starts from a copy of the
+// caller's registers with x0 = 0 and SP = `stack` (unless 0), TPIDR_EL0 `tls` with CLONE_SETTLS (else the
+// caller's), and the caller's blocked set. Its id is written to `parent_tid` with CLONE_PARENT_SETTID,
+// and `child_tid` is zeroed and woken when it ends with CLONE_CHILD_CLEARTID. EAGAIN when the process has
+// MAX_THREADS already.
+private clone_thread(p: *Process, regs: *u64, flags: u64) -> Result[i64, Errno]
+    val tid = new_pid()
+    if (flags & CLONE_PARENT_SETTID) != 0
+        val id: [4]u8 = [u8(tid & 0xff), u8((tid >> 8) & 0xff), u8((tid >> 16) & 0xff), u8((tid >> 24) & 0xff)]
+        if !mm.copy_to_user(&p.space, regs[2], id[..]) then return Err(EFAULT)
+    val clear_tid = if (flags & CLONE_CHILD_CLEARTID) != 0 then regs[4] else 0
+    val tls = if (flags & CLONE_SETTLS) != 0 then regs[3] else cpu.tpidr_el0()
+    var regs_copy = saved_regs(regs)
+    regs_copy.x[0] = 0
+    if regs[1] != 0 then regs_copy.sp_el0 = regs[1]
+    sched.spawn_user(p, () -> run_clone(p, regs_copy, clear_tid), tid, tls, sched.current().user.blocked) match
+        Some(_) -> Ok(i64(tid))
+        None -> Err(EAGAIN)
+
+// A cloned thread's start: what it is to clear when it ends, then into user mode.
+private run_clone(p: *Process, regs: UserRegs, clear_tid: u64)
+    sched.current().user.clear_tid = clear_tid
+    run(p, regs)
 
 // The parent's environment, in a box of the child's own. Read by index: a `&sync` box's array has no
 // slice.
@@ -87,9 +115,19 @@ private[proc] sys_execve(p: *Process, regs: *u64) -> Result[i64, Errno]
             mm.free_space(&l.space)
             return Err(E2BIG)
 
-    // Nothing can fail from here on: the new image takes the old one's place.
+    // Every other thread of the process ends first, as Linux has it; if the group is already ending,
+    // this thread ends with it instead.
+    if !sched.end_other_threads(p)
+        mm.free_space(&l.space)
+        leave_thread()
+
+    // Nothing can fail from here on: the new image takes the old one's place, and this thread is the
+    // process's first: the pid is its id, it has no TLS and nothing to clear.
     var old = p.space
     val t = sched.current()
+    t.user.tid = p.pid
+    t.user.clear_tid = 0
+    cpu.set_tpidr_el0(0)
     val flags = cpu.irq_save()
     p.space = l.space
     t.ttbr0 = mm.ttbr0_of(&p.space)

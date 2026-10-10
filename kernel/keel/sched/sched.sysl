@@ -84,7 +84,7 @@ init()
     c.reaper = Reaper(null, 0)
 
     val boot: &sync Thread = Thread(Context([0; 12], 0, 0), next_id.add(1), Running, null, None, None, None,
-        empty_wait_queue(), Reaper(null, 0), 0, null, 0)
+        empty_wait_queue(), Reaper(null, 0), 0, null, 0, no_user())
     val bp: *Thread = &*boot
     bp.me = Some(boot)
 
@@ -111,7 +111,7 @@ init_secondary()
     cpu.set_tpidr(u64(usize(c)))
 
     val idle: &sync Thread = Thread(Context([0; 12], 0, 0), next_id.add(1), Running, null, None, None, None,
-        empty_wait_queue(), Reaper(null, 0), 0, null, 0)
+        empty_wait_queue(), Reaper(null, 0), 0, null, 0, no_user())
     val ip: *Thread = &*idle
     ip.me = Some(idle)
 
@@ -218,8 +218,34 @@ private[sched] switch_locked()
     c.slice = SLICE
     c.need_resched = false
     if TTBR0_SWITCH && next.ttbr0 != prev.ttbr0 then load_ttbr0(next.ttbr0)
+    if TLS_SWITCH
+        prev.user.tls = cpu.tpidr_el0()
+        cpu.set_tpidr_el0(next.user.tls)
+    count_out(prev)
+    count_in(next, c.id)
     switch_context(&prev.ctx, &next.ctx)
     finish_switch()
+
+// Off only to show what switching TPIDR_EL0 is for: with it off a thread finds in it whatever the
+// thread before it on that core left, and /bin/linuxthreads's TLS check fails.
+private const TLS_SWITCH: bool = true
+
+// A thread of a process leaving a core, and one arriving: how many of the process's threads are running
+// at once, and on which cores any has run (`procs` reports both; the boot test's proof that a process's
+// threads ran in parallel). Under `lock`, so plain fields.
+private count_out(t: *Thread)
+    val p = t.user.counted
+    if p == null then return
+    p.running -= 1
+    t.user.counted = null
+
+private count_in(t: *Thread, core: u64)
+    val p = t.process
+    if p == null then return
+    t.user.counted = p
+    p.running += 1
+    if p.running > p.parallel then p.parallel = p.running
+    p.cores = p.cores | (u64(1) << core)
 
 // The first thing a thread does once it has the processor back, with `lock` still held: the thread it
 // took over from is now off its stack, so an exited one is dead and its joiners may run.
@@ -245,6 +271,7 @@ private[sched] sleep_locked(q: *WaitQueue)
 tick()
     if !started then return
     nap_tick()
+    futex_tick()
     val c = this_cpu()
     if c.slice > 0 then c.slice -= 1
     if c.slice == 0 then c.need_resched = true

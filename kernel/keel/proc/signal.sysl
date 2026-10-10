@@ -83,8 +83,9 @@ private push_frame(p: *Process, regs: *u64, sig: u64, a: Action) -> bool
         w[i] = regs[i]
     val at = (regs[SP] - u64(sizeof(SigFrame))) & ~u64(15)
     val flags = s.lock.lock()
-    f.blocked = s.blocked
-    s.blocked = (s.blocked | a.mask | sched.bit(sig)) & ~sched.UNBLOCKABLE
+    val t = sched.current()
+    f.blocked = t.user.blocked
+    t.user.blocked = (t.user.blocked | a.mask | sched.bit(sig)) & ~sched.UNBLOCKABLE
     s.lock.unlock(flags)
     val bytes: *u8 = ptr_cast(&f)
     if !mm.copy_to_user(&p.space, at, bytes[0..<sizeof(SigFrame)]) then return false
@@ -107,7 +108,7 @@ private[proc] sys_rt_sigreturn(p: *Process, regs: *u64) -> Result[i64, Errno]
     regs[PSTATE] = f.pstate & NZCV
     val s = p.sig
     val flags = s.lock.lock()
-    s.blocked = f.blocked & ~sched.UNBLOCKABLE
+    sched.current().user.blocked = f.blocked & ~sched.UNBLOCKABLE
     s.lock.unlock(flags)
     // The dispatcher writes the answer to x0: the one it had.
     Ok(i64(regs[0]))
@@ -165,10 +166,11 @@ private[proc] sys_rt_sigprocmask(p: *Process, regs: *u64) -> Result[i64, Errno]
     if old_at != 0 && !mm.user_range(&p.space, old_at, 8, true) then return Err(EFAULT)
     val s = p.sig
     val flags = s.lock.lock()
-    val old = s.blocked
+    val t = sched.current()
+    val old = t.user.blocked
     if set_at != 0
         val now = if how == SIG_BLOCK then old | set else if how == SIG_UNBLOCK then old & ~set else set
-        s.blocked = now & ~sched.UNBLOCKABLE
+        t.user.blocked = now & ~sched.UNBLOCKABLE
     s.lock.unlock(flags)
     if old_at != 0
         var out = to_linux_set(old)
@@ -362,7 +364,8 @@ private[proc] sys_procs(p: *Process, regs: *u64) -> Result[i64, Errno]
     for i in 0..<MAX_PROCS
         val c = table[i]
         if c == null then continue
-        found.push(ProcInfo(c.pid, c.ppid, c.pgid, c.uid, if c.ended then 1 else 0, c.name))
+        found.push(ProcInfo(c.pid, c.ppid, c.pgid, c.uid, if c.ended then 1 else 0, c.name, u32(c.cores),
+            u32(c.parallel)))
     family.unlock(flags)
     var n: u64 = 0
     for info in found.view()

@@ -119,6 +119,12 @@ tpidr() -> u64 = read_sysreg("tpidr_el1")
 
 set_tpidr(v: u64) = write_sysreg("tpidr_el1", v)
 
+// TPIDR_EL0, the user thread's own pointer — its thread-local storage — which a program reads and writes
+// itself; keel.sched switches it with the thread.
+tpidr_el0() -> u64 = read_sysreg("tpidr_el0")
+
+set_tpidr_el0(v: u64) = write_sysreg("tpidr_el0", v)
+
 // MPIDR_EL1's affinity level 0: which core of its cluster this is. QEMU's `virt` numbers its cores
 // 0, 1, 2, ... there.
 core_id() -> u64 = read_sysreg("mpidr_el1") & 0xff

@@ -1,15 +1,18 @@
 module keel.proc
 
-import abi.keel.abi.{EINTR, EINVAL, ENOSYS, EPERM, Errno, SYS_BIND, SYS_BRK, SYS_CHDIR, SYS_CLONE, SYS_CLOSE,
+import abi.keel.abi.{EAGAIN, EFAULT, EINTR, EINVAL, ENOSYS, EPERM, ETIMEDOUT, Errno, FUTEX_CLOCK_REALTIME,
+    FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, SYS_BIND, SYS_BRK, SYS_CHDIR, SYS_CLONE, SYS_CLOSE,
     SYS_DUP, SYS_DUP3, SYS_EXECVE, SYS_EXIT, SYS_EXIT_GROUP, SYS_FACCESSAT, SYS_FCHMODAT, SYS_FCHOWNAT, SYS_FSTAT,
-    SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS64, SYS_GETEGID, SYS_GETEUID, SYS_GETGID, SYS_GETPGID, SYS_GETPID,
+    SYS_FTRUNCATE, SYS_FUTEX, SYS_GETCWD, SYS_GETDENTS64, SYS_GETEGID, SYS_GETEUID, SYS_GETGID, SYS_GETPGID, SYS_GETPID,
     SYS_GETPPID, SYS_GETSID, SYS_GETTID, SYS_GETUID, SYS_IOCTL, SYS_KILL, SYS_LSEEK, SYS_MKDIRAT, SYS_NANOSLEEP, SYS_NEWFSTATAT,
     SYS_OPENAT, SYS_PIPE2, SYS_PROCS, SYS_READ, SYS_RECVFROM, SYS_RENAMEAT, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK,
     SYS_RT_SIGRETURN, SYS_SENDTO, SYS_SETGID, SYS_SETPGID, SYS_SETSID, SYS_SETSOCKOPT, SYS_SETUID, SYS_SET_TID_ADDRESS,
-    SYS_SOCKET, SYS_SPAWN, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE}
+    SYS_SOCKET, SYS_SPAWN, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE, Timespec}
 import keel.fs
 import keel.mm
-import keel.sched.Process
+import keel.sched
+import keel.sched.{IrqLock, Process}
+import keel.timer
 
 // System calls (user/abi has the numbers, Linux's aarch64 ones wherever keel has the call Linux has):
 // `svc #0` from EL0 arrives here with the saved registers, the number in x8 and the arguments in x0 to
@@ -28,9 +31,13 @@ private[proc] system_call(regs: *u64) -> Option[u64]
     val p = current_process()
     val first = regs[0]
     val r = regs[8] match
-        SYS_EXIT | SYS_EXIT_GROUP -> sys_exit(p, regs)
+        SYS_EXIT -> sys_exit(p, regs)
+        SYS_EXIT_GROUP -> sys_exit_group(p, regs)
         SYS_WRITE -> sys_write(p, regs)
-        SYS_GETPID | SYS_GETTID | SYS_SET_TID_ADDRESS -> sys_getpid(p, regs)
+        SYS_GETPID -> sys_getpid(p, regs)
+        SYS_GETTID -> Ok(i64(sched.current().user.tid))
+        SYS_SET_TID_ADDRESS -> sys_set_tid_address(regs)
+        SYS_FUTEX -> sys_futex(p, regs)
         SYS_BRK -> sys_brk(p, regs)
         SYS_OPENAT -> fs.sys_openat(p, regs)
         SYS_READ -> sys_read(p, regs)
@@ -86,11 +93,49 @@ private[proc] system_call(regs: *u64) -> Option[u64]
         Err(EINTR) if regs[8] != SYS_NANOSLEEP -> Some(first)
         _ -> None
 
+// exit(code): the calling thread ends; the process ends with its last thread, and its status is the
+// code its first thread passed, as Linux has it.
 private sys_exit(p: *Process, regs: *u64) -> Result[i64, Errno]
-    p.exit_code = i64(regs[0])
-    end(p, 0, 0)
+    sched.leader_exit(p, i64(regs[0]))
+    leave_thread()
+
+// exit_group(code): every thread of the process ends.
+private sys_exit_group(p: *Process, regs: *u64) -> Result[i64, Errno] = end(p, 0, 0, i64(regs[0]))
 
 private sys_getpid(p: *Process, regs: *u64) -> Result[i64, Errno] = Ok(i64(p.pid))
+
+// set_tid_address(*u32) -> the caller's thread id. The word is zeroed and futex-woken when the thread
+// ends.
+private sys_set_tid_address(regs: *u64) -> Result[i64, Errno]
+    val t = sched.current()
+    t.user.clear_tid = regs[0]
+    Ok(i64(t.user.tid))
+
+// futex(*u32, op, val, *Timespec | 0) -> FUTEX_WAIT: 0 once woken; FUTEX_WAKE: how many it woke
+// (keel.sched's futex.sysl; keel.abi has the rules).
+private sys_futex(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val addr = regs[0]
+    val op = regs[1]
+    if (op & FUTEX_CLOCK_REALTIME) != 0 then return Err(ENOSYS)
+    val cmd = op & ~FUTEX_PRIVATE_FLAG
+    if cmd != FUTEX_WAIT && cmd != FUTEX_WAKE then return Err(ENOSYS)
+    if (addr & 3) != 0 then return Err(EINVAL)
+    if cmd == FUTEX_WAKE
+        val n = i64(i32(u32(regs[2] & 0xffff_ffff)))
+        return Ok(i64(sched.futex_wake(p, addr, if n < 0 then 0 else u64(n))))
+    var deadline: u64 = 0
+    if regs[3] != 0
+        var wait = Timespec(0, 0)
+        val raw: *u8 = ptr_cast(&wait)
+        if !mm.copy_from_user(&p.space, regs[3], raw[0..<sizeof(Timespec)]) then return Err(EFAULT)
+        if wait.sec < 0 || wait.nsec < 0 || wait.nsec >= 1_000_000_000 then return Err(EINVAL)
+        deadline = timer.now_ms() + u64(wait.sec) * 1000 + (u64(wait.nsec) + 999_999) / 1_000_000
+    sched.futex_wait(p, addr, u32(regs[2] & 0xffff_ffff), deadline) match
+        sched.FutexWait.Woken -> Ok(0)
+        sched.FutexWait.Differs -> Err(EAGAIN)
+        sched.FutexWait.TimedOut -> Err(ETIMEDOUT)
+        sched.FutexWait.Interrupted -> Err(EINTR)
+        sched.FutexWait.Unreadable -> Err(EFAULT)
 
 // A user address: what a system call's pointer argument is. It is a number and nothing more — it has
 // no dereference, so the kernel cannot read through one by mistake; `user_bytes` checks it against the
@@ -133,8 +178,16 @@ private[proc] user_readable(s: *mm.Space, addr: UserAddr, len: u64) -> bool =
 // answer the end as it now is — unchanged when `addr` is outside [heap start, heap limit] or memory ran
 // out, which is how a caller tells. brk(0) asks where it is.
 private sys_brk(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val want = regs[0]
-    if want < p.heap_base || want > mm.heap_limit() then return Ok(i64(p.brk))
+    val flags = brk_guard.lock()
+    val r = brk_locked(p, regs[0])
+    brk_guard.unlock(flags)
+    Ok(r)
+
+// Two threads of a process may move its break at once; one lock for every process's is enough.
+private var brk_guard: IrqLock
+
+private brk_locked(p: *Process, want: u64) -> i64
+    if want < p.heap_base || want > mm.heap_limit() then return i64(p.brk)
     val old_top = page_up(p.brk)
     val new_top = page_up(want)
     var va = old_top
@@ -145,10 +198,10 @@ private sys_brk(p: *Process, regs: *u64) -> Result[i64, Errno]
                 while va > old_top
                     va -= mm.PAGE_SIZE
                     mm.unmap_user_page(&p.space, va)
-                return Ok(i64(p.brk))
+                return i64(p.brk)
     va = new_top
     while va < old_top
         mm.unmap_user_page(&p.space, va)
         va += mm.PAGE_SIZE
     p.brk = want
-    Ok(i64(want))
+    i64(want)

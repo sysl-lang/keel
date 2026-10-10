@@ -1,6 +1,7 @@
 module keel.mm
 
 import keel.cpu
+import sysl.sync.SpinLock
 
 // Copy-on-write: what `fork` does to an address space, and what a write to a shared page does after.
 //
@@ -70,6 +71,18 @@ private copy_level(child: *Space, from: PhysAddr, to: PhysAddr, level: u64) -> b
 // still maps the frame, or the same frame once none does. False when the page is not copy-on-write
 // (a real fault) or there is no frame for the copy.
 break_cow(s: *Space, va: u64) -> bool
+    val flags = cpu.irq_save()
+    cow_lock.lock()
+    val done = break_cow_locked(s, va)
+    cow_lock.unlock()
+    cpu.irq_restore(flags)
+    done
+
+// Two threads of one process may fault on the same copy-on-write page at once (milestone 16): one breaks
+// it under this lock, and the other then finds it writable and simply retries its store.
+private var cow_lock: SpinLock = SpinLock(0)
+
+private break_cow_locked(s: *Space, va: u64) -> bool
     val page = va & ~(PAGE_SIZE - 1)
     if page >= USER_STACK_TOP then return false
     val slot = leaf_slot(s, page, false) match
@@ -77,7 +90,7 @@ break_cow(s: *Space, va: u64) -> bool
         None -> return false
     if *slot == 0 then return false
     var leaf: LeafDesc = cpu.from_word(*slot)
-    if (leaf.software & 1) == 0 then return false
+    if (leaf.software & 1) == 0 then return leaf.ap == UserRw
     val old = leaf.oa
     val copied = frame_shared(old)
     if copied

@@ -405,7 +405,7 @@ nanosleep(nanos: u64) -> Result[unit, (Errno, u64)]
 
 // Every process in the kernel's table.
 procs() -> Result[Buf[ProcInfo], Errno]
-    var room: [64]ProcInfo = [ProcInfo(0, 0, 0, 0, 0, [0; 16]); 64]
+    var room: [64]ProcInfo = [ProcInfo(0, 0, 0, 0, 0, [0; 16], 0, 0); 64]
     val n = answer(call(SYS_PROCS, u64(usize(&room[0])), 64, 0, 0))?
     val out: Buf[ProcInfo] = buf()
     for i in 0..<usize(n)

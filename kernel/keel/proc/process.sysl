@@ -93,9 +93,9 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
     // The descriptors are filled in once the process is in its box: a kernel stack is 16 KiB, and every
     // copy of a Process made on the way to the box is more than a KiB of it.
     val pid = new_pid()
-    val p: &sync Process = Process(pid, l.space, l.heap_base, l.heap_base, Context([0; 12], 0, 0),
-        sched.fresh_signals(), 0, 0, None, 0, sched.no_files(), sched.root_dir(), 1, 0, false, None, run_as.uid,
-        run_as.gid, sched.env_of(env), pid, pid, 0, name_from(args))
+    val p: &sync Process = Process(pid, l.space, l.heap_base, l.heap_base, sched.no_threads(),
+        sched.fresh_signals(), 0, 0, 0, sched.no_files(), sched.root_dir(), 1, 0, false, None, run_as.uid,
+        run_as.gid, sched.env_of(env), pid, pid, 0, name_from(args), 0, 0, 0)
     val raw: *Process = &*p
     for fd in 0..<3
         raw.files[fd] = std[fd]
@@ -114,8 +114,16 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
         mm.free_space(&raw.space)
         return Err(NoRoom)
     val regs = fresh_regs(l.entry, sp, 0)
-    p.thread = Some(sched.spawn(() -> run(raw, regs)))
+    start_first_thread(raw, () -> run(raw, regs), 0, 0)
     Ok(p)
+
+// Start a new process's first thread, whose id is the pid, with TPIDR_EL0 `tls` and the blocked set
+// `blocked`. A process with no threads yet always has room for one.
+@crossing(f)
+private[proc] start_first_thread(p: *Process, f: &sync Fn() -> unit, tls: u64, blocked: u64)
+    sched.spawn_user(p, f, p.pid, tls, blocked) match
+        Some(_) -> ()
+        None -> panic("keel: a new process had no room for its first thread")
 
 // A process's name for `procs`: its argv[0].
 private[proc] name_from(args: []const string) -> [sched.NAME_ROOM]u8 =
@@ -169,8 +177,8 @@ private put_word(space: *mm.Space, va: u64, w: u64) -> bool
         bytes[i] = u8((w >> u64(8 * i)) & 0xff)
     mm.copy_to_user(space, va, bytes[..])
 
-// The process's thread: switch to its address space and enter it with `regs` — a new program's, or
-// for a forked child a copy of its parent's; come back when it is over.
+// A thread of the process: switch to its address space and enter it with `regs` — a new program's, a
+// forked child's copy of its parent's, or a cloned thread's; come back when the thread is over.
 private[proc] run(p: *Process, regs: UserRegs)
     val t = sched.current()
     val flags = cpu.irq_save()
@@ -180,7 +188,7 @@ private[proc] run(p: *Process, regs: UserRegs)
     cpu.irq_restore(flags)
 
     var entry = regs
-    val _ = enter_user(&p.kernel, &entry)
+    val _ = enter_user(&t.user.ctx, &entry)
 
     // Back from `keel_leave_user`, with IRQs masked as the exception left them.
     t.process = null
@@ -188,9 +196,19 @@ private[proc] run(p: *Process, regs: UserRegs)
     sched.load_ttbr0(0)
     cpu.enable_irqs()
 
-    // Whatever the process left open is closed for it, however it ended; then its parent may reap it.
-    close_all(p)
-    ended(p)
+    // A thread that asked to be told of its end (set_tid_address, CLONE_CHILD_CLEARTID) has the word
+    // zeroed and one waiter on it woken: how a C library joins a thread.
+    val told = t.user.clear_tid
+    t.user.clear_tid = 0
+    if told != 0
+        val zero: [4]u8 = [0; 4]
+        if mm.copy_to_user(&p.space, told, zero[..]) then val _ = sched.futex_wake(p, told, 1)
+
+    // The last thread out closes whatever the process left open, however it ended; then its parent may
+    // reap it.
+    if sched.thread_ended(p)
+        close_all(p)
+        ended(p)
 
 // Wait for a process the kernel started to end, then give its address space back. It stays in the
 // table until it has ended, so `kill` and `procs` find it (init, above all).
@@ -198,15 +216,10 @@ wait(p: &sync Process)
     reap(p)
     leave(&*p)
 
-// Join the process's thread and free its address space: it has ended, or is about to.
+// Join the process's threads and free its address space: it has ended, or is about to.
 private[proc] reap(p: &sync Process)
-    p.thread match
-        Some(t) ->
-            sched.join(t)
-            p.preemptions = sched.preemptions(t)
-        None -> ()
-    p.thread = None
     val raw: *Process = &*p
+    raw.preemptions = sched.join_threads(raw)
     mm.free_space(&raw.space)
 
 // Ask the process to end: SIGKILL. It does at its next return to user mode — at the latest the next
@@ -281,9 +294,11 @@ returning_to_user(regs: *u64)
     val p = current_process()
     if p != null then deliver(p, regs)
 
-// End `p` — the calling thread's process — by the signal `sig` (0: it exited), for `fault` if a fault
-// raised it.
-private[proc] end(p: *Process, sig: u64, fault: u64) -> never
-    p.term_signal = sig
-    p.fault = fault
-    leave_user(&p.kernel, sig)
+// End `p` — the calling thread's process, every thread of it — by the signal `sig` (0: `exit_group`
+// with `code`), for `fault` if a fault raised it. Only the first way the group was ended is recorded.
+private[proc] end(p: *Process, sig: u64, fault: u64, code: i64 = 0) -> never
+    val _ = sched.begin_group_exit(p, sig, fault, code)
+    leave_thread()
+
+// End the calling thread only: back to `run`, which entered user mode for it.
+private[proc] leave_thread() -> never = leave_user(&sched.current().user.ctx, 0)

@@ -270,6 +270,7 @@ session2=(
     'cat /m9/l /m9/l /m9/l /m9/l /m9/l /m9/l | head -n 1 | wc -l'
     'rm /m9/l'
     'linuxhello'
+    'linuxthreads'
     'exit'
     $'\x04'
 )
@@ -319,6 +320,13 @@ transcript2=(
     $'# rm /m9/l\n'                             # through a 4 KiB pipe: head ends, cat's next write is SIGPIPE, no hang
     $'# linuxhello\nlinux: write, getpid and exit_group by Linux\'s numbers; pid '   # a static aarch64-linux
     $'\nsh: linuxhello: exit status 7\n'        # binary, built with no keel header: its raw calls are Linux's
+    # Milestone 16: threads. A second raw-svc Linux program: clone with musl's flags, a futex lock, TLS, joins
+    # by CLONE_CHILD_CLEARTID, a signal to the one thread not blocking it, and (from procs) >= 2 of its threads
+    # running at once; then exit from the first thread and exit_group from another while a third spins.
+    $'# linuxthreads\nlinuxthreads: 4 threads x 100000 under a futex lock: 400000; TLS and ids their own; joined\n'
+    $'linuxthreads: futex EAGAIN, ETIMEDOUT, ENOSYS; the signal went to the thread not blocking it\n'
+    $'linuxthreads: threads ran on different cores at once\n'
+    $'linuxthreads: the first thread has exited; exit_group ends the rest\nsh: linuxthreads: exit status 6\n'
     $'# exit\nlogin: \n'
     "init: the console closed after 1 sessions; orphans reaped: 0"
     "keel: init exited 0"
@@ -372,6 +380,9 @@ linux_ld=${KEEL_LINUX_LD:-/opt/homebrew/bin/ld.lld}
 $linux_cc --target=aarch64-linux-gnu -ffreestanding -fno-builtin -nostdlib -static -fno-pic -O2 -mgeneral-regs-only \
     -c -o $out/linuxhello.o $root/linux/hello.c
 $linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/linuxhello $out/linuxhello.o
+$linux_cc --target=aarch64-linux-gnu -ffreestanding -fno-builtin -nostdlib -static -fno-pic -O2 -mgeneral-regs-only \
+    -mno-outline-atomics -c -o $out/linuxthreads.o $root/linux/threads.c
+$linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/linuxthreads $out/linuxthreads.o
 
 rm -rf $fsroot
 mkdir -p $fsroot/dir $fsroot/bin
@@ -379,6 +390,7 @@ for prog in $user_programs; do
     cp $out/user/$prog.elf $fsroot/bin/$prog
 done
 cp $out/linuxhello $fsroot/bin/linuxhello
+cp $out/linuxthreads $fsroot/bin/linuxthreads
 print -n "hello from the disk" > $fsroot/hello.txt
 print "inside a directory" > $fsroot/dir/inner.txt
 mkdir -p $fsroot/m9

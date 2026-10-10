@@ -34,9 +34,10 @@ const SYS_WRITE: u64 = 64           // write(fd, buf, len) -> bytes written
 const SYS_NEWFSTATAT: u64 = 79      // newfstatat(dirfd, path, *Stat, flags) -> 0; AT_EMPTY_PATH with "" is fstat(dirfd)
 const SYS_FSTAT: u64 = 80           // fstat(fd, *Stat) -> 0
 const SYS_SYNC: u64 = 81            // sync() -> 0: every changed block is on the disk when it returns
-const SYS_EXIT: u64 = 93            // exit(code) -> never
-const SYS_EXIT_GROUP: u64 = 94      // exit_group(code) -> never: a keel process is one thread, so the same as exit
-const SYS_SET_TID_ADDRESS: u64 = 96 // set_tid_address(addr) -> the caller's thread id, which is its pid
+const SYS_EXIT: u64 = 93            // exit(code) -> never: ends the calling thread; the process ends with its last
+const SYS_EXIT_GROUP: u64 = 94      // exit_group(code) -> never: ends every thread of the process
+const SYS_SET_TID_ADDRESS: u64 = 96 // set_tid_address(*u32) -> the caller's thread id; the word is zeroed and woken at its end
+const SYS_FUTEX: u64 = 98           // futex(*u32, op, val, *Timespec | 0, ...) -> FUTEX_WAIT 0 / FUTEX_WAKE the number woken
 const SYS_NANOSLEEP: u64 = 101      // nanosleep(*Timespec, *Timespec left | 0) -> 0, or EINTR with what was left
 const SYS_KILL: u64 = 129           // kill(pid | 0 | -1 | -pgid, sig) -> 0
 const SYS_RT_SIGACTION: u64 = 134   // rt_sigaction(sig, *SigAction | 0, *SigAction old | 0, 8) -> 0
@@ -54,14 +55,14 @@ const SYS_GETUID: u64 = 174         // getuid() -> the caller's user id
 const SYS_GETEUID: u64 = 175        // geteuid() -> the same: keel has one user id per process
 const SYS_GETGID: u64 = 176         // getgid() -> the caller's group id
 const SYS_GETEGID: u64 = 177        // getegid() -> the same
-const SYS_GETTID: u64 = 178         // gettid() -> the pid
+const SYS_GETTID: u64 = 178         // gettid() -> the calling thread's id; the first thread's is the pid
 const SYS_SOCKET: u64 = 198         // socket(AF_INET, SOCK_DGRAM, 0 | IPPROTO_UDP) -> fd
 const SYS_BIND: u64 = 200           // bind(fd, *SockAddrIn, len) -> 0
 const SYS_SENDTO: u64 = 206         // sendto(fd, buf, len, 0, *SockAddrIn, len) -> bytes sent
 const SYS_RECVFROM: u64 = 207       // recvfrom(fd, buf, len, 0, *SockAddrIn | 0, *u32 len | 0) -> bytes of the datagram
 const SYS_SETSOCKOPT: u64 = 208     // setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, *Timeval, 16) -> 0
 const SYS_BRK: u64 = 214            // brk(addr) -> the break: moved to addr if it could be, else unchanged
-const SYS_CLONE: u64 = 220          // clone(SIGCHLD, 0, ...) -> the child's pid in the parent, 0 in the child
+const SYS_CLONE: u64 = 220          // clone(flags, stack, *ptid, tls, *ctid) -> the child's pid or tid; 0 in the child
 const SYS_EXECVE: u64 = 221         // execve(path, argv, envp) -> never on success
 const SYS_WAIT4: u64 = 260          // wait4(pid, *i32 status | 0, options, *rusage | 0) -> the pid of the child that ended
 
@@ -195,8 +196,36 @@ struct ProcInfo
     uid: u32
     ended: u32                  // 1: it has ended and its parent has not yet waited for it
     name: [16]u8                // the program's name, as argv[0] gave it, cut to 16 bytes; NUL-filled
+    cores: u32                  // a bit for each core any of its threads has run on
+    parallel: u32               // the most of its threads that were ever running at once, on different cores
 
-@assert(sizeof(ProcInfo) == 48, "a ProcInfo is 48 bytes")
+@assert(sizeof(ProcInfo) == 56, "a ProcInfo is 56 bytes")
+
+// `clone`'s flags, Linux's values. keel takes two combinations: SIGCHLD alone with no stack (a fork), and
+// a thread — CLONE_THREAD_SET, with any of the CLONE_THREAD_OPTIONS — which is what musl's
+// pthread_create passes. Anything else is EINVAL.
+const CLONE_VM: u64 = 0x100
+const CLONE_FS: u64 = 0x200
+const CLONE_FILES: u64 = 0x400
+const CLONE_SIGHAND: u64 = 0x800
+const CLONE_THREAD: u64 = 0x1_0000
+const CLONE_SYSVSEM: u64 = 0x4_0000
+const CLONE_SETTLS: u64 = 0x8_0000              // TPIDR_EL0 is `tls`; else the caller's
+const CLONE_PARENT_SETTID: u64 = 0x10_0000      // the new thread's id is written to *ptid (a u32)
+const CLONE_CHILD_CLEARTID: u64 = 0x20_0000     // *ctid is zeroed and futex-woken when the thread ends
+const CLONE_DETACHED: u64 = 0x40_0000           // accepted and ignored, as Linux does
+const CLONE_THREAD_SET: u64 = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM
+const CLONE_THREAD_OPTIONS: u64 = CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_DETACHED
+
+// `futex`'s operations, Linux's values: WAIT(*u32, op, val, *Timespec | 0) sleeps while the word holds
+// `val` (EAGAIN if it does not; ETIMEDOUT after the relative timeout, at 10 ms resolution; EINTR for a
+// signal) and WAKE(*u32, op, n) wakes at most n waiters and answers how many. FUTEX_PRIVATE_FLAG is
+// accepted (keel shares no memory between processes, so every futex is private); every other
+// operation, and FUTEX_CLOCK_REALTIME, is ENOSYS. The word must be 4-aligned (EINVAL).
+const FUTEX_WAIT: u64 = 0
+const FUTEX_WAKE: u64 = 1
+const FUTEX_PRIVATE_FLAG: u64 = 128
+const FUTEX_CLOCK_REALTIME: u64 = 256
 
 // `ioctl`'s requests on the console: the foreground process group (an `i32` the argument points at),
 // and the window's size (a `Winsize`; keel's console answers 24 rows of 80 columns). Any other request
