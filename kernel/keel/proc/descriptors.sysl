@@ -228,7 +228,9 @@ private[proc] release(f: OpenFile)
                 pp.writers -= 1
                 if pp.writers == 0 then val _ = pp.can_read.wake_all()
             if pp.readers == 0 && pp.writers == 0 then pp.in_use = false
-            sched.poll_notify()
+            // Only the last end of a kind changes what a poller sees (POLLHUP, POLLERR); every call that
+            // may wait releases the count it took, and that is no event.
+            if pp.readers == 0 || pp.writers == 0 then sched.poll_notify()
             pipe_lock.unlock(flags)
         else ()
 

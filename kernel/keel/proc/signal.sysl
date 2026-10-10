@@ -74,6 +74,11 @@ private[proc] deliver(p: *Process, regs: *u64, again: Option[u64] = None)
         break
     mask_back(p)
 
+// Off only to show what deferring is for: with it off the old mask is back before delivery, the signal
+// that ended the call is blocked again and stays pending, and `linuxpoll` fails at its EINTR check
+// (the handler never ran).
+private const DEFER_CALL_MASK: bool = true
+
 // ppoll's and pselect6's signal mask: `set` (keel's numbering) is the calling thread's blocked set for
 // the length of the call. Answers the set it replaced.
 private[proc] mask_for_call(p: *Process, set: u64) -> u64
@@ -93,7 +98,7 @@ private[proc] mask_after_call(p: *Process, old: u64, interrupted: bool)
     val s = p.sig
     val flags = s.lock.lock()
     val t = sched.current()
-    if interrupted
+    if interrupted && DEFER_CALL_MASK
         t.user.call_mask = true
         t.user.mask_after = old
     else

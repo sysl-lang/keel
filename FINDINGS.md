@@ -2577,6 +2577,73 @@ that a `Mutex`/`Condvar` written in sysl needs — answered by pthreads on a hos
 give (a freestanding runtime owns neither allocator conventions nor a TLS layout the compiler knows),
 which is the design question this finding leaves open.
 
+## 74. `sysl.time` reads a clock through a seam but has no sleep, so a freestanding program cannot wait for a time
+
+Milestone 17 gives keel `clock_gettime`, `nanosleep` and `clock_nanosleep` by Linux's numbers, and
+keel.fsys now answers `sysl.time`'s two seams (`sysl_wall_us`, `sysl_monotonic_us`; `user/fsys/keel/fsys/time.sysl`),
+so `sysl.time.now()` and `monotonic()` work from EL0 (`stdsig: time ok`). Sleeping does not: the only
+sleep in the library is `sysl.posix.time.sleep`, `@requires(posix)` over a C file
+(`posix/time/__posix__/sleep.c`, `sysl_posix_time_nanosleep`):
+
+    import rt.keel.user
+    import sysl.time
+    import sysl.posix.time.sleep
+
+    sleep(time.millis(100))     // a user/<prog> built --target aarch64-freestanding
+
+is not refused where it is written: the module's `@requires(posix)` lets it through analysis on a
+freestanding target, and the build fails at the link instead —
+
+    sysl: error: clang failed (exit 1):
+    ld.lld: error: undefined symbol: sysl_posix_time_nanosleep
+
+— a private C helper of the posix module, not a seam (answering it from keel.fsys would be
+impersonating that module's C file, FINDINGS 65's shape). That `@requires(posix)` is not checked
+against the target before the link looks like a bug in its own right: the refusal names a symbol no
+line of the program contains. And `sysl.time` itself declares no sleep seam beside its two clock seams. `clock.sysl`'s header names exactly the board case this misses ("a board with only a
+tick | the board's own package, over its timer") — the board can be read but not waited on.
+
+What was written instead: `stdsig`'s `clocks()` sleeps with keel's own `user.nanosleep` (rt's raw
+call) between two `sysl.time.monotonic()` readings. Clean form: a third seam in `sysl.time` —
+`sysl_sleep_us(long) -> long` (the time left, for an interrupted sleep) — with `sleep(d: Duration)` over
+it, answered by `nanosleep` on a host and by keel.fsys (or a board package) on a freestanding target.
+
+## 75. No terminal-mode surface reaches a freestanding program, so turning echo off for a password is a raw `ioctl`
+
+keel's console now has Linux's termios (TCGETS/TCSETS, ECHO, ICANON, VMIN/VTIME, ISIG). `login` and `su`
+read passwords and must turn echo off. The library's terminal-mode code is `sysl.posix.tty`
+(`mode.sysl`): `@requires(posix)`, and its raw/cooked switch is two C functions in `__posix__/termios.c`
+(`sysl_tty_raw`, `sysl_tty_cooked`) — not a seam, and with no "echo off, line mode on" state between
+them, which a password prompt is:
+
+    import sysl.posix.tty
+
+    val _ = tty.raw()       // freestanding: past analysis, then at the link
+    // ld.lld: error: undefined symbol: sysl_tty_raw / sysl_tty_cooked / atexit / isatty
+
+and raw is the wrong mode for a password anyway (it also ends line editing). `sysl.term` and `sysl.term.edit` are written over `sysl.io` readers and know nothing of modes. So what
+was written: rt's `tcgetattr`/`tcsetattr` (the `ioctl` by number) and `hidden(fd)`/`shown(h)` around the
+password's `getline` (`user/rt/keel/user/user.sysl`), the newline `getpass` writes included. Clean form:
+a `sysl.term` mode seam in the hook style — `sysl_term_get(fd, *Mode) -> int` / `sysl_term_set(fd,
+*Mode) -> int` over a small struct of the portable bits (echo, canonical, signals, min/time) — with
+`read_hidden(prompt) -> Option[string]` above it, answered by `tcgetattr`/`tcsetattr` on a host and by
+keel.fsys here.
+
+## What worked in milestone 17
+
+- **No sysl gap in the kernel half.** A poller waits on one module `WaitQueue` with an event count under
+  one `IrqLock` (`sched/poll.sysl`), every source calling `poll_notify()` from whatever context it is in
+  (the console's interrupt included: the `@no_alloc` chain through keel.trap accepted it unchanged).
+  `enum Outcome { Found(n: u64), Signal }` and `PollWait`'s bare enum with `==` kept the loop plain.
+- **The kernel `struct termios` is a 36-byte sysl struct** (`[NCCS]u8` after a `u8`), `@assert`-pinned,
+  and `console_termios()` builds Linux's defaults from an array literal in a function — not a module
+  `val` (FINDINGS 31), set in `console.init`.
+- **A raw-mode read's four VMIN/VTIME cases** came out as one loop choosing a deadline per byte, the
+  `match` on the wait's outcome carrying statements in its arms.
+- The one name clash met (a `Wait.Interrupted` beside `Cooked.Interrupted` in one file) was avoided by
+  renaming before compiling, so whether expected-type resolution would have picked the right one was not
+  tested.
+
 ## What worked in milestone 16
 
 - **No sysl gap in the kernel half.** The thread group is a `&sync Threads` box hung off `Process`

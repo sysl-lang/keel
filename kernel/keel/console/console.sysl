@@ -172,6 +172,7 @@ private is(c: u8, t: Termios, i: usize) -> bool = t.cc[i] != 0 && c == t.cc[i]
 private drain_locked() -> Signalled
     var n = Signalled(0, 0)
     val isig = (tio.lflag & ISIG) != 0
+    val before = ring.count
     pl011.clear_receive()
     loop
         if ring.count == RING
@@ -189,7 +190,7 @@ private drain_locked() -> Signalled
                     ring.count += 1
             None -> break
     val _ = readers.wake_all()
-    sched.poll_notify()
+    if ring.count != before then sched.poll_notify()
     n
 
 // What waiting for a byte came to.
@@ -289,8 +290,12 @@ private rub_out(c: u8, t: Termios)
         emit(BS, t.oflag)
     release()
 
+// Off only to show what ECHO is for: with it off every byte read is echoed whatever the settings say,
+// and the boot test's passwords appear on the screen (the transcript fails at the first `password:`).
+private const ECHO_HONOURED: bool = true
+
 enum Cooked
-    Whole                       // a line, in `l`
+    Whole                      // a line, in `l`
     End                         // the end of the input (VEOF on an empty line)
     Interrupted                 // a signal for the reader; what was typed stays in `l` for the next read
 
@@ -310,7 +315,7 @@ private cook(l: *Line, p: *Process) -> Cooked
         val c = mapped(b, t) match
             Some(c) -> c
             None -> continue
-        val echoing = (t.lflag & ECHO) != 0
+        val echoing = (t.lflag & ECHO) != 0 || !ECHO_HONOURED
         if is(c, t, VERASE)
             if l.len > 0
                 l.len -= 1
@@ -407,7 +412,7 @@ private raw_read(l: *Line, p: *Process, va: u64, len: u64, t: Termios) -> Option
                     Some(c) ->
                         got[n] = c
                         n += 1
-                        if (s.lflag & ECHO) != 0 then echo(c, s)
+                        if (s.lflag & ECHO) != 0 || !ECHO_HONOURED then echo(c, s)
                     None -> ()
             TimedOut -> stop = true
             Signal ->
