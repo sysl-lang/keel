@@ -47,9 +47,7 @@ private[proc] sys_clone(p: *Process, regs: *u64) -> Result[i64, Errno]
         sched.copied_signals(p.sig), 0, 0, 0, sched.no_files(), p.cwd, p.cwd_len, p.pid, false, None, p.uid,
         p.gid, copied_env(p), p.pgid, p.sid, 0, p.name, 0, 0, 0)
     val raw: *Process = &*child
-    for fd in 0..<sched.OPEN_FILES
-        raw.files[fd] = p.files[fd]
-        duplicate(raw.files[fd])
+    copy_all(p, raw)
     if !enter(child)
         close_all(raw)
         mm.free_space(&raw.space)

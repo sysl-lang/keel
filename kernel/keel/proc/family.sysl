@@ -137,13 +137,15 @@ private asked_for(p: *Process, va: u64) -> Result[(Buf[u8], [3]u64, Group), Errn
 // The child's descriptors 0 to 2: for each, the caller's descriptor `fds[i]` names, or its own i for
 // NO_FD (which may be free), counted as open once more. EBADF for a named descriptor that is not open.
 private standard_files(p: *Process, fds: [3]u64) -> Result[[3]OpenFile, Errno]
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
     for i in 0..<3
         val fd = if fds[i] == NO_FD then u64(i) else fds[i]
-        if fd >= MAX_FDS || (fds[i] != NO_FD && p.files[usize(fd)].holds == Holds.Free) then return Err(EBADF)
+        if fd >= MAX_FDS || (fds[i] != NO_FD && t.slots[usize(fd)].holds == Holds.Free) then return Err(EBADF)
     var std: [3]OpenFile = [sched.free_file(); 3]
     for i in 0..<3
         val fd = if fds[i] == NO_FD then usize(i) else usize(fds[i])
-        std[i] = p.files[fd]
+        std[i] = t.slots[fd]
         duplicate(std[i])
     Ok(std)
 

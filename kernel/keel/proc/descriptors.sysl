@@ -48,33 +48,105 @@ private struct Pipe
 private var pipes: [PIPES]Pipe
 private var pipe_lock: IrqLock
 
+// **A process's threads share its descriptor table**, so every call that reads or changes it holds the
+// table's lock (keel.sched's `lock_files`) while it does. Choosing a slot and filling it, closing one,
+// copying one for dup3, dup, fork or spawn: all under the one lock, so two threads are never handed one
+// descriptor and a count never goes wrong. A file's read, write, lseek, fstat and getdents keep the
+// table locked for the whole call (keel.fs's lock serializes them anyway, and the offset they move is
+// the slot's own). A call that may wait on another party for as long as it likes — the console's or a
+// pipe's read and write, a socket's receive and send — cannot hold the table that long, so it takes a
+// copy counted as one more open descriptor (`duplicate`, Linux's `fget`), lets the table go, and gives
+// the count back at its end (`release`, `fput`). A thread closing that descriptor meanwhile frees the
+// slot at once, but the pipe end or the socket stays open until the call in flight has finished with it,
+// and a new descriptor in the slot is never what that call works on.
+//
+// Lock order: the table, then keel.fs's `Mutex`, then a pipe's or keel.net's `IrqLock`.
+
+// What a call on a descriptor works on: a file's slot itself, the table staying locked for the call; or
+// anything else's copy, counted, the table let go. `finished` ends either.
+private enum Use
+    InTable(slot: *OpenFile)
+    Held(copy: OpenFile)
+
+private taken(p: *Process, fd: u64) -> Result[Use, Errno]
+    val t = sched.lock_files(p)
+    val f = slot_in(t, fd) match
+        Ok(f) -> f
+        Err(e) ->
+            sched.unlock_files(p)
+            return Err(e)
+    if f.holds == Holds.File then return Ok(Use.InTable(f))
+    val copy = *f
+    duplicate(copy)
+    sched.unlock_files(p)
+    Ok(Use.Held(copy))
+
+private finished(p: *Process, u: Use)
+    u match
+        InTable(_) -> sched.unlock_files(p)
+        Held(f) -> release(f)
+
 // read(fd, buf, len) -> bytes read; 0 at the end of the input.
 private[proc] sys_read(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val f = descriptor(p, regs[0])?
-    f.holds match
-        Console ->
-            if !mm.user_range(&p.space, regs[1], regs[2], true) then return Err(EFAULT)
-            console.read(p, regs[1], regs[2]) match
-                Some(n) -> Ok(i64(n))
-                None -> Err(EINTR)
-        File -> fs.sys_read(p, regs)
-        PipeRead -> pipe_read(p, usize(f.ino), regs[1], regs[2])
-        Socket -> socket_read(p, f, regs[1], regs[2])
-        else Err(EBADF)
+    val u = taken(p, regs[0])?
+    val r = u match
+        InTable(f) -> fs.sys_read(p, f, regs)
+        Held(f) -> held_read(p, f, regs)
+    finished(p, u)
+    r
+
+private held_read(p: *Process, f: OpenFile, regs: *u64) -> Result[i64, Errno] = f.holds match
+    Console ->
+        if !mm.user_range(&p.space, regs[1], regs[2], true) then return Err(EFAULT)
+        console.read(p, regs[1], regs[2]) match
+            Some(n) -> Ok(i64(n))
+            None -> Err(EINTR)
+    PipeRead -> pipe_read(p, usize(f.ino), regs[1], regs[2])
+    Socket -> socket_read(p, f, regs[1], regs[2])
+    else Err(EBADF)
 
 // write(fd, buf, len) -> bytes written. A socket is never connected, so `write` has nowhere to send.
 private[proc] sys_write(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val f = descriptor(p, regs[0])?
-    f.holds match
-        Console -> console_write(p, UserAddr(regs[1]), regs[2])
-        File -> fs.sys_write(p, regs)
-        PipeWrite -> pipe_write(p, usize(f.ino), regs[1], regs[2])
-        Socket -> Err(EDESTADDRREQ)
-        else Err(EBADF)
+    val u = taken(p, regs[0])?
+    val r = u match
+        InTable(f) -> fs.sys_write(p, f, regs)
+        Held(f) -> held_write(p, f, regs)
+    finished(p, u)
+    r
 
-// close(fd) -> 0
+private held_write(p: *Process, f: OpenFile, regs: *u64) -> Result[i64, Errno] = f.holds match
+    Console -> console_write(p, UserAddr(regs[1]), regs[2])
+    PipeWrite -> pipe_write(p, usize(f.ino), regs[1], regs[2])
+    Socket -> Err(EDESTADDRREQ)
+    else Err(EBADF)
+
+// lseek(fd, offset, whence), fstat(fd, *stat), getdents64(fd, buf, len), ftruncate(fd, length): a
+// file's, with the table locked for the call (keel.fs has the rest).
+private[proc] sys_lseek(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
+    fs.sys_lseek(p, slot_in(t, regs[0])?, regs)
+
+private[proc] sys_fstat(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
+    fs.sys_fstat(p, slot_in(t, regs[0])?, regs)
+
+private[proc] sys_getdents64(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
+    fs.sys_getdents64(p, slot_in(t, regs[0])?, regs)
+
+private[proc] sys_ftruncate(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
+    fs.sys_ftruncate(p, slot_in(t, regs[0])?, regs)
+
+// close(fd) -> 0. A call another thread has in flight on it keeps what it holds until that call ends.
 private[proc] sys_close(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val f = descriptor(p, regs[0])?
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
+    val f = slot_in(t, regs[0])?
     release(*f)
     *f = sched.free_file()
     Ok(0)
@@ -82,42 +154,49 @@ private[proc] sys_close(p: *Process, regs: *u64) -> Result[i64, Errno]
 // dup3(old, new, flags) -> new. Whatever `new` held is closed first; `new` == `old` is EINVAL, and the
 // only flag is O_CLOEXEC.
 private[proc] sys_dup3(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val old = descriptor(p, regs[0])?
     val to = regs[1]
     if (regs[2] & ~O_CLOEXEC) != 0 then return Err(EINVAL)
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
+    val old = slot_in(t, regs[0])?
     if to >= MAX_FDS then return Err(EBADF)
     if to == regs[0] then return Err(EINVAL)
     val o = *old
     duplicate(o)
-    release(p.files[usize(to)])
-    p.files[usize(to)] = o
+    release(t.slots[usize(to)])
+    t.slots[usize(to)] = o
     Ok(i64(to))
 
 // dup(old) -> the lowest free descriptor, now standing for what `old` does.
 private[proc] sys_dup(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val old = descriptor(p, regs[0])?
-    val to = lowest_free(p, OPEN_FILES)?
-    p.files[to] = *old
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
+    val old = slot_in(t, regs[0])?
+    val to = lowest_free(t, OPEN_FILES)?
+    t.slots[to] = *old
     duplicate(*old)
     Ok(i64(to))
 
 // pipe2(*[2]i32, flags) -> 0, with the read end's descriptor and then the write end's written out. The
-// only flag is O_CLOEXEC; a pipe that never waits (O_NONBLOCK) keel does not have.
+// only flag is O_CLOEXEC; a pipe that never waits (O_NONBLOCK) keel does not have. The two descriptors
+// are filled in only once the program has their numbers.
 private[proc] sys_pipe2(p: *Process, regs: *u64) -> Result[i64, Errno]
     if (regs[1] & ~O_CLOEXEC) != 0 then return Err(EINVAL)
-    val r = lowest_free(p, OPEN_FILES)?
-    val w = lowest_free(p, r)?
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
+    val r = lowest_free(t, OPEN_FILES)?
+    val w = lowest_free(t, r)?
     val slot = new_pipe()?
-    p.files[r] = OpenFile(Holds.PipeRead, u32(slot), 0, 0)
-    p.files[w] = OpenFile(Holds.PipeWrite, u32(slot), 0, 0)
+    val read_end = OpenFile(Holds.PipeRead, u32(slot), 0, 0)
+    val write_end = OpenFile(Holds.PipeWrite, u32(slot), 0, 0)
     var both: [2]u32 = [u32(r), u32(w)]
     val b: *u8 = ptr_cast(&both[0])
     if !mm.copy_to_user(&p.space, regs[0], b[0..<8])
-        release(p.files[r])
-        release(p.files[w])
-        p.files[r] = sched.free_file()
-        p.files[w] = sched.free_file()
+        release(read_end)
+        release(write_end)
         return Err(EFAULT)
+    t.slots[r] = read_end
+    t.slots[w] = write_end
     Ok(0)
 
 // A second descriptor now stands for what `f` does (dup3, dup, a child's): count it.
@@ -154,21 +233,40 @@ private[proc] release(f: OpenFile)
 
 // Close every descriptor a process still has: it has ended.
 private[proc] close_all(p: *Process)
+    val t = sched.lock_files(p)
     for fd in 0..<OPEN_FILES
-        release(p.files[fd])
-        p.files[fd] = sched.free_file()
+        release(t.slots[fd])
+        t.slots[fd] = sched.free_file()
+    sched.unlock_files(p)
 
-// The descriptor `fd` names, if it holds anything.
-private descriptor(p: *Process, fd: u64) -> Result[*OpenFile, Errno]
+// Every descriptor of `from` copied into `to`'s table and counted (fork's child).
+private[proc] copy_all(from: *Process, to: *Process)
+    val mine = sched.lock_files(from)
+    val theirs = sched.lock_files(to)
+    for fd in 0..<OPEN_FILES
+        theirs.slots[fd] = mine.slots[fd]
+        duplicate(theirs.slots[fd])
+    sched.unlock_files(to)
+    sched.unlock_files(from)
+
+// `p`'s descriptors 0 to 2 set to `std` (spawn's child: they come already counted).
+private[proc] set_standard(p: *Process, std: [3]OpenFile)
+    val t = sched.lock_files(p)
+    for fd in 0..<3
+        t.slots[fd] = std[fd]
+    sched.unlock_files(p)
+
+// The descriptor `fd` names in a locked table, if it holds anything.
+private[proc] slot_in(t: *sched.Files, fd: u64) -> Result[*OpenFile, Errno]
     if fd >= MAX_FDS then return Err(EBADF)
-    val f = &p.files[usize(fd)]
+    val f = &t.slots[usize(fd)]
     if f.holds == Holds.Free then return Err(EBADF)
     Ok(f)
 
-// The lowest free descriptor other than `besides`.
-private lowest_free(p: *Process, besides: usize) -> Result[usize, Errno]
+// The lowest free descriptor in a locked table, other than `besides`.
+private[proc] lowest_free(t: *sched.Files, besides: usize) -> Result[usize, Errno]
     for fd in 0..<OPEN_FILES
-        if fd != besides && p.files[fd].holds == Holds.Free then return Ok(fd)
+        if fd != besides && t.slots[fd].holds == Holds.Free then return Ok(fd)
     Err(EMFILE)
 
 // A free pipe slot, made empty with one read end and one write end.

@@ -19,7 +19,7 @@ import abi.keel.abi.{AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW,
     ERANGE, ESPIPE, Errno, FIRST_FILE_FD, MAX_FDS, O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_TRUNC,
     O_WRONLY, PATH_ROOM, SEEK_CUR, SEEK_END, SEEK_SET, Stat, UMASK}
 import keel.mm
-import keel.sched.{Cred, Holds, OpenFile, Process, cred_of}
+import keel.sched.{Cred, Holds, OpenFile, Process, cred_of, lock_files, unlock_files}
 import ondisk.keel.ondisk
 import ondisk.keel.ondisk.{BLOCK_SIZE, DIRENT_SIZE, Dirent, Inode, KIND_DIR, KIND_FILE, PERMISSION_BITS, ROOT_INO,
     S_IFMT}
@@ -34,8 +34,12 @@ sys_openat(p: *Process, regs: *u64) -> Result[i64, Errno]
     val flags = regs[2]
     val access = flags & O_ACCMODE
     if access == O_ACCMODE then return Err(EINVAL)
+    // The descriptor is chosen and filled in under the table's lock, held across the open (the
+    // table's lock comes before the filesystem's): another thread cannot be handed it meanwhile.
+    val t = lock_files(p)
+    defer unlock_files(p)
     var fd = FIRST_FILE_FD
-    while fd < MAX_FDS && p.files[usize(fd)].holds != Holds.Free
+    while fd < MAX_FDS && t.slots[usize(fd)].holds != Holds.Free
         fd += 1
     if fd == MAX_FDS then return Err(EMFILE)
 
@@ -59,12 +63,12 @@ sys_openat(p: *Process, regs: *u64) -> Result[i64, Errno]
         truncate(st, &i)?
         write_inode(st, ino, i)?
     st.opens[usize(ino)] += 1
-    p.files[usize(fd)] = OpenFile(Holds.File, ino, u32(flags), 0)
+    t.slots[usize(fd)] = OpenFile(Holds.File, ino, u32(flags), 0)
     Ok(i64(fd))
 
-// read(fd, buf, len) -> bytes read, from a descriptor that is a file (keel.proc has the console's).
-sys_read(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val f = file_of(p, regs[0])?
+// read(fd, buf, len) -> bytes read, from `f`, the descriptor's slot, which is a file (keel.proc has
+// the console's, and holds the table locked for the call).
+sys_read(p: *Process, f: *OpenFile, regs: *u64) -> Result[i64, Errno]
     if (u64(f.flags) & O_ACCMODE) == O_WRONLY then return Err(EBADF)
     val va = regs[1]
     val len = regs[2]
@@ -85,9 +89,8 @@ sys_read(p: *Process, regs: *u64) -> Result[i64, Errno]
         done += u64(n)
     Ok(i64(done))
 
-// write(fd, buf, len) -> bytes written, for a descriptor that is a file (keel.proc has the console's).
-sys_write(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val f = file_of(p, regs[0])?
+// write(fd, buf, len) -> bytes written, to `f`, which is a file (as sys_read).
+sys_write(p: *Process, f: *OpenFile, regs: *u64) -> Result[i64, Errno]
     if (u64(f.flags) & O_ACCMODE) == O_RDONLY then return Err(EBADF)
     val va = regs[1]
     val len = regs[2]
@@ -132,12 +135,10 @@ closed(ino: u32)
     st.opens[usize(ino)] -= 1
 
 // lseek(fd, offset, whence) -> the new offset. Past the end is allowed: a write there fills the gap
-// with zeros. A pipe or the console has no offset.
-sys_lseek(p: *Process, regs: *u64) -> Result[i64, Errno]
-    if regs[0] < MAX_FDS
-        val h = p.files[usize(regs[0])].holds
-        if h != Holds.Free && h != Holds.File then return Err(ESPIPE)
-    val f = file_of(p, regs[0])?
+// with zeros. A pipe or the console has no offset. `f` is the descriptor's slot, open, in a table
+// keel.proc holds locked for the call, as for every call below that takes one.
+sys_lseek(p: *Process, f: *OpenFile, regs: *u64) -> Result[i64, Errno]
+    if f.holds != Holds.File then return Err(ESPIPE)
     val base = regs[2] match
         SEEK_SET -> 0
         SEEK_CUR -> i64(f.offset)
@@ -152,8 +153,8 @@ sys_lseek(p: *Process, regs: *u64) -> Result[i64, Errno]
     Ok(at)
 
 // fstat(fd, *Stat) -> 0
-sys_fstat(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val f = file_of(p, regs[0])?
+sys_fstat(p: *Process, f: *OpenFile, regs: *u64) -> Result[i64, Errno]
+    file_in(f)?
     val st = lock()
     defer unlock()
     val s = stat_of(f.ino, read_inode(st, f.ino)?)
@@ -170,7 +171,11 @@ sys_newfstatat(p: *Process, regs: *u64) -> Result[i64, Errno]
         mm.copy_cstr_from_user(&p.space, regs[1], first[..]) match
             Some(0) ->
                 if i64(regs[0]) != AT_FDCWD
-                    val f = file_of(p, regs[0])?
+                    val t = lock_files(p)
+                    defer unlock_files(p)
+                    if regs[0] >= MAX_FDS then return Err(EBADF)
+                    val f = &t.slots[usize(regs[0])]
+                    file_in(f)?
                     val st = lock()
                     defer unlock()
                     return stat_out(p, regs[2], stat_of(f.ino, read_inode(st, f.ino)?))
@@ -194,8 +199,8 @@ sys_mkdirat(p: *Process, regs: *u64) -> Result[i64, Errno]
 
 // getdents64(fd, buf, len) -> bytes: as many whole `linux_dirent64` records as fit, from where the last
 // call stopped. EINVAL when not even the next one fits.
-sys_getdents64(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val f = file_of(p, regs[0])?
+sys_getdents64(p: *Process, f: *OpenFile, regs: *u64) -> Result[i64, Errno]
+    file_in(f)?
     val va = regs[1]
     val len = regs[2]
     if !mm.user_range(&p.space, va, len, true) then return Err(EFAULT)
@@ -406,8 +411,11 @@ private path_at(p: *Process, dirfd: u64, va: u64, room: []u8, empty_ok: bool = f
         given[0] = u8('.')
         len = 1
     if given[0] != u8('/') && i64(dirfd) != AT_FDCWD
-        if dirfd >= MAX_FDS || p.files[usize(dirfd)].holds == Holds.Free then return Err(EBADF)
-        return Err(EOPNOTSUPP)
+        if dirfd >= MAX_FDS then return Err(EBADF)
+        val t = lock_files(p)
+        val open = t.slots[usize(dirfd)].holds != Holds.Free
+        unlock_files(p)
+        return Err(if open then EOPNOTSUPP else EBADF)
     joined(p.cwd[0..<p.cwd_len], given[0..<len], room)
 
 // getcwd(buf, size) -> bytes of the path with its NUL; ERANGE when they do not fit.
@@ -452,8 +460,8 @@ sys_truncate(p: *Process, regs: *u64) -> Result[i64, Errno]
     resized(st, ino, regs[1])
 
 // ftruncate(fd, length) -> 0, on a descriptor open for writing.
-sys_ftruncate(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val f = file_of(p, regs[0])?
+sys_ftruncate(p: *Process, f: *OpenFile, regs: *u64) -> Result[i64, Errno]
+    file_in(f)?
     if (u64(f.flags) & O_ACCMODE) == O_RDONLY then return Err(EBADF)
     val st = lock()
     defer unlock()
@@ -547,12 +555,10 @@ private normalized(path: []const u8, out: []u8) -> usize
         n = 1
     n
 
-// The open file a descriptor names; EBADF if it holds anything else.
-private file_of(p: *Process, fd: u64) -> Result[*OpenFile, Errno]
-    if fd >= MAX_FDS then return Err(EBADF)
-    val f = &p.files[usize(fd)]
+// EBADF unless the descriptor's slot `f` holds a file.
+private file_in(f: *OpenFile) -> Result[unit, Errno]
     if f.holds != Holds.File then return Err(EBADF)
-    Ok(f)
+    Ok(())
 
 // Linux's `struct stat` of inode `ino`: no device and no times, which keel keeps none of; `blocks` in
 // 512-byte units, of whole filesystem blocks.

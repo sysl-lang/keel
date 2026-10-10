@@ -272,6 +272,7 @@ session2=(
     'linuxhello'
     'linuxthreads'
     'linuxthreads exec'
+    'linuxthreads fds'
     'exit'
     $'\x04'
 )
@@ -330,6 +331,10 @@ transcript2=(
     $'linuxthreads: the first thread has exited; exit_group ends the rest\nsh: linuxthreads: exit status 6\n'
     $'# linuxthreads exec\nlinux: write, getpid and exit_group by Linux\'s numbers; pid '   # execve from a thread
     $'\nsh: linuxthreads: exit status 7\n'      # that is not the first: the others end first, the pid stays
+    # The descriptor table under threads: four hammer pipe2/dup/openat/close at once, every descriptor claimed
+    # by one thread; a read in flight keeps its pipe end through another thread's close; nothing left over.
+    $'# linuxthreads fds\nlinuxthreads: 4 threads x 2000 rounds of pipe2, dup, openat and close at once: no descriptor shared, every pipe round-tripped\n'
+    $'linuxthreads: a read in flight keeps its pipe end through a close; the table ends with 0-2 alone\n'
     $'# exit\nlogin: \n'
     "init: the console closed after 1 sessions; orphans reaped: 0"
     "keel: init exited 0"

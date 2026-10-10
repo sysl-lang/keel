@@ -32,8 +32,7 @@ start_with(path: string, args: []const string) -> Result[&sync Process, LoadErro
     val image = fs.read_executable("/".bytes, path.bytes, sched.root_cred()) match
         Ok(b) -> b
         Err(e) -> return Err(Unreadable(e))
-    val console = sched.no_files()
-    val p = start_image(image.bytes.view(), args, null, [console[0], console[1], console[2]], [], image.run_as,
+    val p = start_image(image.bytes.view(), args, null, [sched.console_file(); 3], [], image.run_as,
         Group(NEW_GROUP, false))?
     // A program started with no arguments is named for its file, for `procs`.
     if args.len == 0 then p.name = sched.name_of(base_name(path.bytes))
@@ -98,8 +97,7 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
         sched.fresh_signals(), 0, 0, 0, sched.no_files(), sched.root_dir(), 1, 0, false, None, run_as.uid,
         run_as.gid, sched.env_of(env), pid, pid, 0, name_from(args), 0, 0, 0)
     val raw: *Process = &*p
-    for fd in 0..<3
-        raw.files[fd] = std[fd]
+    set_standard(raw, std)
     if parent != null
         raw.ppid = parent.pid
         raw.cwd = parent.cwd
@@ -110,8 +108,7 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
     if group.foreground && FOREGROUND_AT_SPAWN then console.set_foreground(raw.pgid)
     if !enter(p)
         // Not the child's after all: start_image gives them back.
-        for fd in 0..<3
-            raw.files[fd] = sched.free_file()
+        set_standard(raw, [sched.free_file(); 3])
         mm.free_space(&raw.space)
         return Err(NoRoom)
     val regs = fresh_regs(l.entry, sp, 0)

@@ -302,6 +302,152 @@ static void exec_from_a_thread(void) {
     fail("the first thread outlived an execve", 0);
 }
 
+/* `linuxthreads fds`: the descriptor table shared by threads on different cores.
+
+   FD_WORKERS threads each run FD_ROUNDS rounds of pipe2, write, dup, close, openat, read, close at once.
+   Every descriptor a call hands a thread is claimed in `owner` with a compare-and-swap, and given up just
+   before it is closed: a descriptor handed to two threads at once fails the claim. Every pipe carries
+   its round's own word through, and answers end of input once its last write end is closed (a count
+   gone wrong leaves a writer behind, or loses the word). Then a read in flight keeps its pipe end through
+   a close by another thread (Linux's fget), and the table ends holding 0-2 alone, and the file every
+   round opened can be removed (an open count left behind would make that EBUSY). */
+
+#define SYS_dup 23
+#define SYS_unlinkat 35
+#define SYS_openat 56
+#define SYS_close 57
+#define SYS_pipe2 59
+#define SYS_read 63
+#define SYS_nanosleep 101
+#define AT_FDCWD (-100)
+#define O_RDONLY 0
+#define O_WRONLY 1
+#define O_CREAT 0x40
+#define O_TRUNC 0x200
+#define EMFILE 24
+#define FDS 16
+#define FD_WORKERS 4
+#define FD_ROUNDS 2000
+
+static const char fd_path[] = "/m9/fds";
+static volatile u32 owner[FDS];
+static volatile u32 fd_word;
+
+static void claim(long fd, u32 who) {
+    if (fd < 3 || fd >= FDS)
+        fail("a call handed out the descriptor", fd);
+    u32 none = 0;
+    if (!__atomic_compare_exchange_n(&owner[fd], &none, who, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        fail("descriptor handed to two threads at once:", fd);
+}
+
+static void close_claimed(long fd) {
+    __atomic_store_n(&owner[fd], 0, __ATOMIC_RELEASE);
+    long r = sc(SYS_close, fd, 0, 0, 0, 0);
+    if (r != 0)
+        fail("close answered", r);
+}
+
+static void fd_worker(void *arg) {
+    struct tls *me = arg;
+    u32 who = (u32)me->index + 1;
+    for (long i = 0; i < FD_ROUNDS; i++) {
+        int ends[2];
+        long r = sc(SYS_pipe2, (long)ends, 0, 0, 0, 0);
+        if (r != 0)
+            fail("pipe2 answered", r);
+        claim(ends[0], who);
+        claim(ends[1], who);
+        u64 word = ((u64)who << 32) | (u64)i;
+        if ((r = sc(SYS_write, ends[1], (long)&word, 8, 0, 0)) != 8)
+            fail("a pipe write answered", r);
+        long copy = sc(SYS_dup, ends[1], 0, 0, 0, 0);
+        claim(copy, who);
+        close_claimed(ends[1]);
+        long f = sc(SYS_openat, AT_FDCWD, (long)fd_path, O_RDONLY, 0, 0);
+        claim(f, who);
+        char text[4];
+        if ((r = sc(SYS_read, f, (long)text, 4, 0, 0)) != 4 || text[0] != 'k' || text[3] != 'l')
+            fail("the file read answered", r);
+        close_claimed(f);
+        u64 got = 0;
+        if ((r = sc(SYS_read, ends[0], (long)&got, 8, 0, 0)) != 8 || got != word)
+            fail("a pipe gave back another word, read answering", r);
+        close_claimed(copy);
+        if ((r = sc(SYS_read, ends[0], (long)&got, 8, 0, 0)) != 0)
+            fail("a pipe with no write end left answered", r);
+        close_claimed(ends[0]);
+    }
+}
+
+static int held_ends[2];
+static volatile u32 reader_ready;
+static volatile long reader_answer;
+static u64 reader_got;
+
+static void reader(void *arg) {
+    (void)arg;
+    __atomic_store_n(&reader_ready, 1, __ATOMIC_RELEASE);
+    futex(&reader_ready, FUTEX_WAKE, 1, 0);
+    reader_answer = sc(SYS_read, held_ends[0], (long)&reader_got, 8, 0, 0);
+}
+
+static void descriptors(void) {
+    long r;
+    long f = sc(SYS_openat, AT_FDCWD, (long)fd_path, O_WRONLY | O_CREAT | O_TRUNC, 0644, 0);
+    if (f < 0 || sc(SYS_write, f, (long)"keel", 4, 0, 0) != 4)
+        fail("making the file answered", f);
+    sc(SYS_close, f, 0, 0, 0, 0);
+
+    for (int i = 0; i < FD_WORKERS; i++)
+        start(i, fd_worker);
+    for (int i = 0; i < FD_WORKERS; i++)
+        join(i);
+    put("linuxthreads: ");
+    put_number(FD_WORKERS);
+    put(" threads x ");
+    put_number(FD_ROUNDS);
+    put(" rounds of pipe2, dup, openat and close at once: no descriptor shared, every pipe round-tripped\n");
+    flush();
+
+    /* A read asleep on a pipe whose only read descriptor another thread closes: the slot is free at once
+       (the next open takes its number), but the read still holds the end, so a write finds a reader. */
+    if ((r = sc(SYS_pipe2, (long)held_ends, 0, 0, 0, 0)) != 0)
+        fail("pipe2 answered", r);
+    start(0, reader);
+    while (__atomic_load_n(&reader_ready, __ATOMIC_ACQUIRE) == 0)
+        futex(&reader_ready, FUTEX_WAIT, 0, 0);
+    long hundred_ms[2] = {0, 100000000};
+    sc(SYS_nanosleep, (long)hundred_ms, 0, 0, 0, 0);
+    if ((r = sc(SYS_close, held_ends[0], 0, 0, 0, 0)) != 0)
+        fail("closing the read end answered", r);
+    f = sc(SYS_openat, AT_FDCWD, (long)fd_path, O_RDONLY, 0, 0);
+    if (f != held_ends[0])
+        fail("the closed read end's number was not free; the open answered", f);
+    u64 magic = 0x6b65656c66647321;
+    if ((r = sc(SYS_write, held_ends[1], (long)&magic, 8, 0, 0)) != 8)
+        fail("a write while the closed end's read was in flight answered", r);
+    join(0);
+    if (reader_answer != 8 || reader_got != magic)
+        fail("the read in flight answered", reader_answer);
+    sc(SYS_close, f, 0, 0, 0, 0);
+    sc(SYS_close, held_ends[1], 0, 0, 0, 0);
+
+    /* The table holds 0-2 alone: dup hands out 3 to 15 in order, then EMFILE. */
+    for (long fd = 3; fd < FDS; fd++)
+        if ((r = sc(SYS_dup, 0, 0, 0, 0, 0)) != fd)
+            fail("the table was not empty: dup answered", r);
+    if ((r = sc(SYS_dup, 0, 0, 0, 0, 0)) != -EMFILE)
+        fail("a full table's dup answered", r);
+    for (long fd = 3; fd < FDS; fd++)
+        sc(SYS_close, fd, 0, 0, 0, 0);
+    if ((r = sc(SYS_unlinkat, AT_FDCWD, (long)fd_path, 0, 0, 0)) != 0)
+        fail("removing the file every round opened answered", r);
+    put("linuxthreads: a read in flight keeps its pipe end through a close; the table ends with 0-2 alone\n");
+    flush();
+    sc(SYS_exit_group, 0, 0, 0, 0, 0);
+}
+
 /* The program starts here, with SP at argc (Linux's layout): `_start` hands that to `main_with`. */
 __asm__(".text\n"
         ".global _start\n"
@@ -310,6 +456,8 @@ __asm__(".text\n"
         "    b main_with\n");
 
 void main_with(long *sp) {
+    if (sp[0] > 1 && ((const char *)sp[2])[0] == 'f')
+        descriptors();
     if (sp[0] > 1)
         exec_from_a_thread();
     long pid = sc(SYS_getpid, 0, 0, 0, 0, 0);

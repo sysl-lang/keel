@@ -308,7 +308,12 @@ private[proc] sys_getpgid(p: *Process, regs: *u64) -> Result[i64, Errno]
     Err(ESRCH)
 
 // Whether descriptor `fd` of `p` is the console.
-private on_console(p: *Process, fd: u64) -> bool = fd < MAX_FDS && p.files[usize(fd)].holds == Holds.Console
+private on_console(p: *Process, fd: u64) -> bool
+    if fd >= MAX_FDS then return false
+    val t = sched.lock_files(p)
+    val console = t.slots[usize(fd)].holds == Holds.Console
+    sched.unlock_files(p)
+    console
 
 // ioctl(fd, request, arg) -> 0, on the console: TIOCGPGRP writes its foreground group (0 for none) to the
 // `i32` at `arg`; TIOCSPGRP makes the group in the `i32` at `arg` the foreground one, which must be a

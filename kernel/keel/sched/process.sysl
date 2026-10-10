@@ -21,7 +21,7 @@ struct Process
     exit_code: i64              // what its first thread passed to `exit`, or any thread to `exit_group`
     fault: u64                  // the fault that ended it (keel.proc's encoding); 0 if none did
     preemptions: u64            // times the timer took the processor from its threads, once it has ended
-    files: [OPEN_FILES]OpenFile // indexed by descriptor: the console, a file, a pipe end, or free
+    files: Mutex[Files]         // its descriptors, under their own lock (`lock_files`)
     cwd: [CWD_ROOM]u8           // the current directory: an absolute path with no `.`, `..` or `//`
     cwd_len: usize
     ppid: u64                   // the parent's pid; 0 for a process the kernel started and waits for
@@ -92,12 +92,35 @@ struct OpenFile
 // A descriptor that holds nothing.
 free_file() -> OpenFile = OpenFile(Holds.Free, 0, 0, 0)
 
+// A process's descriptor table, indexed by descriptor: the console, a file, a pipe end, a socket, or
+// free. Its threads share it, so it is only read or changed under `Process.files`' lock, which is a
+// sleeping `Mutex`: a file's call holds it across the filesystem's own lock (in that order, never the
+// other), and keel.proc's `duplicate`/`release` take a pipe's or a socket's `IrqLock` inside it.
+struct Files
+    slots: [OPEN_FILES]OpenFile
+
 // A new process's descriptors: the console at 0 to 2, the rest free.
-no_files() -> [OPEN_FILES]OpenFile
+no_files() -> Mutex[Files]
     var f: [OPEN_FILES]OpenFile = [free_file(); OPEN_FILES]
     for fd in 0..<3
-        f[fd] = OpenFile(Holds.Console, 0, 0, 0)
-    f
+        f[fd] = console_file()
+    mutex(Files(f))
+
+// A descriptor that is the console.
+console_file() -> OpenFile = OpenFile(Holds.Console, 0, 0, 0)
+
+// Off only to show what the lock is for: with it off two threads opening, duplicating or closing at
+// once can be handed one descriptor, and the boot test's `linuxthreads fds` finds it shared.
+private const FILES_LOCKED: bool = true
+
+// `p`'s descriptor table, locked; `unlock_files` lets it go.
+lock_files(p: *Process) -> *Files
+    val t = p.files.lock()
+    if !FILES_LOCKED then p.files.unlock()
+    t
+
+unlock_files(p: *Process)
+    if FILES_LOCKED then p.files.unlock()
 
 // Room for a process's environment: `NAME=value` entries, each followed by a NUL (keel.abi's ENV_ROOM).
 const ENV_ROOM: usize = 1024
