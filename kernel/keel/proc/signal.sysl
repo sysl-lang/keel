@@ -357,7 +357,7 @@ private[proc] sys_nanosleep(p: *Process, regs: *u64) -> Result[i64, Errno]
 // procs(*ProcInfo, count) -> how many it filled: the process table, at most `count` of it.
 private[proc] sys_procs(p: *Process, regs: *u64) -> Result[i64, Errno]
     val room = regs[1]
-    var found: Buf[ProcInfo] = buf()
+    val found: Buf[ProcInfo] = buf()
     val flags = family.lock()
     for i in 0..<MAX_PROCS
         val c = table[i]

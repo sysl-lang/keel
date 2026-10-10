@@ -60,7 +60,7 @@ opens(u: User, password: string) -> bool
 
 // Every well-formed line of a passwd file; a malformed one is skipped.
 users(text: string) -> Buf[User]
-    var out: Buf[User] = buf()
+    val out: Buf[User] = buf()
     for line in split(text, "\n")
         val f = split(line, ":")
         if f.len != 6 then continue
@@ -72,7 +72,7 @@ users(text: string) -> Buf[User]
 
 // Every well-formed line of a group file.
 groups(text: string) -> Buf[Group]
-    var out: Buf[Group] = buf()
+    val out: Buf[Group] = buf()
     for line in split(text, "\n")
         val f = split(line, ":")
         if f.len != 4 then continue

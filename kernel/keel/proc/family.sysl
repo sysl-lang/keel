@@ -122,7 +122,7 @@ private asked_for(p: *Process, va: u64) -> Result[(Buf[u8], [3]u64, Group), Errn
             group.pgid = attr.pgid
         else
             return Err(EPERM)
-    var env: Buf[u8] = buf()
+    val env: Buf[u8] = buf()
     if attr.env_given != 0
         if attr.env_len > ENV_ROOM then return Err(E2BIG)
         for _ in 0..<attr.env_len
@@ -149,7 +149,7 @@ private standard_files(p: *Process, fds: [3]u64) -> Result[[3]OpenFile, Errno]
 
 // NUL-terminated arguments, one after another, as strings.
 private[proc] unpacked(packed: []const u8) -> Result[Buf[string], Errno]
-    var out: Buf[string] = buf()
+    val out: Buf[string] = buf()
     var start: usize = 0
     for i in 0..<packed.len
         if packed[i] != 0 then continue

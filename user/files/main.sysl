@@ -27,7 +27,7 @@ refused[T](r: Result[T, Errno], want: Errno, what: string)
 // A file's whole contents.
 read_all(path: string) -> Result[Buf[u8], Errno]
     val fd = user.open(path, O_RDONLY)?
-    var out: Buf[u8] = buf()
+    val out: Buf[u8] = buf()
     var chunk: [700]u8 = [0; 700]
     loop
         val n = user.read(fd, chunk[..])?
@@ -42,7 +42,7 @@ text(b: Buf[u8]) -> string = from_utf8(b.view()) match
 
 // Every name in a directory, `.` and `..` included, read a few entries at a time.
 names(path: string) -> Buf[string]
-    var out: Buf[string] = buf()
+    val out: Buf[string] = buf()
     val fd = user.open(path, O_RDONLY) match
         Ok(fd) -> fd
         Err(_) ->

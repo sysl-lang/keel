@@ -376,8 +376,8 @@ proc_spawn(path: *u8, path_len: usize, argv: *psys.Text, argc: usize, envp: *psy
 // `path` after it; with no `PATH`, keel's one directory of programs, /bin. An empty directory in `PATH`
 // is the current one, as POSIX reads it.
 private searched(path: *u8, path_len: usize, env: []const u8) -> Buf[Buf[u8]]
-    var out: Buf[Buf[u8]] = buf()
-    var named: Buf[u8] = buf()
+    val out: Buf[Buf[u8]] = buf()
+    val named: Buf[u8] = buf()
     var has_slash = false
     for i in 0..<path_len
         if path[i] == u8('/') then has_slash = true
@@ -389,7 +389,7 @@ private searched(path: *u8, path_len: usize, env: []const u8) -> Buf[Buf[u8]]
     var start: usize = 0
     for i in 0..dirs.len
         if i == dirs.len || dirs[i] == u8(':')
-            var c: Buf[u8] = buf()
+            val c: Buf[u8] = buf()
             if i == start then c.push(u8('.')) else c.extend(dirs[start..<i])
             c.push(u8('/'))
             c.extend(named.view())
@@ -457,7 +457,7 @@ proc_exec(path: *u8, path_len: usize, argv: *psys.Text, argc: usize, envp: *psys
 // A pointer to each NUL-ended string of `packed`, then a null one: an `argv` or `envp` as execve takes
 // it. The pointers are into `packed`, which must outlive them.
 private pointers_to(packed: []const u8) -> Buf[u64]
-    var out: Buf[u64] = buf()
+    val out: Buf[u64] = buf()
     var at: usize = 0
     while at < packed.len
         out.push(u64(usize(as_ptr(packed)) + at))

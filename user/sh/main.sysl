@@ -115,7 +115,7 @@ set_var(sh: *Shell, name: string, value: string, export: bool)
 // open.
 tokens(sh: *Shell, line: string) -> Option[Buf[Token]]
     val b = line.bytes
-    var out: Buf[Token] = buf()
+    val out: Buf[Token] = buf()
     var cur: Buf[u8] = buf()
     var in_word = false
     var quote: u8 = 0
@@ -150,7 +150,7 @@ tokens(sh: *Shell, line: string) -> Option[Buf[Token]]
     Some(out)
 
 cur_of(c: u8) -> Buf[u8]
-    var one: Buf[u8] = buf()
+    val one: Buf[u8] = buf()
     one.push(c)
     one
 
@@ -170,7 +170,7 @@ expand(sh: *Shell, b: []const u8, i: usize, cur: *Buf[u8]) -> usize
     end
 
 slice_buf(b: []const u8) -> Buf[u8]
-    var out: Buf[u8] = buf()
+    val out: Buf[u8] = buf()
     out.extend(b)
     out
 
@@ -187,7 +187,7 @@ assignment(t: Token) -> Option[(string, string)]
 // The line's commands, split at `|`, with each one's redirections taken out; None (and a message) if a
 // redirection has no file or a stage is empty.
 stages(toks: Buf[Token]) -> Option[Buf[Stage]]
-    var out: Buf[Stage] = buf()
+    val out: Buf[Stage] = buf()
     var st = Stage(buf(), "", "", false)
     var i: usize = 0
     while i < toks.len()
@@ -224,7 +224,7 @@ stages(toks: Buf[Token]) -> Option[Buf[Stage]]
 
 // The exported variables, as a child's whole environment.
 exported_vars(sh: *Shell) -> Buf[Var]
-    var out: Buf[Var] = buf()
+    val out: Buf[Var] = buf()
     for v in sh.vars.view()
         if v.exported then out.push(Var(v.name, v.value))
     out
@@ -248,7 +248,7 @@ struct Started
 // in the `foreground`, and every later one joins it.
 start_job(sh: *Shell, all: Buf[Stage], foreground: bool) -> Started
     val env = exported_vars(sh)
-    var started: Buf[(&Spawned, string)] = buf()
+    val started: Buf[(&Spawned, string)] = buf()
     var pgid = 0
     var last: i64 = 0
     var from_prev: Option[File] = None
@@ -341,7 +341,7 @@ writing(f: Option[File]) -> Stdio = f match
 run_background(sh: *Shell, all: Buf[Stage], text: string) -> i64
     val job = start_job(sh, all, false)
     if job.stages.len() == 0 then return job.last
-    var stages: Buf[&Spawned] = buf()
+    val stages: Buf[&Spawned] = buf()
     for (child, _) in job.stages.view()
         stages.push(child)
     var number: u64 = 1

@@ -50,7 +50,7 @@ private arguments()
             proc.wait(p)
             if !proc.exited(p) || proc.exit_code(p) != 0 then report(p)
         Err(_) -> print("keel: echo did not load")
-    var many: Buf[string] = buf()
+    val many: Buf[string] = buf()
     for _ in 0..<600
         many.push("argument")
     proc.start_with("/bin/echo", many.view()) match
@@ -76,7 +76,7 @@ private report(p: &sync Process)
 
 private preempt_user()
     val irqs_before = trap.user_irqs.load(Ordering.Acquire)
-    var spinners: Buf[&sync Process] = buf()
+    val spinners: Buf[&sync Process] = buf()
     for _ in 0..<sched.cores_up()
         proc.start("/bin/spin") match
             Ok(p) -> spinners.push(p)

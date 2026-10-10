@@ -88,7 +88,7 @@ private const HOLD: u64 = 2_000             // spin steps between the read and t
 
 private counting()
     val m: &sync Mutex[u64] = mutex(0)
-    var workers: Buf[&sync Thread] = buf()
+    val workers: Buf[&sync Thread] = buf()
     for _ in 0..<WORKERS
         workers.push(spawn(() -> add_many(m)))
     for w in workers

@@ -57,7 +57,7 @@ private[proc] sys_clone(p: *Process, regs: *u64) -> Result[i64, Errno]
 // The parent's environment, in a box of the child's own. Read by index: a `&sync` box's array has no
 // slice.
 private copied_env(p: *Process) -> &sync Env
-    var bytes: Buf[u8] = buf()
+    val bytes: Buf[u8] = buf()
     for i in 0..<p.env.len
         bytes.push(p.env.bytes[i])
     sched.env_of(bytes.view())
@@ -110,9 +110,9 @@ private[proc] sys_execve(p: *Process, regs: *u64) -> Result[i64, Errno]
 // The strings of the null-ended pointer array at the caller's `va`, each followed by its NUL, at most
 // `room` bytes in all (E2BIG past it); none for a null `va`.
 private vector_in(p: *Process, va: u64, room: u64) -> Result[Buf[u8], Errno]
-    var out: Buf[u8] = buf()
+    val out: Buf[u8] = buf()
     if va == 0 then return Ok(out)
-    var space: Buf[u8] = buf()
+    val space: Buf[u8] = buf()
     for _ in 0..<room
         space.push(0)
     var used: usize = 0

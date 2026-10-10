@@ -76,7 +76,7 @@ fs_shutdown()
 // One `fsload` per core, all at once: each writes, reads back, removes a file of its own and syncs.
 // The filesystem's one lock is what keeps them apart.
 private fs_smp()
-    var loads: Buf[&sync Process] = buf()
+    val loads: Buf[&sync Process] = buf()
     for _ in 0..<sched.cores_up()
         proc.start("/bin/fsload") match
             Ok(p) -> loads.push(p)

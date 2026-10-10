@@ -206,7 +206,7 @@ private heap_tests()
 // A `Buf[u64]` of `n` elements and their sum, and the frames free while it is alive. The `Buf` is
 // dropped when this returns.
 private grow_buf(n: u64) -> (u64, u64)
-    var b: Buf[u64] = buf()
+    val b: Buf[u64] = buf()
     for i in 0..<n
         b.push(i)
     var sum: u64 = 0

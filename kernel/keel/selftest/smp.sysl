@@ -43,7 +43,7 @@ private struct Seen
 private spread()
     val want = sched.cores_up()
     val s: &sync Seen = Seen(Atomic(0))
-    var threads: Buf[&sync Thread] = buf()
+    val threads: Buf[&sync Thread] = buf()
     for _ in 0..<SPINNERS
         threads.push(spawn(() -> record_cores(s, want)))
     for t in threads
@@ -74,7 +74,7 @@ private struct Counted
 
 private smp_counting()
     val c: &sync Counted = Counted(mutex(0), Atomic(0))
-    var workers: Buf[&sync Thread] = buf()
+    val workers: Buf[&sync Thread] = buf()
     for _ in 0..<SMP_WORKERS
         workers.push(spawn(() -> smp_add_many(c)))
     for w in workers
@@ -127,7 +127,7 @@ private smp_heap()
 // Everything this allocates — the threads, the closures, the shared record — is gone when it returns.
 private heap_workers() -> (u64, u64)
     val r: &sync HeapRun = HeapRun(Atomic(0), Atomic(0))
-    var workers: Buf[&sync Thread] = buf()
+    val workers: Buf[&sync Thread] = buf()
     for w in 0..<HEAP_WORKERS
         workers.push(spawn(() -> churn(r, w)))
     for t in workers
@@ -135,11 +135,11 @@ private heap_workers() -> (u64, u64)
     (r.wrong.load(Ordering.Acquire), popcount(r.cores.load(Ordering.Acquire)))
 
 private churn(r: &sync HeapRun, seed: u64)
-    var kept: Buf[Buf[u64]] = buf()
+    val kept: Buf[Buf[u64]] = buf()
     for i in 0..<HEAP_BUFS
         if i % 256 == 0 then r.cores.or(u64(1) << cpu.core_id(), Ordering.Relaxed)
         val n = 1 + (i * 37 + seed * 101) % 400
-        var b: Buf[u64] = buf()
+        val b: Buf[u64] = buf()
         for j in 0..<n
             b.push(j + seed)
         if kept.len() == HEAP_KEEP

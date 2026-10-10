@@ -40,7 +40,7 @@ reaped(pid: u64) -> i64
 
 // Everything `fd` gives until the end of its input.
 drained(fd: u64) -> string
-    var all: Buf[u8] = buf()
+    val all: Buf[u8] = buf()
     var chunk: [64]u8 = [0; 64]
     loop
         val n = user.read(fd, chunk[..]) match

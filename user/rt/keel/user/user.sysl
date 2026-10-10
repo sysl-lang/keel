@@ -68,7 +68,7 @@ env_entry(i: usize) -> Option[[]const u8]
 
 // This process's environment entries, `NAME=value` each, as bytes (keel.fsys builds a child's from it).
 environment() -> Buf[[]const u8]
-    var out: Buf[[]const u8] = buf()
+    val out: Buf[[]const u8] = buf()
     var i: usize = 0
     loop
         env_entry(i) match
@@ -249,12 +249,12 @@ private call5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
 // `foreground` the child's group becomes the console's foreground group before it runs.
 spawn(path: string, args: []const string, stdin: u64 = NO_FD, stdout: u64 = NO_FD, stderr: u64 = NO_FD,
         env: Option[[]const string] = None, group: u64 = SAME_GROUP, foreground: bool = false) -> Result[u64, Errno]
-    var packed: Buf[u8] = buf()
+    val packed: Buf[u8] = buf()
     for a in args
         packed.extend(a.bytes)
         packed.push(0)
     val bytes = packed.view()
-    var block: Buf[u8] = buf()
+    val block: Buf[u8] = buf()
     var flags: u64 = if foreground then SPAWN_FOREGROUND else 0
     if group != SAME_GROUP then flags |= SPAWN_SETPGROUP
     var attr = SpawnAttr([stdin, stdout, stderr], 0, 0, 0, flags, if group == NEW_GROUP then 0 else group)
@@ -407,7 +407,7 @@ nanosleep(nanos: u64) -> Result[unit, (Errno, u64)]
 procs() -> Result[Buf[ProcInfo], Errno]
     var room: [64]ProcInfo = [ProcInfo(0, 0, 0, 0, 0, [0; 16]); 64]
     val n = answer(call(SYS_PROCS, u64(usize(&room[0])), 64, 0, 0))?
-    var out: Buf[ProcInfo] = buf()
+    val out: Buf[ProcInfo] = buf()
     for i in 0..<usize(n)
         out.push(room[i])
     Ok(out)

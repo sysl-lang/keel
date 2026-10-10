@@ -81,7 +81,7 @@ private struct Readers
 private disk_smp()
     val (irqs_before, done_before, _) = virtio.stats()
     val r: &sync Readers = Readers(Atomic(0), Atomic(0), Atomic(0))
-    var threads: Buf[&sync Thread] = buf()
+    val threads: Buf[&sync Thread] = buf()
     for _ in 0..<DISK_READERS
         threads.push(spawn(() -> read_many(r)))
     for t in threads

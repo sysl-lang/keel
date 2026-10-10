@@ -99,7 +99,7 @@ private opened(path: string) -> Image
 // --- build ---------------------------------------------------------------------------------------
 
 private build(path: string, blocks: u32, from: Option[string], owners: Option[string]) -> int
-    var bytes: Buf[u8] = buf()
+    val bytes: Buf[u8] = buf()
     for _ in 0..<usize(blocks) * BLOCK_SIZE
         bytes.push(0)
     var img = Image(bytes.view(), ondisk.layout(blocks, INODES), ROOT_INO, 0)
@@ -379,7 +379,7 @@ private get(path: string, file: string, host: string) -> int
     if ino == 0 then fail(s"mkfs: $file: not found")
     val i = inode(&img, ino)
     if i.kind != KIND_FILE then fail(s"mkfs: $file is not a file")
-    var out: Buf[u8] = buf()
+    val out: Buf[u8] = buf()
     for n in 0..<(usize(i.size) + BLOCK_SIZE - 1) / BLOCK_SIZE
         val b = block(&img, block_at(&img, i, n))
         val end = if usize(i.size) - n * BLOCK_SIZE < BLOCK_SIZE then usize(i.size) - n * BLOCK_SIZE else BLOCK_SIZE
