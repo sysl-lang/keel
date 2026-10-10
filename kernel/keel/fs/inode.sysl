@@ -28,9 +28,9 @@ private[fs] write_inode(st: *State, ino: u32, value: Inode) -> Result[unit, Errn
     put(st, slot)
     Ok(())
 
-// A free inode, made a `kind` with nothing in it and one link, belonging to `owner` — a file 0o644, a
-// directory 0o755; ENOSPC when there is none.
-private[fs] new_inode(st: *State, kind: u16, owner: Cred) -> Result[u32, Errno]
+// A free inode, made a `kind` with nothing in it and one link, belonging to `owner`, with permission
+// bits `perms`; ENOSPC when there is none.
+private[fs] new_inode(st: *State, kind: u16, owner: Cred, perms: u16) -> Result[u32, Errno]
     var first: u32 = 1
     while first < st.sb.inodes
         val block = ondisk.inode_block(st.sb, first)
@@ -39,7 +39,6 @@ private[fs] new_inode(st: *State, kind: u16, owner: Cred) -> Result[u32, Errno]
         for ino in first..<last
             val i: *Inode = ondisk.at(bytes(st, slot), ondisk.inode_offset(ino))
             if i.kind == KIND_FREE
-                val perms: u16 = if kind == KIND_DIR then 0o755 else 0o644
                 *i = Inode(kind, ondisk.type_bits(kind) | perms, 1, u16(owner.uid), 0, [0; NDIRECT], 0,
                     u16(owner.gid), 0)
                 mark_dirty(st, slot)

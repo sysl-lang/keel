@@ -19,7 +19,7 @@ loop
         Err(e) ->
             print(s"init: cannot start /bin/login: ${user.describe(e)}")
             exit(1)
-    var status = ExitStatus(0, 0)
+    var status = ExitStatus(0)
     loop
         user.wait() match
             Ok((pid, s)) ->

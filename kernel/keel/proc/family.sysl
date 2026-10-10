@@ -1,6 +1,6 @@
 module keel.proc
 
-// Parents and children: the process table, and the `spawn`, `wait` and `getppid` system calls.
+// Parents and children: the process table, and the `spawn`, `wait4` and `getppid` system calls.
 //
 // **Two ways to make a child.** `spawn(path, args, attr)` makes a new address space from an
 // executable on the disk — exactly what `start` already did for the kernel — and gives the child its
@@ -14,11 +14,11 @@ module keel.proc
 // under one IrqLock (`family`); each entry keeps its own box alive through `Process.me`, as a thread
 // does (keel.sched), so a parent needs no handle on its children. A process that ends is marked
 // `ended` and its children are handed to init, pid 1 — exactly then, so an orphan is never without a
-// parent to reap it. `wait` sleeps on `changed`, which every ending wakes.
+// parent to reap it. `wait4` sleeps on `changed`, which every ending wakes.
 
 import abi.keel.abi.{ANY_CHILD, ARGS_ROOM, E2BIG, EAGAIN, ECHILD, EFAULT, EINTR, EINVAL, ENAMETOOLONG, ENOENT,
-    ENOEXEC, EBADF, ENOMEM, ENV_ROOM, EPERM, Errno, ExitStatus, INIT_PID, MAX_FDS, NO_FD, SIGCHLD, SPAWN_FOREGROUND,
-    SPAWN_SETPGROUP, SpawnAttr, WNOHANG, exit_status, signal_status}
+    ENOEXEC, EBADF, ENOMEM, ENV_ROOM, EPERM, Errno, ExitStatus, INIT_PID, MAX_FDS, NO_FD, RUSAGE_SIZE, SIGCHLD,
+    SPAWN_FOREGROUND, SPAWN_SETPGROUP, SpawnAttr, WCONTINUED, WNOHANG, WUNTRACED, exit_status, signal_status}
 import keel.fs
 import keel.mm
 import keel.sched
@@ -168,13 +168,17 @@ private[proc] errno_of(e: LoadError) -> Errno = e match
     NoRoom -> EAGAIN
     _ -> ENOEXEC
 
-// wait(pid, *ExitStatus, options) -> the pid of the child that ended. Sleeps until one has — or, with
-// WNOHANG, answers 0 at once if none has; EINTR if a signal comes first.
-private[proc] sys_wait(p: *Process, regs: *u64) -> Result[i64, Errno]
+// wait4(pid, *i32 status | 0, options, *rusage | 0) -> the pid of the child that ended: `pid` itself,
+// any child for -1, one in the caller's group for 0, one in group -pid below -1. Sleeps until one has —
+// or, with WNOHANG, answers 0 at once if none has; EINTR if a signal comes first. WUNTRACED and
+// WCONTINUED ask about stopped children, and keel has none. A `rusage` is zeros: keel counts nothing.
+private[proc] sys_wait4(p: *Process, regs: *u64) -> Result[i64, Errno]
     val want = i64(regs[0])
     val status_at = regs[1]
-    if (regs[2] & ~WNOHANG) != 0 then return Err(EINVAL)
+    val usage_at = regs[3]
+    if (regs[2] & ~(WNOHANG | WUNTRACED | WCONTINUED)) != 0 then return Err(EINVAL)
     if status_at != 0 && !mm.user_range(&p.space, status_at, u64(sizeof(ExitStatus)), true) then return Err(EFAULT)
+    if usage_at != 0 && !mm.user_range(&p.space, usage_at, RUSAGE_SIZE, true) then return Err(EFAULT)
     val found = ended_child(p, want, (regs[2] & WNOHANG) != 0)?
     val child = found match
         Some(c) -> c
@@ -182,13 +186,23 @@ private[proc] sys_wait(p: *Process, regs: *u64) -> Result[i64, Errno]
     reap(child)
     if status_at != 0
         val how = if child.term_signal == 0 then exit_status(child.exit_code) else signal_status(child.term_signal)
-        var status = ExitStatus(how, child.fault)
+        var status = ExitStatus(u32(how))
         val b: *u8 = ptr_cast(&status)
         if !mm.copy_to_user(&p.space, status_at, b[0..<sizeof(ExitStatus)]) then return Err(EFAULT)
+    if usage_at != 0
+        var zeros: [RUSAGE_SIZE]u8 = [0; RUSAGE_SIZE]
+        if !mm.copy_to_user(&p.space, usage_at, zeros[..]) then return Err(EFAULT)
     Ok(i64(child.pid))
 
-// A child of `parent` that has ended — `want`, or any for ANY_CHILD — taken out of the table; None if
-// there is a child but none has ended and `no_hang` says not to wait.
+// Whether child `c` is one `want` names, `own_group` being the caller's: wait4's reading of its pid.
+private wanted(c: *Process, want: i64, own_group: u64) -> bool
+    if want == ANY_CHILD then return true
+    if want == 0 then return c.pgid == own_group
+    if want < 0 then return c.pgid == u64(-want)
+    i64(c.pid) == want
+
+// A child of `parent` that has ended — one `want` names — taken out of the table; None if there is a
+// child but none has ended and `no_hang` says not to wait.
 private ended_child(parent: *Process, want: i64, no_hang: bool) -> Result[Option[&sync Process], Errno]
     val flags = family.lock()
     loop
@@ -196,7 +210,7 @@ private ended_child(parent: *Process, want: i64, no_hang: bool) -> Result[Option
         for i in 0..<MAX_PROCS
             val c = table[i]
             if c == null || c.ppid != parent.pid then continue
-            if want != ANY_CHILD && i64(c.pid) != want then continue
+            if !wanted(c, want, parent.pgid) then continue
             any = true
             if !c.ended then continue
             table[i] = null

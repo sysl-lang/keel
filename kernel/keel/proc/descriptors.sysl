@@ -1,9 +1,9 @@
 module keel.proc
 
 // Descriptors: what each of a process's descriptors stands for (keel.sched's `OpenFile` — the console,
-// a file, one end of a pipe, or nothing), and the calls that work on any of them: read, write, close,
-// pipe, dup2 and dup. A file's own reading and writing is keel.fs's; the console's is keel.console's;
-// pipes are here.
+// a file, one end of a pipe, a socket, or nothing), and the calls that work on any of them: read, write,
+// close, pipe2, dup3 and dup. A file's own reading and writing is keel.fs's; the console's is
+// keel.console's; a socket's is socket.sysl's; pipes are here.
 //
 // **A pipe** is a bounded ring of PIPE_ROOM bytes in a fixed table, with a count of the read ends and
 // of the write ends open in every process. A reader sleeps while it is empty and a writer is left; a
@@ -17,13 +17,16 @@ module keel.proc
 // had already put in. A write with no reader left answers EPIPE and sends the writer SIGPIPE, which ends
 // it unless it is ignored or handled.
 //
-// What is simplified: a second descriptor on a file (dup2, dup, a child's) copies the offset rather
-// than sharing it, which is the same for the shell's `>` and `>>` (a fresh file, and O_APPEND).
+// What is simplified: a second descriptor on a file (dup3, dup, a child's) copies the offset rather
+// than sharing it, which is the same for the shell's `>` and `>>` (a fresh file, and O_APPEND); and
+// O_CLOEXEC is taken and changes nothing — keel has no close-on-exec.
 
-import abi.keel.abi.{EBADF, EFAULT, EINTR, EMFILE, ENFILE, EPIPE, Errno, MAX_FDS, PIPE_ROOM, SIGPIPE}
+import abi.keel.abi.{EBADF, EDESTADDRREQ, EFAULT, EINTR, EINVAL, EMFILE, ENFILE, EPIPE, Errno, MAX_FDS, O_CLOEXEC,
+    PIPE_ROOM, SIGPIPE}
 import keel.console
 import keel.fs
 import keel.mm
+import keel.net
 import keel.pl011.put_byte
 import keel.sched
 import keel.sched.{Holds, IrqLock, OPEN_FILES, OpenFile, Process, WaitQueue}
@@ -56,15 +59,17 @@ private[proc] sys_read(p: *Process, regs: *u64) -> Result[i64, Errno]
                 None -> Err(EINTR)
         File -> fs.sys_read(p, regs)
         PipeRead -> pipe_read(p, usize(f.ino), regs[1], regs[2])
+        Socket -> socket_read(p, f, regs[1], regs[2])
         else Err(EBADF)
 
-// write(fd, buf, len) -> bytes written.
+// write(fd, buf, len) -> bytes written. A socket is never connected, so `write` has nowhere to send.
 private[proc] sys_write(p: *Process, regs: *u64) -> Result[i64, Errno]
     val f = descriptor(p, regs[0])?
     f.holds match
         Console -> console_write(p, UserAddr(regs[1]), regs[2])
         File -> fs.sys_write(p, regs)
         PipeWrite -> pipe_write(p, usize(f.ino), regs[1], regs[2])
+        Socket -> Err(EDESTADDRREQ)
         else Err(EBADF)
 
 // close(fd) -> 0
@@ -74,12 +79,14 @@ private[proc] sys_close(p: *Process, regs: *u64) -> Result[i64, Errno]
     *f = sched.free_file()
     Ok(0)
 
-// dup2(old, new) -> new. Whatever `new` held is closed first; `new` == `old` changes nothing.
-private[proc] sys_dup2(p: *Process, regs: *u64) -> Result[i64, Errno]
+// dup3(old, new, flags) -> new. Whatever `new` held is closed first; `new` == `old` is EINVAL, and the
+// only flag is O_CLOEXEC.
+private[proc] sys_dup3(p: *Process, regs: *u64) -> Result[i64, Errno]
     val old = descriptor(p, regs[0])?
     val to = regs[1]
+    if (regs[2] & ~O_CLOEXEC) != 0 then return Err(EINVAL)
     if to >= MAX_FDS then return Err(EBADF)
-    if to == regs[0] then return Ok(i64(to))
+    if to == regs[0] then return Err(EINVAL)
     val o = *old
     duplicate(o)
     release(p.files[usize(to)])
@@ -94,8 +101,10 @@ private[proc] sys_dup(p: *Process, regs: *u64) -> Result[i64, Errno]
     duplicate(*old)
     Ok(i64(to))
 
-// pipe(*[2]u32) -> 0, with the read end's descriptor and then the write end's written out.
-private[proc] sys_pipe(p: *Process, regs: *u64) -> Result[i64, Errno]
+// pipe2(*[2]i32, flags) -> 0, with the read end's descriptor and then the write end's written out. The
+// only flag is O_CLOEXEC; a pipe that never waits (O_NONBLOCK) keel does not have.
+private[proc] sys_pipe2(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if (regs[1] & ~O_CLOEXEC) != 0 then return Err(EINVAL)
     val r = lowest_free(p, OPEN_FILES)?
     val w = lowest_free(p, r)?
     val slot = new_pipe()?
@@ -111,10 +120,11 @@ private[proc] sys_pipe(p: *Process, regs: *u64) -> Result[i64, Errno]
         return Err(EFAULT)
     Ok(0)
 
-// A second descriptor now stands for what `f` does (dup2, dup, a child's): count it.
+// A second descriptor now stands for what `f` does (dup3, dup, a child's): count it.
 private[proc] duplicate(f: OpenFile)
     f.holds match
         File -> fs.opened_again(f.ino)
+        Socket -> net.socket_hold(usize(f.ino))
         PipeRead | PipeWrite ->
             val flags = pipe_lock.lock()
             val pp = &pipes[usize(f.ino)]
@@ -122,12 +132,13 @@ private[proc] duplicate(f: OpenFile)
             pipe_lock.unlock(flags)
         else ()
 
-// A descriptor that stood for what `f` does is gone (close, dup2's target, a process's end, a child
+// A descriptor that stood for what `f` does is gone (close, dup3's target, a process's end, a child
 // that could not be started). The last write end wakes the readers for their end of input; the last
-// read end wakes the writers for their EPIPE.
+// read end wakes the writers for their EPIPE; the last descriptor on a socket closes it.
 private[proc] release(f: OpenFile)
     f.holds match
         File -> fs.closed(f.ino)
+        Socket -> net.socket_release(usize(f.ino))
         PipeRead | PipeWrite ->
             val flags = pipe_lock.lock()
             val pp = &pipes[usize(f.ino)]

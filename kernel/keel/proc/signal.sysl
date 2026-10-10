@@ -9,14 +9,15 @@ module keel.proc
 // signal: ignored, it is dropped; default, it ends the process (or is dropped, for the ones whose
 // default is to ignore); handled, a `SigFrame` holding every register and the blocked set is pushed on
 // the process's own stack, and the registers are changed so that the process resumes in the handler
-// with x0 = the signal, x30 = the restorer its `sigaction` named, and SP at the frame. The restorer is
-// the user runtime's `keel_sigreturn_trampoline` (Linux's `sa_restorer`), which makes `sigreturn`; that
+// with x0 = the signal, x30 = the restorer its `rt_sigaction` named, and SP at the frame. The restorer
+// is the user runtime's `keel_sigreturn_trampoline` (Linux's `sa_restorer`), which makes `rt_sigreturn`;
+// that
 // reads the frame back from SP and puts every register back as it was, the flags made safe (EL0, no
 // exception masked: only NZCV is taken from the frame).
 
 import abi.keel.abi.{EFAULT, EINTR, EINVAL, ENOTTY, EPERM, ESRCH, Errno, INIT_PID, MAX_FDS, NSIG, ProcInfo,
-    SA_RESTART, SIGINT, SIGKILL, SIGSEGV, SIGSTOP, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_SETMASK, SIG_UNBLOCK, SigAction,
-    SigFrame}
+    SA_RESTART, SA_RESTORER, SIGINT, SIGKILL, SIGSEGV, SIGSET_SIZE, SIGSTOP, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_SETMASK,
+    SIG_UNBLOCK, SigAction, SigFrame, TIOCGPGRP, TIOCGWINSZ, TIOCSPGRP, Timespec, Winsize}
 import keel.console
 import keel.mm
 import keel.sched
@@ -93,8 +94,9 @@ private push_frame(p: *Process, regs: *u64, sig: u64, a: Action) -> bool
     regs[SP] = at
     true
 
-// sigreturn() -> the interrupted x0: every register back from the SigFrame at SP, and the blocked set.
-private[proc] sys_sigreturn(p: *Process, regs: *u64) -> Result[i64, Errno]
+// rt_sigreturn() -> the interrupted x0: every register back from the SigFrame at SP, and the blocked
+// set.
+private[proc] sys_rt_sigreturn(p: *Process, regs: *u64) -> Result[i64, Errno]
     var f = SigFrame([0; 31], 0, 0, 0, 0, 0)
     val bytes: *u8 = ptr_cast(&f)
     if !mm.copy_from_user(&p.space, regs[SP], bytes[0..<sizeof(SigFrame)]) then end(p, SIGSEGV, 0)
@@ -110,43 +112,67 @@ private[proc] sys_sigreturn(p: *Process, regs: *u64) -> Result[i64, Errno]
     // The dispatcher writes the answer to x0: the one it had.
     Ok(i64(regs[0]))
 
-// sigaction(sig, handler, mask, restorer, *SigAction old | 0, flags) -> 0
-private[proc] sys_sigaction(p: *Process, regs: *u64) -> Result[i64, Errno]
+// A set as keel.sched keeps it (signal n at bit n) and as Linux's `sigset_t` has it (signal n at bit
+// n - 1). Linux's signals from NSIG up, the real-time ones, keel does not have, and a set loses them.
+private from_linux_set(set: u64) -> u64 = (set << 1) & ((u64(1) << NSIG) - 2)
+private to_linux_set(set: u64) -> u64 = set >> 1
+
+// rt_sigaction(sig, *SigAction | 0, *SigAction old | 0, sigsetsize) -> 0, the kernel's `struct
+// sigaction` both ways. A handler needs SA_RESTORER and a restorer to return through; SA_RESTART and
+// SA_RESTORER are the only flags.
+private[proc] sys_rt_sigaction(p: *Process, regs: *u64) -> Result[i64, Errno]
     val sig = regs[0]
-    val a = Action(regs[1], regs[2], regs[3], regs[5])
-    if sig == 0 || sig >= NSIG || sig == SIGKILL || sig == SIGSTOP then return Err(EINVAL)
-    if (a.flags & ~SA_RESTART) != 0 then return Err(EINVAL)
-    if a.handler != SIG_DFL && a.handler != SIG_IGN && a.restorer == 0 then return Err(EINVAL)
-    val old_at = regs[4]
+    val new_at = regs[1]
+    val old_at = regs[2]
+    if regs[3] != SIGSET_SIZE then return Err(EINVAL)
+    if sig == 0 || sig >= NSIG then return Err(EINVAL)
+    if new_at != 0 && (sig == SIGKILL || sig == SIGSTOP) then return Err(EINVAL)
     if old_at != 0 && !mm.user_range(&p.space, old_at, u64(sizeof(SigAction)), true) then return Err(EFAULT)
+    var given = SigAction(0, 0, 0, 0)
+    if new_at != 0
+        val raw: *u8 = ptr_cast(&given)
+        if !mm.copy_from_user(&p.space, new_at, raw[0..<sizeof(SigAction)]) then return Err(EFAULT)
+        if (given.flags & ~(SA_RESTART | SA_RESTORER)) != 0 then return Err(EINVAL)
+        val handled = given.handler != SIG_DFL && given.handler != SIG_IGN
+        if handled && ((given.flags & SA_RESTORER) == 0 || given.restorer == 0) then return Err(EINVAL)
     val s = p.sig
     val flags = s.lock.lock()
     val old = s.actions[usize(sig)]
-    s.actions[usize(sig)] = a
-    // A signal that is now ignored and is pending is thrown away, as it would have been when sent.
-    if sched.ignores(s, sig) then s.pending.store(s.pending.load(Ordering.Relaxed) & ~sched.bit(sig), Ordering.Release)
+    if new_at != 0
+        s.actions[usize(sig)] = Action(given.handler, from_linux_set(given.mask), given.restorer, given.flags)
+        // A signal that is now ignored and is pending is thrown away, as it would have been when sent.
+        if sched.ignores(s, sig) then s.pending.store(s.pending.load(Ordering.Relaxed) & ~sched.bit(sig), Ordering.Release)
     s.lock.unlock(flags)
     if old_at != 0
-        var o = SigAction(old.handler, old.mask, old.restorer, old.flags)
+        var o = SigAction(old.handler, old.flags, old.restorer, to_linux_set(old.mask))
         val b: *u8 = ptr_cast(&o)
         if !mm.copy_to_user(&p.space, old_at, b[0..<sizeof(SigAction)]) then return Err(EFAULT)
     Ok(0)
 
-// sigprocmask(how, set, *u64 old | 0) -> 0
-private[proc] sys_sigprocmask(p: *Process, regs: *u64) -> Result[i64, Errno]
+// rt_sigprocmask(how, *u64 set | 0, *u64 old | 0, sigsetsize) -> 0. With no set, `how` is not looked at
+// and the blocked set is only read.
+private[proc] sys_rt_sigprocmask(p: *Process, regs: *u64) -> Result[i64, Errno]
     val how = regs[0]
-    val set = regs[1]
+    val set_at = regs[1]
     val old_at = regs[2]
-    if how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK then return Err(EINVAL)
+    if regs[3] != SIGSET_SIZE then return Err(EINVAL)
+    var set: u64 = 0
+    if set_at != 0
+        if how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK then return Err(EINVAL)
+        val raw: *u8 = ptr_cast(&set)
+        if !mm.copy_from_user(&p.space, set_at, raw[0..<8]) then return Err(EFAULT)
+        set = from_linux_set(set)
     if old_at != 0 && !mm.user_range(&p.space, old_at, 8, true) then return Err(EFAULT)
     val s = p.sig
     val flags = s.lock.lock()
-    var old = s.blocked
-    val now = if how == SIG_BLOCK then old | set else if how == SIG_UNBLOCK then old & ~set else set
-    s.blocked = now & ~sched.UNBLOCKABLE
+    val old = s.blocked
+    if set_at != 0
+        val now = if how == SIG_BLOCK then old | set else if how == SIG_UNBLOCK then old & ~set else set
+        s.blocked = now & ~sched.UNBLOCKABLE
     s.lock.unlock(flags)
     if old_at != 0
-        val b: *u8 = ptr_cast(&old)
+        var out = to_linux_set(old)
+        val b: *u8 = ptr_cast(&out)
         if !mm.copy_to_user(&p.space, old_at, b[0..<8]) then return Err(EFAULT)
     Ok(0)
 
@@ -244,30 +270,50 @@ private[proc] sys_getpgid(p: *Process, regs: *u64) -> Result[i64, Errno]
 // Whether descriptor `fd` of `p` is the console.
 private on_console(p: *Process, fd: u64) -> bool = fd < MAX_FDS && p.files[usize(fd)].holds == Holds.Console
 
-// tcsetpgrp(fd, pgid) -> 0: the console's foreground group, which must be a group of the caller's user.
-private[proc] sys_tcsetpgrp(p: *Process, regs: *u64) -> Result[i64, Errno]
+// ioctl(fd, request, arg) -> 0, on the console: TIOCGPGRP writes its foreground group (0 for none) to the
+// `i32` at `arg`; TIOCSPGRP makes the group in the `i32` at `arg` the foreground one, which must be a
+// group of the caller's user; TIOCGWINSZ answers 24 rows of 80 columns. ENOTTY for any descriptor but
+// the console, EINVAL for any other request.
+private[proc] sys_ioctl(p: *Process, regs: *u64) -> Result[i64, Errno]
     if !on_console(p, regs[0]) then return Err(ENOTTY)
-    if !group_joinable(p, regs[1]) then return Err(EPERM)
-    console.set_foreground(regs[1])
-    Ok(0)
+    val arg = regs[2]
+    regs[1] match
+        TIOCGPGRP ->
+            var g = u32(console.foreground_group())
+            val b: *u8 = ptr_cast(&g)
+            if !mm.copy_to_user(&p.space, arg, b[0..<4]) then return Err(EFAULT)
+            Ok(0)
+        TIOCSPGRP ->
+            var g: u32 = 0
+            val b: *u8 = ptr_cast(&g)
+            if !mm.copy_from_user(&p.space, arg, b[0..<4]) then return Err(EFAULT)
+            if i32(g) <= 0 || !group_joinable(p, u64(g)) then return Err(EPERM)
+            console.set_foreground(u64(g))
+            Ok(0)
+        TIOCGWINSZ ->
+            var w = Winsize(24, 80, 0, 0)
+            val b: *u8 = ptr_cast(&w)
+            if !mm.copy_to_user(&p.space, arg, b[0..<sizeof(Winsize)]) then return Err(EFAULT)
+            Ok(0)
+        else Err(EINVAL)
 
-// tcgetpgrp(fd) -> the console's foreground group; 0 for none.
-private[proc] sys_tcgetpgrp(p: *Process, regs: *u64) -> Result[i64, Errno]
-    if !on_console(p, regs[0]) then return Err(ENOTTY)
-    Ok(i64(console.foreground_group()))
-
-// nanosleep(nanos, *u64 left | 0) -> 0; EINTR, with the nanoseconds that were left, if a signal ended
-// it. Rounded up to the timer's 10 ms.
+// nanosleep(*Timespec, *Timespec left | 0) -> 0; EINTR, with what was left, if a signal ended it.
+// Rounded up to the timer's 10 ms.
 private[proc] sys_nanosleep(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var want = Timespec(0, 0)
+    val raw: *u8 = ptr_cast(&want)
+    if !mm.copy_from_user(&p.space, regs[0], raw[0..<sizeof(Timespec)]) then return Err(EFAULT)
+    if want.sec < 0 || want.nsec < 0 || want.nsec >= 1_000_000_000 then return Err(EINVAL)
     val left_at = regs[1]
-    if left_at != 0 && !mm.user_range(&p.space, left_at, 8, true) then return Err(EFAULT)
-    val deadline = timer.now_ms() + (regs[0] + 999_999) / 1_000_000
+    if left_at != 0 && !mm.user_range(&p.space, left_at, u64(sizeof(Timespec)), true) then return Err(EFAULT)
+    val deadline = timer.now_ms() + u64(want.sec) * 1000 + (u64(want.nsec) + 999_999) / 1_000_000
     if sched.nap_until(p, deadline) then return Ok(0)
     if left_at != 0
         val now = timer.now_ms()
-        var left: u64 = if now < deadline then (deadline - now) * 1_000_000 else 0
+        val ms = if now < deadline then deadline - now else 0
+        var left = Timespec(i64(ms / 1000), i64(ms % 1000) * 1_000_000)
         val b: *u8 = ptr_cast(&left)
-        if !mm.copy_to_user(&p.space, left_at, b[0..<8]) then return Err(EFAULT)
+        if !mm.copy_to_user(&p.space, left_at, b[0..<sizeof(Timespec)]) then return Err(EFAULT)
     Err(EINTR)
 
 // procs(*ProcInfo, count) -> how many it filled: the process table, at most `count` of it.

@@ -8,13 +8,14 @@ module keel.user
 // for a `main(args: []string)`, turns the pair into the slice and calls it — and ends the process with
 // whatever `main` answered.
 
-import abi.keel.abi.{ANY_CHILD, EACCES, EINVAL, ENOENT, EPERM, Errno, ExitStatus, NO_FD, STDOUT, SYS_BRK, SYS_CLOSE, SYS_EXIT, SYS_FSTAT,
-    SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN,
-    SYS_STAT, SYS_SYNC, SYS_UNLINK, SYS_WAIT, SYS_WRITE, Stat, SYS_SOCKET, SYS_BIND, SYS_RECVFROM, SYS_SENDTO,
-    SYS_SOCKCLOSE, SockAddr, SYS_PIPE, SYS_DUP2, SYS_DUP,
-    SpawnAttr, SYS_FORK, EINTR, ESRCH, ProcInfo, SPAWN_FOREGROUND, SPAWN_SETPGROUP, SigAction,
-    SYS_GETPGID, SYS_KILL, SYS_NANOSLEEP, SYS_PROCS, SYS_SETPGID, SYS_SIGACTION, SYS_SIGPROCMASK, SYS_TCGETPGRP,
-    SYS_TCSETPGRP, WNOHANG}
+import abi.keel.abi.{AF_INET, ANY_CHILD, AT_FDCWD, AT_REMOVEDIR, EACCES, EINTR, EINVAL, ENAMETOOLONG, ENOENT, EPERM,
+    ESRCH, Errno, ExitStatus, NO_FD, PATH_ROOM, ProcInfo, SA_RESTORER, SIGCHLD, SIGSET_SIZE, SOCK_DGRAM, SOL_SOCKET,
+    SO_RCVTIMEO, SPAWN_FOREGROUND, SPAWN_SETPGROUP, STDOUT, SYS_BIND, SYS_BRK, SYS_CLONE, SYS_CLOSE, SYS_DUP, SYS_DUP3,
+    SYS_EXIT, SYS_FSTAT, SYS_GETDENTS64, SYS_GETPGID, SYS_GETPID, SYS_GETPPID, SYS_IOCTL, SYS_KILL, SYS_LSEEK,
+    SYS_MKDIRAT, SYS_NANOSLEEP, SYS_NEWFSTATAT, SYS_OPENAT, SYS_PIPE2, SYS_PROCS, SYS_READ, SYS_RECVFROM,
+    SYS_RENAMEAT, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK, SYS_SENDTO, SYS_SETPGID, SYS_SETSOCKOPT, SYS_SOCKET,
+    SYS_SPAWN, SYS_SYNC, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE, SigAction, SockAddrIn, SpawnAttr, Stat, TIOCGPGRP,
+    TIOCSPGRP, Timespec, Timeval, WNOHANG, empty_stat, sock_addr_in}
 import sysl.buf.{Buf, buf}
 import sysl.slices.{as_mut_ptr, as_ptr}
 
@@ -154,7 +155,27 @@ private addr(b: []const u8) -> u64 = u64(usize(as_ptr(b)))
 
 private len(b: []const u8) -> u64 = u64(b.len)
 
-open(path: string, flags: u64) -> Result[u64, Errno] = answer(call(SYS_OPEN, addr(path.bytes), len(path.bytes), flags, 0))
+// A path as the kernel takes one: its bytes and a NUL, in a buffer of PATH_ROOM; ENAMETOOLONG when that
+// does not hold them.
+private struct CPath
+    bytes: [PATH_ROOM]u8
+
+    at(*self) -> u64 = u64(usize(&self.bytes[0]))
+end CPath
+
+private c_path(path: string) -> Result[CPath, Errno]
+    if u64(path.bytes.len) >= PATH_ROOM then return Err(ENAMETOOLONG)
+    var c = CPath([0; PATH_ROOM])
+    for i in 0..<path.bytes.len
+        c.bytes[i] = path.bytes[i]
+    Ok(c)
+
+private const CWD: u64 = u64(AT_FDCWD)
+
+// Open `path` with `flags` (keel.abi's O_*); a file O_CREAT makes is 0o666 less the kernel's UMASK.
+open(path: string, flags: u64) -> Result[u64, Errno]
+    var c = c_path(path)?
+    answer(call(SYS_OPENAT, CWD, c.at(), flags, 0o666))
 
 read(fd: u64, into: []u8) -> Result[u64, Errno] = answer(call(SYS_READ, fd, u64(usize(as_mut_ptr(into))), u64(into.len), 0))
 
@@ -166,27 +187,37 @@ close(fd: u64) -> Result[unit, Errno] = done(call(SYS_CLOSE, fd, 0, 0, 0))
 lseek(fd: u64, offset: i64, whence: u64) -> Result[u64, Errno] = answer(call(SYS_LSEEK, fd, u64(offset), whence, 0))
 
 fstat(fd: u64) -> Result[Stat, Errno]
-    var s = Stat(0, 0, 0, 0, 0, 0, 0)
+    var s = empty_stat()
     done(call(SYS_FSTAT, fd, u64(usize(&s)), 0, 0))?
     Ok(s)
 
 stat(path: string) -> Result[Stat, Errno]
-    var s = Stat(0, 0, 0, 0, 0, 0, 0)
-    done(call(SYS_STAT, addr(path.bytes), len(path.bytes), u64(usize(&s)), 0))?
+    var c = c_path(path)?
+    var s = empty_stat()
+    done(call(SYS_NEWFSTATAT, CWD, c.at(), u64(usize(&s)), 0))?
     Ok(s)
 
-mkdir(path: string) -> Result[unit, Errno] = done(call(SYS_MKDIR, addr(path.bytes), len(path.bytes), 0, 0))
+// A directory, 0o777 less the kernel's UMASK.
+mkdir(path: string) -> Result[unit, Errno]
+    var c = c_path(path)?
+    done(call(SYS_MKDIRAT, CWD, c.at(), 0o777, 0))
 
-// As many whole directory entries (keel.abi's `Dirent`) as fit in `into`; 0 bytes at the end.
+// As many whole `linux_dirent64` records as fit in `into`; 0 bytes at the end.
 getdents(fd: u64, into: []u8) -> Result[u64, Errno] =
-    answer(call(SYS_GETDENTS, fd, u64(usize(as_mut_ptr(into))), u64(into.len), 0))
+    answer(call(SYS_GETDENTS64, fd, u64(usize(as_mut_ptr(into))), u64(into.len), 0))
 
-unlink(path: string) -> Result[unit, Errno] = done(call(SYS_UNLINK, addr(path.bytes), len(path.bytes), 0, 0))
+unlink(path: string) -> Result[unit, Errno]
+    var c = c_path(path)?
+    done(call(SYS_UNLINKAT, CWD, c.at(), 0, 0))
 
-rmdir(path: string) -> Result[unit, Errno] = done(call(SYS_RMDIR, addr(path.bytes), len(path.bytes), 0, 0))
+rmdir(path: string) -> Result[unit, Errno]
+    var c = c_path(path)?
+    done(call(SYS_UNLINKAT, CWD, c.at(), AT_REMOVEDIR, 0))
 
-rename(from: string, to: string) -> Result[unit, Errno] =
-    done(call(SYS_RENAME, addr(from.bytes), len(from.bytes), addr(to.bytes), len(to.bytes)))
+rename(from: string, to: string) -> Result[unit, Errno]
+    var a = c_path(from)?
+    var b = c_path(to)?
+    done(call(SYS_RENAMEAT, CWD, a.at(), CWD, b.at()))
 
 sync() -> Result[unit, Errno] = done(call(SYS_SYNC, 0, 0, 0, 0))
 
@@ -241,11 +272,15 @@ spawn(path: string, args: []const string, stdin: u64 = NO_FD, stdout: u64 = NO_F
 // A pipe: its read end's descriptor, then its write end's.
 pipe() -> Result[(u64, u64), Errno]
     var fds: [2]u32 = [0, 0]
-    done(call(SYS_PIPE, u64(usize(&fds[0])), 0, 0, 0))?
+    done(call(SYS_PIPE2, u64(usize(&fds[0])), 0, 0, 0))?
     Ok((u64(fds[0]), u64(fds[1])))
 
-// Make descriptor `new` stand for what `old` does, closing what `new` held first.
-dup2(old: u64, new: u64) -> Result[u64, Errno] = answer(call(SYS_DUP2, old, new, 0, 0))
+// Make descriptor `new` stand for what `old` does, closing what `new` held first; `new` == `old` changes
+// nothing, once `old` is known to be open (dup3 refuses the same two, so a `dup` asks).
+dup2(old: u64, new: u64) -> Result[u64, Errno]
+    if old != new then return answer(call(SYS_DUP3, old, new, 0, 0))
+    close(dup(old)?)?
+    Ok(new)
 
 // A second descriptor, the lowest free one, standing for what `old` does.
 dup(old: u64) -> Result[u64, Errno] = answer(call(SYS_DUP, old, 0, 0, 0))
@@ -256,14 +291,14 @@ const NEW_GROUP: u64 = 0xffff_ffff_ffff_ffff
 
 // Wait for a child to end — `pid`, or any one for ANY_CHILD — and answer which, and how.
 wait(pid: i64 = ANY_CHILD) -> Result[(u64, ExitStatus), Errno]
-    var s = ExitStatus(0, 0)
-    val child = answer(call(SYS_WAIT, u64(pid), u64(usize(&s)), 0, 0))?
+    var s = ExitStatus(0)
+    val child = answer(call(SYS_WAIT4, u64(pid), u64(usize(&s)), 0, 0))?
     Ok((child, s))
 
 // The same without waiting: None while the child (or every child, for ANY_CHILD) is still running.
 poll(pid: i64 = ANY_CHILD) -> Result[Option[(u64, ExitStatus)], Errno]
-    var s = ExitStatus(0, 0)
-    val child = answer(call(SYS_WAIT, u64(pid), u64(usize(&s)), WNOHANG, 0))?
+    var s = ExitStatus(0)
+    val child = answer(call(SYS_WAIT4, u64(pid), u64(usize(&s)), WNOHANG, 0))?
     if child == 0 then return Ok(None)
     Ok(Some((child, s)))
 
@@ -273,9 +308,9 @@ getppid() -> u64 = u64(call(SYS_GETPPID, 0, 0, 0, 0))
 // the same call with a copy-on-write copy of the parent's memory, its descriptors, directory and
 // environment. The standard library has `exec` but deliberately no `fork`, which belongs to a runtime
 // that owns every thread and every count there is — this one.
-fork() -> Result[u64, Errno] = answer(call(SYS_FORK, 0, 0, 0, 0))
+fork() -> Result[u64, Errno] = answer(call(SYS_CLONE, SIGCHLD, 0, 0, 0))
 
-// A system call of six arguments: `execve` and `sigaction` need the sixth.
+// A system call of six arguments: `sendto` and `recvfrom` need the sixth.
 private call6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64
     var r: i64 = 0
     asm
@@ -308,14 +343,14 @@ describe(e: Errno) -> string = e match
 // foreground reach them through keel.fsys's hooks; a program that wants a handler of its own, a mask or
 // `setpgid` calls these directly.
 //
-// The restorer every handler returns to: it makes `sigreturn`, which puts back the registers the
-// signal interrupted (keel.abi's `SigFrame`). Linux's `sa_restorer`, kept in the runtime rather than
-// the kernel, so the kernel never writes code into a process.
+// The restorer every handler returns to: it makes `rt_sigreturn` (139), which puts back the registers
+// the signal interrupted (keel.abi's `SigFrame`). Linux's `sa_restorer`, kept in the runtime rather
+// than the kernel, so the kernel never writes code into a process.
 asm
     [aarch64]
         ".globl keel_sigreturn_trampoline"
         "keel_sigreturn_trampoline:"
-        "mov x8, #43"
+        "mov x8, #139"
         "svc #0"
         "brk #2"
     [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
@@ -323,21 +358,24 @@ asm
 extern keel_sigreturn_trampoline: u8
 
 // Set `sig`'s action — SIG_DFL, SIG_IGN, or the address of a handler `(sig: u64)`, which runs with
-// `mask` blocked as well as `sig` — and answer the action it replaces. `flags` is SA_RESTART or 0.
+// `mask` (a set, keel.abi's `sig_bit`s) blocked as well as `sig` — and answer the action it replaces.
+// `flags` is SA_RESTART or 0; SA_RESTORER and the restorer are added here.
 sigaction(sig: u64, handler: u64, mask: u64 = 0, flags: u64 = 0) -> Result[SigAction, Errno]
     var old = SigAction(0, 0, 0, 0)
-    val restorer = u64(usize(&keel_sigreturn_trampoline))
-    done(call6(SYS_SIGACTION, sig, handler, mask, restorer, u64(usize(&old)), flags))?
+    var a = SigAction(handler, flags | SA_RESTORER, u64(usize(&keel_sigreturn_trampoline)), mask)
+    done(call(SYS_RT_SIGACTION, sig, u64(usize(&a)), u64(usize(&old)), SIGSET_SIZE))?
     Ok(old)
 
 // Put back an action `sigaction` answered, exactly as it was.
-restore_action(sig: u64, a: SigAction) -> Result[unit, Errno] =
-    done(call6(SYS_SIGACTION, sig, a.handler, a.mask, a.restorer, 0, a.flags))
+restore_action(sig: u64, a: SigAction) -> Result[unit, Errno]
+    var given = a
+    done(call(SYS_RT_SIGACTION, sig, u64(usize(&given)), 0, SIGSET_SIZE))
 
 // Change the blocked set (`how`: SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK) and answer what it was.
 sigprocmask(how: u64, set: u64) -> Result[u64, Errno]
+    var given = set
     var old: u64 = 0
-    done(call(SYS_SIGPROCMASK, how, set, u64(usize(&old)), 0))?
+    done(call(SYS_RT_SIGPROCMASK, how, u64(usize(&given)), u64(usize(&old)), SIGSET_SIZE))?
     Ok(old)
 
 // Send `sig` to process `pid`, to the caller's group for 0, to group `g` for -g.
@@ -347,17 +385,24 @@ setpgid(pid: u64, pgid: u64) -> Result[unit, Errno] = done(call(SYS_SETPGID, pid
 
 getpgid(pid: u64 = 0) -> Result[u64, Errno] = answer(call(SYS_GETPGID, pid, 0, 0, 0))
 
-// The console's foreground process group, which Ctrl-C signals; `fd` must be the console.
-tcsetpgrp(fd: u64, pgid: u64) -> Result[unit, Errno] = done(call(SYS_TCSETPGRP, fd, pgid, 0, 0))
+// The console's foreground process group, which Ctrl-C signals; `fd` must be the console. Linux's
+// TIOCSPGRP and TIOCGPGRP.
+tcsetpgrp(fd: u64, pgid: u64) -> Result[unit, Errno]
+    var g = u32(pgid)
+    done(call(SYS_IOCTL, fd, TIOCSPGRP, u64(usize(&g)), 0))
 
-tcgetpgrp(fd: u64) -> Result[u64, Errno] = answer(call(SYS_TCGETPGRP, fd, 0, 0, 0))
+tcgetpgrp(fd: u64) -> Result[u64, Errno]
+    var g: u32 = 0
+    done(call(SYS_IOCTL, fd, TIOCGPGRP, u64(usize(&g)), 0))?
+    Ok(u64(g))
 
 // Sleep `nanos` nanoseconds (the kernel's tick is 10 ms). Err(EINTR) and what was left if a signal
 // ended it first.
 nanosleep(nanos: u64) -> Result[unit, (Errno, u64)]
-    var left: u64 = 0
-    val r = call(SYS_NANOSLEEP, nanos, u64(usize(&left)), 0, 0)
-    if r < 0 then return Err((Errno(-r), left))
+    var want = Timespec(i64(nanos / 1_000_000_000), i64(nanos % 1_000_000_000))
+    var left = Timespec(0, 0)
+    val r = call(SYS_NANOSLEEP, u64(usize(&want)), u64(usize(&left)), 0, 0)
+    if r < 0 then return Err((Errno(-r), u64(left.sec) * 1_000_000_000 + u64(left.nsec)))
     Ok(())
 
 // Every process in the kernel's table.
@@ -371,35 +416,42 @@ procs() -> Result[Buf[ProcInfo], Errno]
 
 // --- UDP sockets -----------------------------------------------------------------------------------
 //
-// keel.abi's socket calls, as they are: a socket is a number, an address a `SockAddr`. A program
-// written with `sysl.net` reaches them through keel.fsys's hooks instead.
+// keel.abi's socket calls, as they are: a socket is a descriptor (`close` closes it), an address a
+// `SockAddrIn`. A program written with `sysl.net` reaches them through keel.fsys's hooks instead.
 
-socket() -> Result[u64, Errno] = answer(call(SYS_SOCKET, 0, 0, 0, 0))
+// A UDP socket.
+socket() -> Result[u64, Errno] = answer(call(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0, 0))
 
-bind(sd: u64, port: u16) -> Result[unit, Errno] = done(call(SYS_BIND, sd, u64(port), 0, 0))
+bind(fd: u64, port: u16) -> Result[unit, Errno]
+    var at = sock_addr_in(0, port)
+    done(call(SYS_BIND, fd, u64(usize(&at)), u64(sizeof(SockAddrIn)), 0))
 
-// The oldest datagram for `sd`, cut to fit `into`: its length and its sender. Waits up to `timeout_ms`
-// (0: for ever), then ETIMEDOUT.
-recvfrom(sd: u64, into: []u8, timeout_ms: u64) -> Result[(u64, SockAddr), Errno]
-    var from = SockAddr(0, 0, 0)
-    val n = answer(call5(SYS_RECVFROM, sd, u64(usize(as_mut_ptr(into))), u64(into.len), u64(usize(&from)),
-        timeout_ms))?
+// How long `recvfrom` waits before EAGAIN: SO_RCVTIMEO, in milliseconds (0: for ever).
+receive_timeout(fd: u64, ms: u64) -> Result[unit, Errno]
+    var t = Timeval(i64(ms / 1000), i64(ms % 1000) * 1000)
+    done(call6(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_RCVTIMEO, u64(usize(&t)), u64(sizeof(Timeval)), 0))
+
+// The oldest datagram for `fd`, cut to fit `into`: its length and its sender.
+recvfrom(fd: u64, into: []u8) -> Result[(u64, SockAddrIn), Errno]
+    var from = sock_addr_in(0, 0)
+    var from_len = u32(sizeof(SockAddrIn))
+    val n = answer(call6(SYS_RECVFROM, fd, u64(usize(as_mut_ptr(into))), u64(into.len), 0, u64(usize(&from)),
+        u64(usize(&from_len))))?
     Ok((n, from))
 
-sendto(sd: u64, bytes: []const u8, to: SockAddr) -> Result[u64, Errno] =
-    answer(call(SYS_SENDTO, sd, addr(bytes), len(bytes), u64(usize(&to))))
-
-sockclose(sd: u64) -> Result[unit, Errno] = done(call(SYS_SOCKCLOSE, sd, 0, 0, 0))
+sendto(fd: u64, bytes: []const u8, to: SockAddrIn) -> Result[u64, Errno]
+    var at = to
+    answer(call6(SYS_SENDTO, fd, addr(bytes), len(bytes), 0, u64(usize(&at)), u64(sizeof(SockAddrIn))))
 
 // A system call of up to four arguments, its answer exactly as the kernel gave it: the result, or a
 // negative error number. For a caller that turns the number into something of its own (keel.fsys
 // turns it into an `IoError`'s code).
 syscall(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 = call(nr, a0, a1, a2, a3)
 
-// The same for a call of five arguments (spawn).
+// The same for a call of five arguments (spawn, fchownat).
 syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 = call5(nr, a0, a1, a2, a3, a4)
 
-// The same for a call of six arguments (execve, which keel.fsys's `exec` hook makes).
+// The same for a call of six arguments (sendto, recvfrom).
 syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 = call6(nr, a0, a1, a2, a3, a4, a5)
 
 // Write a string to standard output, all of it unless the kernel refuses.

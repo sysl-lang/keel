@@ -7,16 +7,18 @@ module keel.fsys
 //
 // Every hook answers as a system call does — zero or more for success, the code of the `IoError` the
 // call failed with negated for an error — and `status` is the one place a kernel's error number becomes
-// such a code. Paths cross as they arrive — a pointer and a length is what both sysl.fs and keel's
-// calls take — and so does a descriptor. What keel has no call for (links, a temporary directory)
-// answers `sysl.sys.UNSUPPORTED`, which `sysl.fs` reports as "not supported on this target".
+// such a code. A path arrives from sysl.fs as a pointer and a length and goes to keel's calls, which are
+// Linux's, NUL-terminated: copied into a bounded buffer first (`c_path`), ENAMETOOLONG past it. A
+// descriptor crosses as it is. What keel has no call for (links, a temporary directory) answers
+// `sysl.sys.UNSUPPORTED`, which `sysl.fs` reports as "not supported on this target".
 
-import abi.keel.abi.{EACCES, EBADF, EEXIST, EINTR, EISDIR, EMFILE, ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EPERM,
-    Errno, SPAWN_FOREGROUND, SPAWN_SETPGROUP, SYS_GETPGID, SYS_KILL, SYS_PIPE, SYS_TCGETPGRP, SYS_TCSETPGRP,
-    ExitStatus, KIND_DIR, NO_FD, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, SYS_ACCESS, SYS_CHDIR, SYS_CHMOD,
-    SYS_CHOWN, SYS_CLOSE, SYS_EXECVE, SYS_GETGID, SYS_GETUID, SYS_SETGID, SYS_SETUID,
-    SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ, SYS_RENAME,
-    SYS_RMDIR, SYS_SPAWN, SYS_STAT, SYS_TRUNCATE, SYS_UNLINK, SYS_WAIT, SYS_WRITE, SpawnAttr}
+import abi.keel.abi.{AT_FDCWD, AT_REMOVEDIR, DIRENT64_NAME, EACCES, EBADF, EEXIST, EINTR, EISDIR, EMFILE, ENAMETOOLONG,
+    ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EPERM, Errno, ExitStatus, NO_FD, O_APPEND, O_CREAT, O_DIRECTORY,
+    O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PATH_ROOM, SPAWN_FOREGROUND, SPAWN_SETPGROUP, SYS_CHDIR, SYS_CLOSE,
+    SYS_EXECVE, SYS_FACCESSAT, SYS_FCHMODAT, SYS_FCHOWNAT, SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS64,
+    SYS_GETGID, SYS_GETPGID, SYS_GETUID, SYS_IOCTL, SYS_KILL, SYS_LSEEK, SYS_MKDIRAT, SYS_NEWFSTATAT, SYS_OPENAT,
+    SYS_PIPE2, SYS_READ, SYS_RENAMEAT, SYS_SETGID, SYS_SETUID, SYS_SPAWN, SYS_TRUNCATE, SYS_UNLINKAT, SYS_WAIT4,
+    SYS_WRITE, SpawnAttr, Stat, TIOCGPGRP, TIOCSPGRP, empty_stat}
 import rt.keel.user.{environment, flush, syscall, syscall5, syscall6}
 import sysl.buf.{Buf, buf}
 import sysl.fs.IoError
@@ -57,8 +59,26 @@ private code_of(e: Errno) -> int = e match
 
 private addr(p: *u8) -> u64 = u64(usize(p))
 
-// `sysl.fs`'s `open_*` bits as keel's (Linux's) `O_*` flags. The permission bits a new file asks for
-// are not passed: keel gives every new file 0o644.
+// A path as keel's calls take it: the bytes and a NUL, in a buffer of PATH_ROOM.
+private struct CPath
+    bytes: [PATH_ROOM]u8
+
+    at(*self) -> u64 = u64(usize(&self.bytes[0]))
+end CPath
+
+// `len` bytes at `path` with a NUL after them; None when they do not fit (TOO_LONG is the hook's answer).
+private c_path(path: *u8, len: usize) -> Option[CPath]
+    if u64(len) >= PATH_ROOM then return None
+    var c = CPath([0; PATH_ROOM])
+    for i in 0..<len
+        c.bytes[i] = path[i]
+    Some(c)
+
+private too_long() -> int = status(-i64(ENAMETOOLONG))
+
+private const CWD: u64 = u64(AT_FDCWD)
+
+// `sysl.fs`'s `open_*` bits as keel's (Linux's) `O_*` flags.
 private open_flags(flags: u32) -> u64
     val read = (flags & fsys.open_read) != 0
     val write = (flags & fsys.open_write) != 0
@@ -70,7 +90,10 @@ private open_flags(flags: u32) -> u64
 
 @export("sysl_fs_open")
 open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int
-    val r = syscall(SYS_OPEN, addr(path), u64(len), open_flags(flags), 0)
+    var c = c_path(path, len) match
+        Some(c) -> c
+        None -> return too_long()
+    val r = syscall(SYS_OPENAT, CWD, c.at(), open_flags(flags), u64(mode))
     if r >= 0 then *fd = int(r)
     status(r)
 
@@ -98,7 +121,7 @@ seek(fd: int, offset: long, whence: int, at: *long) -> int
 
 @export("sysl_fs_fstat")
 fstat(fd: int, out: *fsys.Stat) -> int
-    var s = Stat(0, 0, 0, 0, 0, 0, 0)
+    var s = empty_stat()
     val r = syscall(SYS_FSTAT, u64(fd), u64(usize(&s)), 0, 0)
     if r >= 0 then *out = converted(s)
     status(r)
@@ -106,57 +129,92 @@ fstat(fd: int, out: *fsys.Stat) -> int
 @export("sysl_fs_ftruncate")
 ftruncate(fd: int, length: long) -> int = status(syscall(SYS_FTRUNCATE, u64(fd), u64(length), 0, 0))
 
-// keel's 32-byte `Stat` as `sysl.fs`'s thirteen numbers: the mode is POSIX's already, type bits and
-// all, and so are the owner and group (`Meta.owner`, `Meta.group`); keel keeps no devices or times, so
-// those stay zero.
+// Linux's `struct stat` as `sysl.fs`'s thirteen numbers: the mode is POSIX's, type bits and all, and so
+// are the owner and group (`Meta.owner`, `Meta.group`); keel keeps no devices or times, so those stay
+// zero.
 private converted(s: Stat) -> fsys.Stat
-    fsys.Stat(long(s.size), long(s.mode), long(s.links), long(s.uid), long(s.gid), long(s.ino), 0, 0, 0, 0, 0, 0, 0)
+    fsys.Stat(long(s.size), long(s.mode), long(s.nlink), long(s.uid), long(s.gid), long(s.ino), 0, 0, 0, 0, 0, 0, 0)
 
 // --- Paths -----------------------------------------------------------------------------------------
 
 // keel has no symbolic links, so `follow` changes nothing.
 @export("sysl_fs_stat")
 stat(path: *u8, len: usize, follow: int, out: *fsys.Stat) -> int
-    var s = Stat(0, 0, 0, 0, 0, 0, 0)
-    val r = syscall(SYS_STAT, addr(path), u64(len), u64(usize(&s)), 0)
+    var c = c_path(path, len) match
+        Some(c) -> c
+        None -> return too_long()
+    var s = empty_stat()
+    val r = syscall(SYS_NEWFSTATAT, CWD, c.at(), u64(usize(&s)), 0)
     if r >= 0 then *out = converted(s)
     status(r)
 
 @export("sysl_fs_truncate")
-truncate(path: *u8, len: usize, length: long) -> int =
-    status(syscall(SYS_TRUNCATE, addr(path), u64(len), u64(length), 0))
+truncate(path: *u8, len: usize, length: long) -> int
+    var c = c_path(path, len) match
+        Some(c) -> c
+        None -> return too_long()
+    status(syscall(SYS_TRUNCATE, c.at(), u64(length), 0, 0))
 
 @export("sysl_fs_mkdir")
-mkdir(path: *u8, len: usize, mode: u32) -> int = status(syscall(SYS_MKDIR, addr(path), u64(len), 0, 0))
+mkdir(path: *u8, len: usize, mode: u32) -> int
+    var c = c_path(path, len) match
+        Some(c) -> c
+        None -> return too_long()
+    status(syscall(SYS_MKDIRAT, CWD, c.at(), u64(mode), 0))
 
 @export("sysl_fs_rmdir")
-rmdir(path: *u8, len: usize) -> int = status(syscall(SYS_RMDIR, addr(path), u64(len), 0, 0))
+rmdir(path: *u8, len: usize) -> int
+    var c = c_path(path, len) match
+        Some(c) -> c
+        None -> return too_long()
+    status(syscall(SYS_UNLINKAT, CWD, c.at(), AT_REMOVEDIR, 0))
 
 @export("sysl_fs_unlink")
-unlink(path: *u8, len: usize) -> int = status(syscall(SYS_UNLINK, addr(path), u64(len), 0, 0))
+unlink(path: *u8, len: usize) -> int
+    var c = c_path(path, len) match
+        Some(c) -> c
+        None -> return too_long()
+    status(syscall(SYS_UNLINKAT, CWD, c.at(), 0, 0))
 
 @export("sysl_fs_rename")
-rename(from: *u8, from_len: usize, to: *u8, to_len: usize) -> int =
-    status(syscall(SYS_RENAME, addr(from), u64(from_len), addr(to), u64(to_len)))
+rename(from: *u8, from_len: usize, to: *u8, to_len: usize) -> int
+    var a = c_path(from, from_len) match
+        Some(c) -> c
+        None -> return too_long()
+    var b = c_path(to, to_len) match
+        Some(c) -> c
+        None -> return too_long()
+    status(syscall(SYS_RENAMEAT, CWD, a.at(), CWD, b.at()))
 
 @export("sysl_fs_access")
-access(path: *u8, len: usize, how: int) -> int = status(syscall(SYS_ACCESS, addr(path), u64(len), u64(how), 0))
+access(path: *u8, len: usize, how: int) -> int
+    var c = c_path(path, len) match
+        Some(c) -> c
+        None -> return too_long()
+    status(syscall(SYS_FACCESSAT, CWD, c.at(), u64(how), 0))
 
-// `set_permissions`: keel's chmod takes the set-user-ID and rwx bits, which is all a keel mode has;
+// `set_permissions`: keel's fchmodat takes the set-user-ID and rwx bits, which is all a keel mode has;
 // setgid and sticky are refused as EINVAL, which reaches the program as an `Other(22)`.
 @export("sysl_fs_chmod")
-chmod(path: *u8, len: usize, mode: u32) -> int = status(syscall(SYS_CHMOD, addr(path), u64(len), u64(mode), 0))
+chmod(path: *u8, len: usize, mode: u32) -> int
+    var c = c_path(path, len) match
+        Some(c) -> c
+        None -> return too_long()
+    status(syscall(SYS_FCHMODAT, CWD, c.at(), u64(mode), 0))
 
-// `set_owner`: keel's chown (35), root only; an id past 16 bits is EINVAL.
+// `set_owner`: keel's fchownat, root only; an id past 16 bits is EINVAL.
 @export("sysl_fs_chown")
-chown(path: *u8, len: usize, owner: u32, group: u32) -> int =
-    status(syscall(SYS_CHOWN, addr(path), u64(len), u64(owner), u64(group)))
+chown(path: *u8, len: usize, owner: u32, group: u32) -> int
+    var c = c_path(path, len) match
+        Some(c) -> c
+        None -> return too_long()
+    status(syscall5(SYS_FCHOWNAT, CWD, c.at(), u64(owner), u64(group), 0))
 
 // --- Directories -----------------------------------------------------------------------------------
 
-// An open directory: its descriptor, and the whole `Dirent` records the last `getdents` handed back,
-// taken one at a time. A stream is a slot of a fixed table, and the `usize` sysl.fs holds is the slot's
-// number plus one, so zero is never a stream.
+// An open directory: its descriptor, and the whole `linux_dirent64` records the last `getdents64`
+// handed back, taken one at a time. A stream is a slot of a fixed table, and the `usize` sysl.fs holds
+// is the slot's number plus one, so zero is never a stream.
 private struct Stream
     fd: u64                     // 0 for a free slot: descriptor 0 is the console, never a directory
     held: usize                 // bytes of records in `records`
@@ -164,9 +222,9 @@ private struct Stream
     records: [RECORDS]u8
 
 private const STREAMS: usize = 8
-private const RECORDS: usize = 512              // 16 records of keel.abi's 32-byte `Dirent`
-private const RECORD: usize = 32
-private const NAME_AT: usize = 8                // a `Dirent`'s `name`; its length is the byte at 4
+private const RECORDS: usize = 512              // at least ten records of at most 48 bytes
+private const RECLEN_AT: usize = 16             // a record's length, a little-endian u16
+private const NAME_AT: usize = usize(DIRENT64_NAME)   // its name, which ends in a NUL
 
 private var streams: [STREAMS]Stream
 
@@ -176,13 +234,11 @@ opendir(path: *u8, len: usize, dir: *usize) -> int
     while slot < STREAMS && streams[slot].fd != 0
         slot += 1
     if slot == STREAMS then return -IoError.TooManyOpenFiles.code()
-    val fd = syscall(SYS_OPEN, addr(path), u64(len), O_RDONLY, 0)
+    var c = c_path(path, len) match
+        Some(c) -> c
+        None -> return too_long()
+    val fd = syscall(SYS_OPENAT, CWD, c.at(), O_RDONLY | O_DIRECTORY, 0)
     if fd < 0 then return status(fd)
-    var s = Stat(0, 0, 0, 0, 0, 0, 0)
-    val r = syscall(SYS_FSTAT, u64(fd), u64(usize(&s)), 0, 0)
-    if r < 0 || s.kind != KIND_DIR
-        val _ = syscall(SYS_CLOSE, u64(fd), 0, 0, 0)
-        return if r < 0 then status(r) else -IoError.NotADirectory.code()
     streams[slot].fd = u64(fd)
     streams[slot].held = 0
     streams[slot].at = 0
@@ -194,18 +250,20 @@ readdir(dir: usize, into: *u8, room: usize, got: *usize) -> int
     if dir == 0 || dir > STREAMS || streams[dir - 1].fd == 0 then return -IoError.NotOpen.code()
     val s = &streams[dir - 1]
     if s.at >= s.held
-        val r = syscall(SYS_GETDENTS, s.fd, u64(usize(&s.records[0])), u64(RECORDS), 0)
+        val r = syscall(SYS_GETDENTS64, s.fd, u64(usize(&s.records[0])), u64(RECORDS), 0)
         if r < 0 then return status(r)
         s.held = usize(r)
         s.at = 0
         if r == 0
             *got = 0
             return 0
-    val n = usize(s.records[s.at + 4])
+    var n: usize = 0
+    while s.records[s.at + NAME_AT + n] != 0
+        n += 1
     val take = if n < room then n else room
     for i in 0..<take
         into[i] = s.records[s.at + NAME_AT + i]
-    s.at += RECORD
+    s.at += usize(s.records[s.at + RECLEN_AT]) | (usize(s.records[s.at + RECLEN_AT + 1]) << 8)
     *got = take
     0
 
@@ -218,12 +276,22 @@ closedir(dir: usize) -> int
 
 @export("sysl_fs_getcwd")
 getcwd(into: *u8, room: usize, got: *usize) -> int
-    val r = syscall(SYS_GETCWD, addr(into), u64(room), 0, 0)
-    if r >= 0 then *got = usize(r)
-    status(r)
+    var whole: [PATH_ROOM]u8 = [0; PATH_ROOM]
+    val r = syscall(SYS_GETCWD, u64(usize(&whole[0])), PATH_ROOM, 0, 0)
+    if r < 0 then return status(r)
+    val n = usize(r) - 1
+    if n > room then return status(-i64(Errno.ERANGE))
+    for i in 0..<n
+        into[i] = whole[i]
+    *got = n
+    0
 
 @export("sysl_fs_chdir")
-chdir(path: *u8, len: usize) -> int = status(syscall(SYS_CHDIR, addr(path), u64(len), 0, 0))
+chdir(path: *u8, len: usize) -> int
+    var c = c_path(path, len) match
+        Some(c) -> c
+        None -> return too_long()
+    status(syscall(SYS_CHDIR, c.at(), 0, 0, 0))
 
 @export("sysl_fs_temp_dir")
 temp_dir(prefix: *u8, len: usize, into: *u8, room: usize, got: *usize) -> int = UNSUPPORTED
@@ -268,8 +336,8 @@ io_flush(fd: int) -> int
 
 // --- sysl.process: the hooks of `sysl.process.sys` -------------------------------------------------
 //
-// keel's spawn (22), wait (23), the user calls (30-33), pipe (36), execve (40), kill (44), getpgid (46),
-// tcsetpgrp (47) and tcgetpgrp (48). The child's three standard streams and its environment go
+// keel's own spawn (1024), and Linux's wait4, getuid, getgid, setuid, setgid, pipe2, execve, kill,
+// getpgid and the console's ioctls. The child's three standard streams and its environment go
 // to keel's spawn as they are asked for; wait's POSIX status becomes an exit code or a signal. What it
 // cannot be told — a starting directory (the child takes the caller's) — answers `UNSUPPORTED` rather
 // than being dropped; so do a bounded wait and a temporary file.
@@ -344,7 +412,7 @@ private path_of_env(env: []const u8) -> []const u8
 // A hook's descriptor as keel's spawn takes it: -1, "this program's own", is NO_FD.
 private fd_of(fd: int) -> u64 = if fd < 0 then NO_FD else u64(fd)
 
-// keel's spawn and execve take the argument vector as each argument followed by a NUL.
+// keel's spawn takes the argument vector as each argument followed by a NUL.
 private packed_args(argv: *psys.Text, argc: usize) -> Buf[u8]
     var packed: Buf[u8] = buf()
     for i in 0..<argc
@@ -366,7 +434,7 @@ private packed_env(envp: *psys.Text, envc: usize, inherit_env: int) -> Buf[u8]
         env.push(0)
     env
 
-// keel's execve (40), which keeps the pid, the descriptors and the directory and answers only when it
+// Linux's execve, which keeps the pid, the descriptors and the directory and answers only when it
 // fails, having checked everything before giving the image up. `print`'s line goes out first: the
 // buffer holding it goes with the image.
 @export("sysl_proc_exec")
@@ -374,13 +442,30 @@ proc_exec(path: *u8, path_len: usize, argv: *psys.Text, argc: usize, envp: *psys
           inherit_env: int) -> int
     val packed = packed_args(argv, argc)
     val env = packed_env(envp, envc, inherit_env)
+    val arg_ptrs = pointers_to(packed.view())
+    val env_ptrs = pointers_to(env.view())
     flush()
     var r = -i64(Errno.ENOENT)
     for c in searched(path, path_len, env.view()).view()
-        r = syscall6(SYS_EXECVE, u64(usize(as_ptr(c.view()))), u64(c.len()), u64(usize(as_ptr(packed.view()))),
-                     u64(packed.len()), u64(usize(as_ptr(env.view()))), u64(env.len()))
+        var named = c
+        named.push(0)
+        r = syscall(SYS_EXECVE, u64(usize(as_ptr(named.view()))), u64(usize(as_ptr(arg_ptrs.view()))),
+                    u64(usize(as_ptr(env_ptrs.view()))), 0)
         if r != -i64(Errno.ENOENT) then break
     if r < 0 then status(r) else -IoError.Other(5).code()
+
+// A pointer to each NUL-ended string of `packed`, then a null one: an `argv` or `envp` as execve takes
+// it. The pointers are into `packed`, which must outlive them.
+private pointers_to(packed: []const u8) -> Buf[u64]
+    var out: Buf[u64] = buf()
+    var at: usize = 0
+    while at < packed.len
+        out.push(u64(usize(as_ptr(packed)) + at))
+        while packed[at] != 0
+            at += 1
+        at += 1
+    out.push(0)
+    out
 
 // keel keeps one user and one group per process, so the real ids are the ones the process acts as.
 @export("sysl_proc_get_id")
@@ -424,8 +509,8 @@ private named_in(e: []const u8, envp: *psys.Text, envc: usize) -> bool
 @export("sysl_proc_wait")
 proc_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int
     if timeout_ms > 0 then return UNSUPPORTED
-    var s = ExitStatus(0, 0)
-    val r = syscall(SYS_WAIT, u64(pid), u64(usize(&s)), 0, 0)
+    var s = ExitStatus(0)
+    val r = syscall(SYS_WAIT4, u64(pid), u64(usize(&s)), 0, 0)
     if r < 0 then return status(r)
     if s.exited()
         *how = psys.ended_exited
@@ -435,7 +520,7 @@ proc_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> in
         *value = int(s.signal())
     0
 
-// kill(2): keel's SYS_KILL, with POSIX's numbering.
+// kill(2), with POSIX's numbering.
 @export("sysl_proc_kill")
 proc_kill(pid: i64, signal: int) -> int
     if signal < 0 then return -IoError.Other(22).code()
@@ -445,12 +530,12 @@ proc_kill(pid: i64, signal: int) -> int
 @export("sysl_proc_temp_path")
 proc_temp_path(into: *u8, room: usize) -> isize = isize(UNSUPPORTED)
 
-// keel's pipe (36). Neither end reaches a child it was not placed in: keel's spawn hands a child only
-// the three streams it names.
+// pipe2. Neither end reaches a child it was not placed in: keel's spawn hands a child only the three
+// streams it names.
 @export("sysl_proc_pipe")
 proc_pipe(read_end: *int, write_end: *int) -> int
     var fds: [2]u32 = [0, 0]
-    val r = syscall(SYS_PIPE, u64(usize(&fds[0])), 0, 0, 0)
+    val r = syscall(SYS_PIPE2, u64(usize(&fds[0])), 0, 0, 0)
     if r < 0 then return status(r)
     *read_end = int(fds[0])
     *write_end = int(fds[1])
@@ -468,9 +553,15 @@ proc_getpgrp() -> i64
 // no terminal to ask about: ENXIO.
 private const ENXIO: int = 6
 
+// TIOCGPGRP on `fd`: the foreground group, or the negative errno.
+private foreground_of(fd: u64) -> i64
+    var g: u32 = 0
+    val r = syscall(SYS_IOCTL, fd, TIOCGPGRP, u64(usize(&g)), 0)
+    if r < 0 then r else i64(g)
+
 private console_fd() -> Option[u64]
     for fd in 0..<3
-        if syscall(SYS_TCGETPGRP, u64(fd), 0, 0, 0) >= 0 then return Some(u64(fd))
+        if foreground_of(u64(fd)) >= 0 then return Some(u64(fd))
     None
 
 @export("sysl_proc_tcgetpgrp")
@@ -478,7 +569,7 @@ proc_tcgetpgrp() -> i64
     val fd = console_fd() match
         Some(f) -> f
         None -> return i64(-IoError.Other(ENXIO).code())
-    val r = syscall(SYS_TCGETPGRP, fd, 0, 0, 0)
+    val r = foreground_of(fd)
     if r < 0 then i64(status(r)) else r
 
 // keel has no stopped state, so a background group's tcsetpgrp earns no SIGTTOU to hold back.
@@ -488,4 +579,5 @@ proc_tcsetpgrp(pgid: i64) -> int
     val fd = console_fd() match
         Some(f) -> f
         None -> return -IoError.Other(ENXIO).code()
-    status(syscall(SYS_TCSETPGRP, fd, u64(pgid), 0, 0))
+    var g = u32(pgid)
+    status(syscall(SYS_IOCTL, fd, TIOCSPGRP, u64(usize(&g)), 0))

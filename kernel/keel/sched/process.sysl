@@ -74,6 +74,7 @@ enum Holds
     File            // `ino`, an inode of the filesystem (keel.fs)
     PipeRead        // `ino` is the pipe's slot (keel.proc's pipe table)
     PipeWrite
+    Socket          // `ino` is the socket's slot in keel.net's table, `offset` its receive timeout in ms
 
 // A descriptor: what it holds, and for a file the flags it was opened with and where the next read or
 // write starts. Plain numbers, so a process can name its files and pipes without this module importing

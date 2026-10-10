@@ -135,6 +135,23 @@ copy_to_user(s: *Space, va: u64, src: []const u8) -> bool
         done += chunk
     true
 
+// Copy a NUL-terminated string in from user address `va` of space `s`, at most `dst.len` bytes with its
+// NUL: Some of its length without the NUL, Some(dst.len) when no NUL came within that many bytes, or None
+// when the bytes before the NUL are not all user memory. Read a page at a time, so a string that ends
+// just before an unmapped page is read without touching it.
+copy_cstr_from_user(s: *Space, va: u64, dst: []u8) -> Option[usize]
+    var done: usize = 0
+    while done < dst.len
+        val a = va + u64(done)
+        if !user_range(s, a, 1, false) then return None
+        val chunk = min_usize(dst.len - done, usize(PAGE_SIZE - (a & (PAGE_SIZE - 1))))
+        val src: *u8 = ptr_cast(usize(u64(to_virt(translated(s, a)))))
+        for i in 0..<chunk
+            dst[done + i] = src[i]
+            if src[i] == 0 then return Some(done + i)
+        done += chunk
+    Some(dst.len)
+
 // Whether all of `len` bytes from `va` are user memory of this space — inside the user range with no
 // wrap around, every page mapped, and writable where `write` asks. A copy-on-write page is writable: it
 // is given its own frame here, before the kernel writes it, as the program's own write would have been.

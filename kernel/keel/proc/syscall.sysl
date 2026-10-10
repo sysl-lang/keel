@@ -1,20 +1,20 @@
 module keel.proc
 
-import abi.keel.abi.{EINTR, EINVAL, ENOSYS, EPERM, Errno, SYS_CHMOD, SYS_CHOWN, SYS_DUP, SYS_DUP2, SYS_GETGID, SYS_PIPE,
-    SYS_GETUID, SYS_SETGID, SYS_SETUID, SYS_ACCESS, SYS_BRK, SYS_CHDIR, SYS_CLOSE,
-    SYS_EXIT, SYS_FSTAT, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS, SYS_GETPID, SYS_GETPPID, SYS_LSEEK, SYS_MKDIR,
-    SYS_OPEN, SYS_READ, SYS_RENAME, SYS_RMDIR, SYS_SPAWN, SYS_STAT, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINK, SYS_WAIT,
-    SYS_WRITE, SYS_SOCKET, SYS_BIND, SYS_RECVFROM, SYS_SENDTO, SYS_SOCKCLOSE, SYS_FORK, SYS_EXECVE, SYS_SIGACTION,
-    SYS_SIGPROCMASK, SYS_SIGRETURN, SYS_KILL, SYS_SETPGID, SYS_GETPGID, SYS_TCSETPGRP, SYS_TCGETPGRP, SYS_NANOSLEEP,
-    SYS_PROCS}
+import abi.keel.abi.{EINTR, EINVAL, ENOSYS, EPERM, Errno, SYS_BIND, SYS_BRK, SYS_CHDIR, SYS_CLONE, SYS_CLOSE,
+    SYS_DUP, SYS_DUP3, SYS_EXECVE, SYS_EXIT, SYS_EXIT_GROUP, SYS_FACCESSAT, SYS_FCHMODAT, SYS_FCHOWNAT, SYS_FSTAT,
+    SYS_FTRUNCATE, SYS_GETCWD, SYS_GETDENTS64, SYS_GETEGID, SYS_GETEUID, SYS_GETGID, SYS_GETPGID, SYS_GETPID,
+    SYS_GETPPID, SYS_GETTID, SYS_GETUID, SYS_IOCTL, SYS_KILL, SYS_LSEEK, SYS_MKDIRAT, SYS_NANOSLEEP, SYS_NEWFSTATAT,
+    SYS_OPENAT, SYS_PIPE2, SYS_PROCS, SYS_READ, SYS_RECVFROM, SYS_RENAMEAT, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK,
+    SYS_RT_SIGRETURN, SYS_SENDTO, SYS_SETGID, SYS_SETPGID, SYS_SETSOCKOPT, SYS_SETUID, SYS_SET_TID_ADDRESS,
+    SYS_SOCKET, SYS_SPAWN, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE}
 import keel.fs
 import keel.mm
 import keel.sched.Process
 
-// System calls (user/abi has the numbers): `svc #0` from EL0 arrives here with the saved registers, the
-// number in x8 and the arguments in x0 to x5; the answer goes back in x0, an error as its negative
-// errno. `regs` is the whole trap frame (user.sysl's `UserRegs`): `fork` copies it and `execve`
-// rewrites it.
+// System calls (user/abi has the numbers, Linux's aarch64 ones wherever keel has the call Linux has):
+// `svc #0` from EL0 arrives here with the saved registers, the number in x8 and the arguments in x0 to
+// x5; the answer goes back in x0, an error as its negative errno. `regs` is the whole trap frame
+// (user.sysl's `UserRegs`): `clone` copies it and `execve` rewrites it.
 //
 // Every handler has the same shape — the process and its saved registers in, a `Result` out — and the
 // dispatch is a `match` on the number. A table of the handlers' addresses (`[5]*extern(*Process, *u64)
@@ -28,55 +28,53 @@ private[proc] system_call(regs: *u64) -> Option[u64]
     val p = current_process()
     val first = regs[0]
     val r = regs[8] match
-        SYS_EXIT -> sys_exit(p, regs)
+        SYS_EXIT | SYS_EXIT_GROUP -> sys_exit(p, regs)
         SYS_WRITE -> sys_write(p, regs)
-        SYS_GETPID -> sys_getpid(p, regs)
+        SYS_GETPID | SYS_GETTID | SYS_SET_TID_ADDRESS -> sys_getpid(p, regs)
         SYS_BRK -> sys_brk(p, regs)
-        SYS_OPEN -> fs.sys_open(p, regs)
+        SYS_OPENAT -> fs.sys_openat(p, regs)
         SYS_READ -> sys_read(p, regs)
         SYS_CLOSE -> sys_close(p, regs)
         SYS_LSEEK -> fs.sys_lseek(p, regs)
         SYS_FSTAT -> fs.sys_fstat(p, regs)
-        SYS_STAT -> fs.sys_stat(p, regs)
-        SYS_MKDIR -> fs.sys_mkdir(p, regs)
-        SYS_GETDENTS -> fs.sys_getdents(p, regs)
-        SYS_UNLINK -> fs.sys_unlink(p, regs)
-        SYS_RMDIR -> fs.sys_rmdir(p, regs)
-        SYS_RENAME -> fs.sys_rename(p, regs)
+        SYS_NEWFSTATAT -> fs.sys_newfstatat(p, regs)
+        SYS_MKDIRAT -> fs.sys_mkdirat(p, regs)
+        SYS_GETDENTS64 -> fs.sys_getdents64(p, regs)
+        SYS_UNLINKAT -> fs.sys_unlinkat(p, regs)
+        SYS_RENAMEAT -> fs.sys_renameat(p, regs)
         SYS_SYNC -> fs.sys_sync()
         SYS_GETCWD -> fs.sys_getcwd(p, regs)
         SYS_CHDIR -> fs.sys_chdir(p, regs)
         SYS_TRUNCATE -> fs.sys_truncate(p, regs)
         SYS_FTRUNCATE -> fs.sys_ftruncate(p, regs)
-        SYS_ACCESS -> fs.sys_access(p, regs)
-        SYS_SPAWN -> sys_spawn(p, regs)
-        SYS_WAIT -> sys_wait(p, regs)
+        SYS_FACCESSAT -> fs.sys_faccessat(p, regs)
+        SYS_WAIT4 -> sys_wait4(p, regs)
         SYS_GETPPID -> sys_getppid(p, regs)
-        SYS_SOCKET -> sys_socket(p)
+        SYS_SOCKET -> sys_socket(p, regs)
         SYS_BIND -> sys_bind(p, regs)
         SYS_RECVFROM -> sys_recvfrom(p, regs)
         SYS_SENDTO -> sys_sendto(p, regs)
-        SYS_SOCKCLOSE -> sys_sockclose(p, regs)
-        SYS_GETUID -> Ok(i64(p.uid))
-        SYS_GETGID -> Ok(i64(p.gid))
+        SYS_SETSOCKOPT -> sys_setsockopt(p, regs)
+        SYS_GETUID | SYS_GETEUID -> Ok(i64(p.uid))
+        SYS_GETGID | SYS_GETEGID -> Ok(i64(p.gid))
         SYS_SETUID -> sys_setuid(p, regs)
         SYS_SETGID -> sys_setgid(p, regs)
-        SYS_CHMOD -> fs.sys_chmod(p, regs)
-        SYS_CHOWN -> fs.sys_chown(p, regs)
-        SYS_PIPE -> sys_pipe(p, regs)
-        SYS_DUP2 -> sys_dup2(p, regs)
+        SYS_FCHMODAT -> fs.sys_fchmodat(p, regs)
+        SYS_FCHOWNAT -> fs.sys_fchownat(p, regs)
+        SYS_PIPE2 -> sys_pipe2(p, regs)
+        SYS_DUP3 -> sys_dup3(p, regs)
         SYS_DUP -> sys_dup(p, regs)
-        SYS_FORK -> sys_fork(p, regs)
+        SYS_CLONE -> sys_clone(p, regs)
         SYS_EXECVE -> sys_execve(p, regs)
-        SYS_SIGACTION -> sys_sigaction(p, regs)
-        SYS_SIGPROCMASK -> sys_sigprocmask(p, regs)
-        SYS_SIGRETURN -> sys_sigreturn(p, regs)
+        SYS_RT_SIGACTION -> sys_rt_sigaction(p, regs)
+        SYS_RT_SIGPROCMASK -> sys_rt_sigprocmask(p, regs)
+        SYS_RT_SIGRETURN -> sys_rt_sigreturn(p, regs)
         SYS_KILL -> sys_kill(p, regs)
         SYS_SETPGID -> sys_setpgid(p, regs)
         SYS_GETPGID -> sys_getpgid(p, regs)
-        SYS_TCSETPGRP -> sys_tcsetpgrp(p, regs)
-        SYS_TCGETPGRP -> sys_tcgetpgrp(p, regs)
+        SYS_IOCTL -> sys_ioctl(p, regs)
         SYS_NANOSLEEP -> sys_nanosleep(p, regs)
+        SYS_SPAWN -> sys_spawn(p, regs)
         SYS_PROCS -> sys_procs(p, regs)
         else Err(ENOSYS)
     regs[0] = r match
@@ -105,14 +103,17 @@ private[proc] const VALIDATE_USER_POINTERS: bool = true
 private sys_getppid(p: *Process, regs: *u64) -> Result[i64, Errno] = Ok(i64(p.ppid))
 
 // setuid(uid), setgid(gid): only root may become someone else, and only to an id the disk can record
-// as an owner (16 bits). A process that gives up root cannot take it back.
+// as an owner (16 bits); anyone may set the id they already have. A process that gives up root cannot
+// take it back.
 private sys_setuid(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[0] == u64(p.uid) then return Ok(0)
     if !may_change_ids(p) then return Err(EPERM)
     if regs[0] > 0xffff then return Err(EINVAL)
     p.uid = u32(regs[0])
     Ok(0)
 
 private sys_setgid(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[0] == u64(p.gid) then return Ok(0)
     if !may_change_ids(p) then return Err(EPERM)
     if regs[0] > 0xffff then return Err(EINVAL)
     p.gid = u32(regs[0])

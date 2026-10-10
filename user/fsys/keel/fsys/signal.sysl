@@ -1,6 +1,6 @@
 module keel.fsys
 
-// `sysl.signal` on keel: the five hooks of `sysl.signal.sys`, over keel's sigaction (41) and kill (44).
+// `sysl.signal` on keel: the five hooks of `sysl.signal.sys`, over rt_sigaction and kill.
 //
 // The handler `watch` installs is `counted`, a function of this module that adds one to the signal's
 // count and does nothing else, installed with SA_RESTART so that a call the signal arrives during is

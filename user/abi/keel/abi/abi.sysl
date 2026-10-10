@@ -2,81 +2,97 @@ module keel.abi
 
 // keel's system calls. A user program makes one with `svc #0`: the call's number in x8, its arguments
 // in x0 to x5, and the answer comes back in x0 — the result, or a negative error number. Every other
-// register is preserved. The numbers are keel's own; the error numbers and the `open` flags are
-// Linux's, so a C library's tables would read them unchanged.
+// register is preserved.
 //
-// A path is a pointer and a length, not a NUL-terminated string: a sysl `string` is a pointer and a
-// length, and nothing lays a zero after its bytes.
+// Wherever keel has a call Linux also has, it is Linux's on aarch64: the number from the asm-generic
+// table, the arguments in Linux's order, Linux's structure layouts and flag values, and Linux's error
+// numbers — so a static program built for aarch64 Linux makes it unchanged. A path is a NUL-terminated
+// string, and a call taking one takes a directory descriptor before it as the `*at` calls do: AT_FDCWD,
+// or any descriptor when the path is absolute (keel keeps no path for an open directory, so a relative
+// path from one answers EOPNOTSUPP). Calls Linux has no equivalent of are numbered from KEEL_CALLS.
 
-const SYS_EXIT: u64 = 1         // exit(code) -> never
-const SYS_WRITE: u64 = 2        // write(fd, buf, len) -> bytes written
-const SYS_GETPID: u64 = 3       // getpid() -> pid
-const SYS_BRK: u64 = 4          // brk(addr) -> the break: moved to addr if it could be, else unchanged
-const SYS_OPEN: u64 = 5         // open(path, path_len, flags) -> fd
-const SYS_READ: u64 = 6         // read(fd, buf, len) -> bytes read; 0 at the end of the file
-const SYS_CLOSE: u64 = 7        // close(fd) -> 0
-const SYS_LSEEK: u64 = 8        // lseek(fd, offset, whence) -> the new offset
-const SYS_FSTAT: u64 = 9        // fstat(fd, *Stat) -> 0
-const SYS_STAT: u64 = 10        // stat(path, path_len, *Stat) -> 0
-const SYS_MKDIR: u64 = 11       // mkdir(path, path_len) -> 0
-const SYS_GETDENTS: u64 = 12    // getdents(fd, buf, len) -> bytes of whole `Dirent` records; 0 at the end
-const SYS_UNLINK: u64 = 13      // unlink(path, path_len) -> 0: a file
-const SYS_RMDIR: u64 = 14       // rmdir(path, path_len) -> 0: an empty directory
-const SYS_RENAME: u64 = 15      // rename(from, from_len, to, to_len) -> 0
-const SYS_SYNC: u64 = 16        // sync() -> 0: every changed block is on the disk when it returns
-const SYS_GETCWD: u64 = 17      // getcwd(buf, len) -> bytes of the current directory's path; ERANGE if it does not fit
-const SYS_CHDIR: u64 = 18       // chdir(path, path_len) -> 0
-const SYS_TRUNCATE: u64 = 19    // truncate(path, path_len, length) -> 0: cut to `length`, or grown with zeros
-const SYS_FTRUNCATE: u64 = 20   // ftruncate(fd, length) -> 0: the same, through a descriptor open for writing
-const SYS_ACCESS: u64 = 21      // access(path, path_len, how) -> 0 if the path is there and the caller may (how: r 4, w 2, x 1)
-const SYS_SPAWN: u64 = 22       // spawn(path, path_len, args, args_len, *SpawnAttr | 0) -> the child's pid
-const SYS_WAIT: u64 = 23        // wait(pid, *ExitStatus) -> the pid of the child that ended
-const SYS_GETPPID: u64 = 24     // getppid() -> the parent's pid; 0 for a process the kernel started
-const SYS_SOCKET: u64 = 25      // socket() -> a UDP socket's number
-const SYS_BIND: u64 = 26        // bind(sd, port) -> 0
-const SYS_RECVFROM: u64 = 27    // recvfrom(sd, buf, len, *SockAddr, timeout_ms) -> bytes of the datagram
-const SYS_SENDTO: u64 = 28      // sendto(sd, buf, len, *SockAddr) -> bytes sent
-const SYS_SOCKCLOSE: u64 = 29   // sockclose(sd) -> 0
-const SYS_GETUID: u64 = 30      // getuid() -> the caller's user id
-const SYS_GETGID: u64 = 31      // getgid() -> the caller's group id
-const SYS_SETUID: u64 = 32      // setuid(uid) -> 0; EPERM unless the caller is root
-const SYS_SETGID: u64 = 33      // setgid(gid) -> 0; EPERM unless the caller is root
-const SYS_CHMOD: u64 = 34       // chmod(path, path_len, mode) -> 0; the owner or root; mode & 0o4777
-const SYS_CHOWN: u64 = 35       // chown(path, path_len, uid, gid) -> 0; root only
-const SYS_PIPE: u64 = 36        // pipe(*[2]u32) -> 0: the read end's descriptor, then the write end's
-const SYS_DUP2: u64 = 37        // dup2(old, new) -> new: `new` closed first if open, then the same as `old`
-const SYS_DUP: u64 = 38         // dup(old) -> the lowest free descriptor, now the same as `old`
-const SYS_FORK: u64 = 39        // fork() -> the child's pid in the parent, 0 in the child
-const SYS_EXECVE: u64 = 40      // execve(path, path_len, args, args_len, env, env_len) -> never on success
-const SYS_SIGACTION: u64 = 41   // sigaction(sig, handler, mask, restorer, *SigAction old | 0, flags) -> 0
-const SYS_SIGPROCMASK: u64 = 42 // sigprocmask(how, set, *u64 old | 0) -> 0
-const SYS_SIGRETURN: u64 = 43   // sigreturn() -> never: the registers a handler interrupted, from its frame
-const SYS_KILL: u64 = 44        // kill(pid | 0 | -1 | -pgid, sig) -> 0
-const SYS_SETPGID: u64 = 45     // setpgid(pid | 0, pgid | 0) -> 0
-const SYS_GETPGID: u64 = 46     // getpgid(pid | 0) -> the process group
-const SYS_TCSETPGRP: u64 = 47   // tcsetpgrp(fd, pgid) -> 0: the console's foreground process group
-const SYS_TCGETPGRP: u64 = 48   // tcgetpgrp(fd) -> the console's foreground process group, 0 for none
-const SYS_NANOSLEEP: u64 = 49   // nanosleep(nanos, *u64 left | 0) -> 0, or EINTR with what was left
-const SYS_PROCS: u64 = 50       // procs(*ProcInfo, count) -> the processes in the table, at most count
+const SYS_GETCWD: u64 = 17          // getcwd(buf, size) -> bytes written, its NUL included; ERANGE if it does not fit
+const SYS_DUP: u64 = 23             // dup(old) -> the lowest free descriptor, now the same as `old`
+const SYS_DUP3: u64 = 24            // dup3(old, new, flags) -> new: `new` closed first if open; EINVAL if old == new
+const SYS_IOCTL: u64 = 29           // ioctl(fd, request, arg) -> 0: TIOCGPGRP, TIOCSPGRP, TIOCGWINSZ on the console
+const SYS_MKDIRAT: u64 = 34         // mkdirat(dirfd, path, mode) -> 0
+const SYS_UNLINKAT: u64 = 35        // unlinkat(dirfd, path, flags) -> 0: a file, or with AT_REMOVEDIR an empty directory
+const SYS_RENAMEAT: u64 = 38        // renameat(olddirfd, old, newdirfd, new) -> 0
+const SYS_TRUNCATE: u64 = 45        // truncate(path, length) -> 0: cut to `length`, or grown with zeros
+const SYS_FTRUNCATE: u64 = 46       // ftruncate(fd, length) -> 0: the same, through a descriptor open for writing
+const SYS_FACCESSAT: u64 = 48       // faccessat(dirfd, path, how) -> 0 if the path is there and the caller may (r 4, w 2, x 1)
+const SYS_CHDIR: u64 = 49           // chdir(path) -> 0
+const SYS_FCHMODAT: u64 = 53        // fchmodat(dirfd, path, mode) -> 0; the owner or root; mode & 0o4777
+const SYS_FCHOWNAT: u64 = 54        // fchownat(dirfd, path, uid, gid, flags) -> 0; root only; -1 leaves an id as it is
+const SYS_OPENAT: u64 = 56          // openat(dirfd, path, flags, mode) -> fd
+const SYS_CLOSE: u64 = 57           // close(fd) -> 0
+const SYS_PIPE2: u64 = 59           // pipe2(*[2]i32, flags) -> 0: the read end's descriptor, then the write end's
+const SYS_GETDENTS64: u64 = 61      // getdents64(fd, buf, len) -> bytes of whole `Dirent64` records; 0 at the end
+const SYS_LSEEK: u64 = 62           // lseek(fd, offset, whence) -> the new offset
+const SYS_READ: u64 = 63            // read(fd, buf, len) -> bytes read; 0 at the end of the file
+const SYS_WRITE: u64 = 64           // write(fd, buf, len) -> bytes written
+const SYS_NEWFSTATAT: u64 = 79      // newfstatat(dirfd, path, *Stat, flags) -> 0; AT_EMPTY_PATH with "" is fstat(dirfd)
+const SYS_FSTAT: u64 = 80           // fstat(fd, *Stat) -> 0
+const SYS_SYNC: u64 = 81            // sync() -> 0: every changed block is on the disk when it returns
+const SYS_EXIT: u64 = 93            // exit(code) -> never
+const SYS_EXIT_GROUP: u64 = 94      // exit_group(code) -> never: a keel process is one thread, so the same as exit
+const SYS_SET_TID_ADDRESS: u64 = 96 // set_tid_address(addr) -> the caller's thread id, which is its pid
+const SYS_NANOSLEEP: u64 = 101      // nanosleep(*Timespec, *Timespec left | 0) -> 0, or EINTR with what was left
+const SYS_KILL: u64 = 129           // kill(pid | 0 | -1 | -pgid, sig) -> 0
+const SYS_RT_SIGACTION: u64 = 134   // rt_sigaction(sig, *SigAction | 0, *SigAction old | 0, 8) -> 0
+const SYS_RT_SIGPROCMASK: u64 = 135 // rt_sigprocmask(how, *u64 set | 0, *u64 old | 0, 8) -> 0
+const SYS_RT_SIGRETURN: u64 = 139   // rt_sigreturn() -> never: the registers a handler interrupted, from its frame
+const SYS_SETGID: u64 = 144         // setgid(gid) -> 0; EPERM unless the caller is root or already has it
+const SYS_SETUID: u64 = 146         // setuid(uid) -> 0; EPERM unless the caller is root or already has it
+const SYS_SETPGID: u64 = 154        // setpgid(pid | 0, pgid | 0) -> 0
+const SYS_GETPGID: u64 = 155        // getpgid(pid | 0) -> the process group
+const SYS_GETPID: u64 = 172         // getpid() -> pid
+const SYS_GETPPID: u64 = 173        // getppid() -> the parent's pid; 0 for a process the kernel started
+const SYS_GETUID: u64 = 174         // getuid() -> the caller's user id
+const SYS_GETEUID: u64 = 175        // geteuid() -> the same: keel has one user id per process
+const SYS_GETGID: u64 = 176         // getgid() -> the caller's group id
+const SYS_GETEGID: u64 = 177        // getegid() -> the same
+const SYS_GETTID: u64 = 178         // gettid() -> the pid
+const SYS_SOCKET: u64 = 198         // socket(AF_INET, SOCK_DGRAM, 0 | IPPROTO_UDP) -> fd
+const SYS_BIND: u64 = 200           // bind(fd, *SockAddrIn, len) -> 0
+const SYS_SENDTO: u64 = 206         // sendto(fd, buf, len, 0, *SockAddrIn, len) -> bytes sent
+const SYS_RECVFROM: u64 = 207       // recvfrom(fd, buf, len, 0, *SockAddrIn | 0, *u32 len | 0) -> bytes of the datagram
+const SYS_SETSOCKOPT: u64 = 208     // setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, *Timeval, 16) -> 0
+const SYS_BRK: u64 = 214            // brk(addr) -> the break: moved to addr if it could be, else unchanged
+const SYS_CLONE: u64 = 220          // clone(SIGCHLD, 0, ...) -> the child's pid in the parent, 0 in the child
+const SYS_EXECVE: u64 = 221         // execve(path, argv, envp) -> never on success
+const SYS_WAIT4: u64 = 260          // wait4(pid, *i32 status | 0, options, *rusage | 0) -> the pid of the child that ended
+
+// keel's own calls, which Linux has nothing like.
+const KEEL_CALLS: u64 = 1024
+const SYS_SPAWN: u64 = 1024         // spawn(path, path_len, args, args_len, *SpawnAttr | 0) -> the child's pid
+const SYS_PROCS: u64 = 1025         // procs(*ProcInfo, count) -> the processes in the table, at most count
+
+// The directory descriptor of a `*at` call that means the current directory, and the flags those calls
+// take.
+const AT_FDCWD: i64 = -100
+const AT_SYMLINK_NOFOLLOW: u64 = 0x100
+const AT_REMOVEDIR: u64 = 0x200
+const AT_EMPTY_PATH: u64 = 0x1000
 
 // Signals, numbered as Linux numbers them on arm64. Every one is pending or not (a second of the same
 // kind before the first is delivered is the same one) and may be blocked; a pending signal that is not
 // blocked is delivered when the process next returns to user mode — after a system call, an interrupt
-// or a fault — and a system call asleep (a pipe, the console, `wait`, `nanosleep`) is woken to answer
+// or a fault — and a system call asleep (a pipe, the console, `wait4`, `nanosleep`) is woken to answer
 // EINTR first. Its action is `SIG_DFL`, `SIG_IGN` or a handler's address. A signal whose action is to
 // be ignored is thrown away when it is sent, and interrupts nothing.
 //
 // The default actions: CHLD, CONT, URG and WINCH are ignored; STOP, TSTP, TTIN and TTOU would stop the
 // process and **keel has no stopped state, so they are ignored too**; every other ends the process
-// (`wait`'s status says which). KILL and STOP cannot be caught, ignored or blocked.
+// (`wait4`'s status says which). KILL and STOP cannot be caught, ignored or blocked.
 //
 // A handler runs on the process's own stack with `x0` = the signal and `x30` = the `restorer` its
-// `sigaction` named: a routine of the program's that makes `sigreturn` (keel.user's
-// `keel_sigreturn_trampoline`, as Linux's `sa_restorer`). Below the stack pointer the kernel has put a
-// `SigFrame` — every register as it was, and the blocked set to go back to — and `sigreturn` reads it
-// back from the stack pointer, so the handler must return with the stack as it found it. While it runs
-// the signal itself and the `mask` its `sigaction` named are blocked as well. A fault (SEGV, ILL, BUS,
-// TRAP, FPE) is not delivered to a handler: it ends the process.
+// `rt_sigaction` named with SA_RESTORER: a routine of the program's that makes `rt_sigreturn`
+// (keel.user's `keel_sigreturn_trampoline`, as a C library's). Below the stack pointer the kernel has
+// put a `SigFrame` — every register as it was, and the blocked set to go back to — and `rt_sigreturn`
+// reads it back from the stack pointer, so the handler must return with the stack as it found it. While
+// it runs the signal itself and the `mask` its action named are blocked as well. A fault (SEGV, ILL,
+// BUS, TRAP, FPE) is not delivered to a handler: it ends the process.
 const SIGHUP: u64 = 1
 const SIGINT: u64 = 2
 const SIGQUIT: u64 = 3
@@ -100,36 +116,42 @@ const SIGTTIN: u64 = 21
 const SIGTTOU: u64 = 22
 const SIGURG: u64 = 23
 const SIGWINCH: u64 = 28
-const NSIG: u64 = 32            // signals are 1 to NSIG - 1
+const NSIG: u64 = 32            // keel's signals are 1 to NSIG - 1; Linux's real-time ones above are EINVAL
+const SIGSET_SIZE: u64 = 8      // the size a signal call is told its sets are: Linux's 64 bits
 
 const SIG_DFL: u64 = 0
 const SIG_IGN: u64 = 1
 
-// `sigprocmask`'s how: add `set` to the blocked signals, take it away, or make it the blocked set.
+// `rt_sigprocmask`'s how: add `set` to the blocked signals, take it away, or make it the blocked set.
 const SIG_BLOCK: u64 = 0
 const SIG_UNBLOCK: u64 = 1
 const SIG_SETMASK: u64 = 2
 
-// A signal's bit in a set: `1 << sig`.
-sig_bit(sig: u64) -> u64 = u64(1) << sig
+// A signal's bit in a set, as Linux numbers them: signal n is bit n - 1.
+sig_bit(sig: u64) -> u64 = u64(1) << (sig - 1)
 
-// `sigaction`'s flags. With SA_RESTART a system call the handled signal interrupted — one that would
+// `rt_sigaction`'s flags. With SA_RESTART a system call the handled signal interrupted — one that would
 // have answered EINTR — is made again once the handler returns, instead of answering; `nanosleep` is
-// the exception, and answers EINTR with what was left either way. Linux's number.
+// the exception, and answers EINTR with what was left either way. SA_RESTORER says `restorer` is where
+// the handler returns to; a handler without it is EINVAL, keel having no page of its own to return
+// through.
 const SA_RESTART: u64 = 0x1000_0000
+const SA_RESTORER: u64 = 0x0400_0000
 
-// What `sigaction` answers about the action it replaced.
+// The kernel's `struct sigaction` on arm64: what `rt_sigaction` takes and answers about the action it
+// replaced.
 struct SigAction
     handler: u64                // SIG_DFL, SIG_IGN or the handler's address
-    mask: u64                   // blocked as well while the handler runs
+    flags: u64                  // SA_RESTART, SA_RESTORER
     restorer: u64               // where the handler returns to
-    flags: u64                  // SA_RESTART, or 0
+    mask: u64                   // blocked as well while the handler runs
 
 @assert(sizeof(SigAction) == 32, "a SigAction is 32 bytes")
 
 // What delivering a signal to a handler puts on the stack, at the stack pointer the handler starts
 // with: the registers as they were — x0 to x30, then where the program was (ELR), its flags (SPSR) and
-// its stack pointer — the blocked set to restore, and the signal.
+// its stack pointer — the blocked set to restore, and the signal. This frame is keel's own, not Linux's
+// `rt_sigframe`.
 struct SigFrame
     x: [31]u64
     pc: u64
@@ -140,13 +162,27 @@ struct SigFrame
 
 @assert(sizeof(SigFrame) == 288, "a SigFrame is 288 bytes, a multiple of 16")
 
+// A time as `nanosleep` takes it.
+struct Timespec
+    sec: i64
+    nsec: i64
+
+@assert(sizeof(Timespec) == 16, "a Timespec is 16 bytes")
+
+// ...and as SO_RCVTIMEO takes it.
+struct Timeval
+    sec: i64
+    usec: i64
+
+@assert(sizeof(Timeval) == 16, "a Timeval is 16 bytes")
+
 // Process groups: every process is in one, numbered by the pid of the process that made it. A child
 // starts in its parent's (a process the kernel starts, in its own); `setpgid(pid, pgid)` moves the
 // caller or a child of its own into the group `pgid` — 0 for the pid's own number — which must be one of
-// the caller's own or a new one. The console has a foreground group (`tcsetpgrp`), and Ctrl-C typed at
-// it sends SIGINT to every process in that group. `kill`'s pid is a process, 0 for the caller's group,
-// -1 for every process the caller may signal but init, or -pgid for a group; a user may signal only
-// their own processes, root any. There are no sessions: any process may set the console's group.
+// the caller's own or a new one. The console has a foreground group (`ioctl` TIOCSPGRP), and Ctrl-C
+// typed at it sends SIGINT to every process in that group. `kill`'s pid is a process, 0 for the caller's
+// group, -1 for every process the caller may signal but init, or -pgid for a group; a user may signal
+// only their own processes, root any. There are no sessions: any process may set the console's group.
 //
 // `procs` fills an array of `ProcInfo`, one for each process in the table, the ended ones not yet
 // reaped included; `/proc` it is not.
@@ -160,10 +196,26 @@ struct ProcInfo
 
 @assert(sizeof(ProcInfo) == 48, "a ProcInfo is 48 bytes")
 
-// Descriptors are a table of what each one is: the console, a file, or one end of a pipe. A new
-// process's 0 to 2 are the console unless its parent gave it something else (`SpawnAttr`); a child is
-// given nothing above 2. `dup2` and `dup` make a second descriptor on the same thing — a pipe end
-// counts both — and `close` gives one up.
+// `ioctl`'s requests on the console: the foreground process group (an `i32` the argument points at),
+// and the window's size (a `Winsize`; keel's console answers 24 rows of 80 columns). Any other request
+// is EINVAL; any descriptor but the console's is ENOTTY.
+const TIOCGPGRP: u64 = 0x540f
+const TIOCSPGRP: u64 = 0x5410
+const TIOCGWINSZ: u64 = 0x5413
+
+struct Winsize
+    rows: u16
+    cols: u16
+    xpixel: u16
+    ypixel: u16
+
+@assert(sizeof(Winsize) == 8, "a Winsize is 8 bytes")
+
+// Descriptors are a table of what each one is: the console, a file, one end of a pipe, or a socket. A
+// new process's 0 to 2 are the console unless its parent gave it something else (`SpawnAttr`); a
+// spawned child is given nothing above 2, a cloned one all of its parent's. `dup3` and `dup` make a
+// second descriptor on the same thing and `close` gives one up; what it stands for goes when the last
+// is closed.
 //
 // A pipe is a bounded buffer of PIPE_ROOM bytes in the kernel. `read` blocks while it is empty and some
 // write end is open, answers what is there (at most what was asked), and 0 once every write end is
@@ -177,23 +229,48 @@ const PIPE_ROOM: u64 = 4096
 // Opening needs `r` and/or `w`, as the flags ask; spawn needs `x` on the file; making, removing or
 // renaming an entry needs `w` and `x` on its directory; chdir and every directory a path walks through
 // need `x`. An executable with the set-user-ID bit (`0o4000`) runs as its owner, which is how `su`
-// becomes root to ask for a password.
+// becomes root to ask for a password. A new file or directory is given the mode its call asked for less
+// the bits of UMASK, which every process has and none can change.
 const ROOT_UID: u32 = 0
 const S_IFMT: u32 = 0o170000
 const S_IFDIR: u32 = 0o040000
 const S_IFREG: u32 = 0o100000
 const S_ISUID: u32 = 0o4000
+const UMASK: u32 = 0o022
 
-// A socket is a UDP endpoint on keel's one interface (10.0.2.15). Its number is not a file descriptor:
-// sockets have a table of their own, and a process's are closed when it ends. `recvfrom` waits for a
-// datagram up to `timeout_ms` (0: for ever) and answers ETIMEDOUT after; its `*SockAddr` (or 0) is
-// filled with the sender. Port 7 is the kernel's own echo service and cannot be bound.
-struct SockAddr
-    ip: u32                     // 10.0.2.2 is 0x0a00_0202
-    port: u16
-    reserved: u16
+// A socket is a UDP endpoint on keel's one interface (10.0.2.15), and a descriptor. `recvfrom` waits for
+// a datagram as long as SO_RCVTIMEO says (0: for ever) and answers EAGAIN after; its `*SockAddrIn` (or
+// 0) is filled with the sender. Port 7 is the kernel's own echo service and cannot be bound, and
+// neither can port 0. `send` and `recv` flags are 0.
+const AF_INET: u64 = 2
+const SOCK_DGRAM: u64 = 2
+const SOCK_TYPE_MASK: u64 = 0xf
+const SOCK_CLOEXEC: u64 = 0x8_0000
+const IPPROTO_UDP: u64 = 17
+const SOL_SOCKET: u64 = 1
+const SO_REUSEADDR: u64 = 2
+const SO_RCVTIMEO: u64 = 20
+const SO_SNDTIMEO: u64 = 21
 
-@assert(sizeof(SockAddr) == 8, "a SockAddr is 8 bytes")
+// Linux's `sockaddr_in`: the port and the address in network byte order (big-endian).
+struct SockAddrIn
+    family: u16                 // AF_INET
+    port_be: u16
+    addr_be: u32                // 10.0.2.2 is bytes 10, 0, 2, 2
+    zero: [8]u8
+
+    // The port and the address as numbers.
+    port(self) -> u16 = swap16(self.port_be)
+    ip(self) -> u32 = swap32(self.addr_be)
+end SockAddrIn
+
+@assert(sizeof(SockAddrIn) == 16, "a SockAddrIn is 16 bytes")
+
+// The `sockaddr_in` of address `ip` and `port`, written as numbers.
+sock_addr_in(ip: u32, port: u16) -> SockAddrIn = SockAddrIn(u16(AF_INET), swap16(port), swap32(ip), [0; 8])
+
+swap16(v: u16) -> u16 = (v << 8) | (v >> 8)
+swap32(v: u32) -> u32 = (v << 24) | ((v << 8) & 0xff_0000) | ((v >> 8) & 0xff00) | (v >> 24)
 
 // `spawn` starts the executable at `path` as a child of the caller, with the caller's current
 // directory. `args` is the child's argv, each argument followed by a NUL (so `"ls\0-a\0"` is two), at
@@ -206,10 +283,12 @@ struct SockAddr
 // foreground group before the child runs, so a Ctrl-C typed the moment it starts reaches it. The child
 // starts with every signal's action the default and none blocked.
 //
-// `wait(pid, *ExitStatus, options)` blocks until a child of the caller ends — the one numbered `pid`, or
-// any one for ANY_CHILD — and fills in how it ended; ECHILD if there is no such child. With WNOHANG it
-// answers 0 instead of blocking. A process whose parent ends first is handed to init (pid 1), which
-// waits for it instead; the parent is sent SIGCHLD when a child ends.
+// `wait4(pid, *status, options, *rusage)` blocks until a child of the caller ends — the one numbered
+// `pid`, any one for -1, one in the caller's group for 0 or in group -pid below that — and stores how it
+// ended (POSIX's wait status, an `i32`); ECHILD if there is no such child. With WNOHANG it answers 0
+// instead of blocking; WUNTRACED and WCONTINUED change nothing, since nothing stops. A `rusage` is
+// filled with zeros. A process whose parent ends first is handed to init (pid 1), which waits for it
+// instead; the parent is sent SIGCHLD when a child ends.
 const NO_FD: u64 = 0xffff_ffff_ffff_ffff
 const ANY_CHILD: i64 = -1
 const ARGS_ROOM: u64 = 4096
@@ -217,6 +296,9 @@ const INIT_PID: u64 = 1
 const ENV_ROOM: u64 = 1024
 
 const WNOHANG: u64 = 1
+const WUNTRACED: u64 = 2
+const WCONTINUED: u64 = 8
+const RUSAGE_SIZE: u64 = 144
 const SPAWN_SETPGROUP: u64 = 1
 const SPAWN_FOREGROUND: u64 = 2
 
@@ -230,21 +312,19 @@ struct SpawnAttr
 
 @assert(sizeof(SpawnAttr) == 64, "a SpawnAttr is 64 bytes")
 
-// How a child ended. `status` is POSIX's wait status: the exit code (its low 8 bits) shifted left 8
-// when it called `exit`, or the number of the signal that ended it. `fault` is non-zero only when the
-// signal was a fault's: ESR_EL1's exception class shifted left 8, with the fault status code below it.
+// How a child ended: POSIX's wait status, the exit code (its low 8 bits) shifted left 8 when it called
+// `exit`, or the number of the signal that ended it.
 struct ExitStatus
-    status: u64
-    fault: u64
+    status: u32
 
     // WIFEXITED, WEXITSTATUS, WIFSIGNALED, WTERMSIG.
     exited(self) -> bool = (self.status & 0x7f) == 0
     code(self) -> i64 = i64((self.status >> 8) & 0xff)
     signalled(self) -> bool = (self.status & 0x7f) != 0 && (self.status & 0x7f) != 0x7f
-    signal(self) -> u64 = self.status & 0x7f
+    signal(self) -> u64 = u64(self.status & 0x7f)
 end ExitStatus
 
-@assert(sizeof(ExitStatus) == 16, "an ExitStatus is 16 bytes")
+@assert(sizeof(ExitStatus) == 4, "an ExitStatus is a C int")
 
 // The wait status of a process that exited with `code`, and of one a signal ended.
 exit_status(code: i64) -> u64 = (u64(code) & 0xff) << 8
@@ -253,7 +333,8 @@ signal_status(sig: u64) -> u64 = sig & 0x7f
 // A path that does not begin with `/` is taken from the process's current directory, which starts at
 // `/`. A process starts with its arguments and environment on its stack, as Linux lays them out: SP
 // points at argc (a u64), then argc pointers to NUL-terminated strings, then a zero, then a pointer to
-// each `NAME=value` of the environment, then a zero.
+// each `NAME=value` of the environment, then a zero. A path is at most PATH_ROOM bytes with its NUL.
+const PATH_ROOM: u64 = 256
 
 // The console, at whichever descriptors stand for it (0 to 2 unless the process was started with
 // something else there): a write goes to the UART, and 0 reads from it a line at a time — the kernel echoes what is typed and
@@ -265,7 +346,9 @@ const STDERR: u64 = 2
 const FIRST_FILE_FD: u64 = 3
 const MAX_FDS: u64 = 16
 
-// `open`'s flags.
+// `openat`'s flags, as arm64 numbers them. Any others — O_LARGEFILE, O_CLOEXEC, O_NOCTTY, O_NONBLOCK,
+// O_NOFOLLOW — are taken and change nothing: keel has no links, no exec-time closing and no waiting on
+// a file.
 const O_RDONLY: u64 = 0
 const O_WRONLY: u64 = 1
 const O_RDWR: u64 = 2
@@ -274,38 +357,53 @@ const O_CREAT: u64 = 0x40
 const O_EXCL: u64 = 0x80
 const O_TRUNC: u64 = 0x200
 const O_APPEND: u64 = 0x400
+const O_DIRECTORY: u64 = 0x4000
+const O_CLOEXEC: u64 = 0x8_0000
 
 // `lseek`'s whence.
 const SEEK_SET: u64 = 0
 const SEEK_CUR: u64 = 1
 const SEEK_END: u64 = 2
 
-// `Stat.kind`.
-const KIND_FILE: u32 = 1
-const KIND_DIR: u32 = 2
-
-// What `fstat` and `stat` fill in.
+// Linux's `struct stat` on arm64 (asm-generic's), what `fstat` and `newfstatat` fill in. keel keeps no
+// devices and no times, so those are zero.
 struct Stat
-    ino: u32
-    kind: u32                   // KIND_FILE or KIND_DIR
+    dev: u64
+    ino: u64
     mode: u32                   // POSIX's st_mode: S_IFDIR or S_IFREG, S_ISUID, and the nine rwx bits
-    links: u32
-    size: u64
+    nlink: u32
     uid: u32                    // the owner
     gid: u32                    // the group
+    rdev: u64
+    pad1: u64
+    size: i64
+    blksize: i32
+    pad2: i32
+    blocks: i64
+    atime: i64
+    atime_nsec: u64
+    mtime: i64
+    mtime_nsec: u64
+    ctime: i64
+    ctime_nsec: u64
+    unused4: u32
+    unused5: u32
 
-@assert(sizeof(Stat) == 32, "a Stat is 32 bytes")
+    is_dir(self) -> bool = (self.mode & S_IFMT) == S_IFDIR
+    is_file(self) -> bool = (self.mode & S_IFMT) == S_IFREG
+end Stat
 
-// What `getdents` fills its buffer with: whole records, `.` and `..` included, as the directory holds
-// them. The same 32 bytes as the directory entry on the disk (keel.ondisk's `Dirent`).
-struct Dirent
-    ino: u32
-    len: u8                     // bytes of `name` in use
-    kind: u8                    // KIND_FILE or KIND_DIR
-    reserved: u16
-    name: [24]u8
+@assert(sizeof(Stat) == 128, "a Stat is 128 bytes")
 
-@assert(sizeof(Dirent) == 32, "a Dirent is 32 bytes")
+// A `Stat` of nothing, to be filled in.
+empty_stat() -> Stat = Stat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+// What `getdents64` fills its buffer with: Linux's `linux_dirent64` records, `.` and `..` included, as
+// the directory holds them. Each is this 19-byte head, then the name and its NUL, padded to a multiple of
+// 8 (`reclen` is the whole record); `off` is where the next one starts, for `lseek`.
+const DIRENT64_NAME: u64 = 19
+const DT_DIR: u8 = 4
+const DT_REG: u8 = 8
 
 // The error numbers, as the negative of what a call answers.
 enum Errno: i64
@@ -314,11 +412,11 @@ enum Errno: i64
     ESRCH = 3                   // kill, setpgid, getpgid: no such process or group
     EINTR = 4                   // a signal arrived while the call was asleep
     EIO = 5                     // the disk failed
-    E2BIG = 7                   // spawn's arguments are more than ARGS_ROOM
+    E2BIG = 7                   // spawn's or execve's arguments are more than ARGS_ROOM
     ENOEXEC = 8                 // spawn's file is not an executable keel can load
     EBADF = 9                   // not an open descriptor, or not open for this
-    ECHILD = 10                 // wait: no such child
-    EAGAIN = 11                 // spawn: the process table is full
+    ECHILD = 10                 // wait4: no such child
+    EAGAIN = 11                 // spawn: the process table is full; recvfrom: SO_RCVTIMEO passed
     ENOMEM = 12
     EACCES = 13                 // the mode of the file, or of a directory on the way, refuses the caller
     EFAULT = 14                // a pointer argument is not memory the caller may use that way
@@ -329,18 +427,25 @@ enum Errno: i64
     EINVAL = 22
     ENFILE = 23                 // socket: every socket in the system is open
     EMFILE = 24                 // every descriptor is in use
-    ENOTTY = 25                 // tcsetpgrp, tcgetpgrp: the descriptor is not the console
+    ENOTTY = 25                 // ioctl: the descriptor is not the console
     EFBIG = 27                  // past the largest file the filesystem holds
     ENOSPC = 28                 // no free block or inode
-    ESPIPE = 29                 // lseek on a pipe or the console
+    ESPIPE = 29                 // lseek on a pipe, a socket or the console
     EPIPE = 32                  // write to a pipe whose every read end is closed
     ERANGE = 34                // a result does not fit the buffer it was asked into
     ENAMETOOLONG = 36
     ENOSYS = 38                 // no such system call
     ENOTEMPTY = 39
+    ENOTSOCK = 88               // a socket call on a descriptor that is not one
     EDESTADDRREQ = 89           // the socket is not bound to a port
     EMSGSIZE = 90               // more than one datagram holds (1472 bytes)
+    ENOPROTOOPT = 92            // setsockopt: an option keel does not have
+    EPROTONOSUPPORT = 93        // socket: a protocol other than UDP
+    ESOCKTNOSUPPORT = 94        // socket: a type other than SOCK_DGRAM
+    EOPNOTSUPP = 95             // a relative path from a directory descriptor; send and recv flags
+    EAFNOSUPPORT = 97           // socket, bind, sendto: a family other than AF_INET
     EADDRINUSE = 98             // bind: the port is taken
+    EADDRNOTAVAIL = 99          // bind: an address other than keel's own or any
     ENETDOWN = 100              // no network card, or the stack is down
-    ETIMEDOUT = 110             // recvfrom: nothing arrived in time
+    ETIMEDOUT = 110
     EHOSTUNREACH = 113          // sendto: ARP found no address for the next hop

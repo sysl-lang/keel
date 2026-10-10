@@ -263,6 +263,7 @@ session2=(
     'ls -l /bin > /m9/l'
     'cat /m9/l /m9/l /m9/l /m9/l /m9/l /m9/l | head -n 1 | wc -l'
     'rm /m9/l'
+    'linuxhello'
     'exit'
     $'\x04'
 )
@@ -302,6 +303,8 @@ transcript2=(
     $'\n# fg %1\nsleep 100\nsh: sleep 100: killed by signal 2\n'   # brought to the foreground, then Ctrl-C
     $'# ls -l /bin > /m9/l\n# cat /m9/l /m9/l /m9/l /m9/l /m9/l /m9/l | head -n 1 | wc -l\n1\n'   # ~11 KiB of text
     $'# rm /m9/l\n'                             # through a 4 KiB pipe: head ends, cat's next write is SIGPIPE, no hang
+    $'# linuxhello\nlinux: write, getpid and exit_group by Linux\'s numbers; pid '   # a static aarch64-linux
+    $'\nsh: linuxhello: exit status 7\n'        # binary, built with no keel header: its raw calls are Linux's
     $'# exit\nlogin: \n'
     "init: the console closed after 1 sessions; orphans reaped: 0"
     "keel: init exited 0"
@@ -348,11 +351,20 @@ for prog in $user_programs; do
 done
 $compiler build --target aarch64-freestanding ${opt:+$opt} -o $elf $root/kernel
 
+# A static aarch64 Linux program, built with a Linux target's toolchain and no keel header: it proves
+# that keel's system-call numbers are Linux's. LLVM's clang and ld.lld from Homebrew unless told otherwise.
+linux_cc=${KEEL_LINUX_CC:-/opt/homebrew/opt/llvm/bin/clang}
+linux_ld=${KEEL_LINUX_LD:-/opt/homebrew/bin/ld.lld}
+$linux_cc --target=aarch64-linux-gnu -ffreestanding -fno-builtin -nostdlib -static -fno-pic -O2 -mgeneral-regs-only \
+    -c -o $out/linuxhello.o $root/linux/hello.c
+$linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/linuxhello $out/linuxhello.o
+
 rm -rf $fsroot
 mkdir -p $fsroot/dir $fsroot/bin
 for prog in $user_programs; do
     cp $out/user/$prog.elf $fsroot/bin/$prog
 done
+cp $out/linuxhello $fsroot/bin/linuxhello
 print -n "hello from the disk" > $fsroot/hello.txt
 print "inside a directory" > $fsroot/dir/inner.txt
 mkdir -p $fsroot/m9

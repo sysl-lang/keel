@@ -14,21 +14,23 @@ module keel.fs
 // an operation that fails half way through can leave a block or an inode allocated and unnamed, which
 // mkfs's check reports.
 
-import abi.keel.abi.{EBADF, EBUSY, EEXIST, EFAULT, EINVAL, EISDIR, EMFILE, ENAMETOOLONG, ENOENT, ENOTDIR, EPERM,
-    ENOTEMPTY, ERANGE, ESPIPE, Errno, FIRST_FILE_FD, MAX_FDS, O_ACCMODE, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY,
-    SEEK_CUR, SEEK_END, SEEK_SET, Stat}
+import abi.keel.abi.{AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, DIRENT64_NAME, DT_DIR, DT_REG,
+    EBADF, EBUSY, EEXIST, EFAULT, EINVAL, EISDIR, EMFILE, ENAMETOOLONG, ENOENT, ENOTDIR, EOPNOTSUPP, EPERM, ENOTEMPTY,
+    ERANGE, ESPIPE, Errno, FIRST_FILE_FD, MAX_FDS, O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_TRUNC,
+    O_WRONLY, PATH_ROOM, SEEK_CUR, SEEK_END, SEEK_SET, Stat, UMASK}
 import keel.mm
 import keel.sched.{Cred, Holds, OpenFile, Process, cred_of}
 import ondisk.keel.ondisk
-import ondisk.keel.ondisk.{DIRENT_SIZE, Dirent, Inode, KIND_DIR, KIND_FILE, PERMISSION_BITS, ROOT_INO, S_IFMT}
+import ondisk.keel.ondisk.{BLOCK_SIZE, DIRENT_SIZE, Dirent, Inode, KIND_DIR, KIND_FILE, PERMISSION_BITS, ROOT_INO,
+    S_IFMT}
 
-private const MAX_PATH: usize = 256
+private const MAX_PATH: usize = usize(PATH_ROOM)
 private const CHUNK: usize = 512
 
-// open(path, path_len, flags) -> fd
-sys_open(p: *Process, regs: *u64) -> Result[i64, Errno]
+// openat(dirfd, path, flags, mode) -> fd. A file made by O_CREAT gets `mode` less UMASK.
+sys_openat(p: *Process, regs: *u64) -> Result[i64, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
-    val path = path_in(p, regs[0], regs[1], room[..])?
+    val path = path_at(p, regs[0], regs[1], room[..])?
     val flags = regs[2]
     val access = flags & O_ACCMODE
     if access == O_ACCMODE then return Err(EINVAL)
@@ -46,9 +48,10 @@ sys_open(p: *Process, regs: *u64) -> Result[i64, Errno]
             ino
         Err(ENOENT) ->
             if (flags & O_CREAT) == 0 then return Err(ENOENT)
-            create(st, path, KIND_FILE, who)?
+            create(st, path, KIND_FILE, who, regs[3])?
         Err(e) -> return Err(e)
     var i = read_inode(st, ino)?
+    if (flags & O_DIRECTORY) != 0 && i.kind != KIND_DIR then return Err(ENOTDIR)
     if i.kind == KIND_DIR && access != O_RDONLY then return Err(EISDIR)
     val want = if access == O_RDONLY then MAY_READ elif access == O_WRONLY then MAY_WRITE else MAY_READ | MAY_WRITE
     allowed(&i, who, want)?
@@ -156,31 +159,45 @@ sys_fstat(p: *Process, regs: *u64) -> Result[i64, Errno]
     val s = stat_of(f.ino, read_inode(st, f.ino)?)
     stat_out(p, regs[1], s)
 
-// stat(path, path_len, *Stat) -> 0
-sys_stat(p: *Process, regs: *u64) -> Result[i64, Errno]
+// newfstatat(dirfd, path, *Stat, flags) -> 0. keel has no symbolic links, so AT_SYMLINK_NOFOLLOW
+// changes nothing; with AT_EMPTY_PATH an empty path is `dirfd` itself, as fstat.
+sys_newfstatat(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val flags = regs[3]
+    if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0 then return Err(EINVAL)
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
-    val path = path_in(p, regs[0], regs[1], room[..])?
+    if (flags & AT_EMPTY_PATH) != 0
+        var first: [1]u8 = [0]
+        mm.copy_cstr_from_user(&p.space, regs[1], first[..]) match
+            Some(0) ->
+                if i64(regs[0]) != AT_FDCWD
+                    val f = file_of(p, regs[0])?
+                    val st = lock()
+                    defer unlock()
+                    return stat_out(p, regs[2], stat_of(f.ino, read_inode(st, f.ino)?))
+            None -> return Err(EFAULT)
+            _ -> ()
+    val path = path_at(p, regs[0], regs[1], room[..], (flags & AT_EMPTY_PATH) != 0)?
     val st = lock()
     defer unlock()
     val ino = resolve(st, path, cred_of(p))?
     val s = stat_of(ino, read_inode(st, ino)?)
     stat_out(p, regs[2], s)
 
-// mkdir(path, path_len) -> 0
-sys_mkdir(p: *Process, regs: *u64) -> Result[i64, Errno]
+// mkdirat(dirfd, path, mode) -> 0: a directory of `mode` less UMASK.
+sys_mkdirat(p: *Process, regs: *u64) -> Result[i64, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
-    val path = path_in(p, regs[0], regs[1], room[..])?
+    val path = path_at(p, regs[0], regs[1], room[..])?
     val st = lock()
     defer unlock()
-    val _ = create(st, path, KIND_DIR, cred_of(p))?
+    val _ = create(st, path, KIND_DIR, cred_of(p), regs[2])?
     Ok(0)
 
-// getdents(fd, buf, len) -> bytes: as many whole entries as fit, from where the last call stopped.
-sys_getdents(p: *Process, regs: *u64) -> Result[i64, Errno]
+// getdents64(fd, buf, len) -> bytes: as many whole `linux_dirent64` records as fit, from where the last
+// call stopped. EINVAL when not even the next one fits.
+sys_getdents64(p: *Process, regs: *u64) -> Result[i64, Errno]
     val f = file_of(p, regs[0])?
     val va = regs[1]
     val len = regs[2]
-    if len < u64(DIRENT_SIZE) then return Err(EINVAL)
     if !mm.user_range(&p.space, va, len, true) then return Err(EFAULT)
     val st = lock()
     defer unlock()
@@ -189,19 +206,48 @@ sys_getdents(p: *Process, regs: *u64) -> Result[i64, Errno]
     val count = usize(d.size) / DIRENT_SIZE
     var slot = usize(f.offset) / DIRENT_SIZE
     var done: u64 = 0
-    while slot < count && done + u64(DIRENT_SIZE) <= len
+    while slot < count
         var e = entry_at(st, &d, slot)?
+        if e.ino == 0
+            slot += 1
+            continue
+        var rec: [RECORD_ROOM]u8 = [0; RECORD_ROOM]
+        val n = record64(&e, u64((slot + 1) * DIRENT_SIZE), rec[..])
+        if done + u64(n) > len then break
+        if !mm.copy_to_user(&p.space, va + done, rec[0..<n]) then return Err(EFAULT)
+        done += u64(n)
         slot += 1
-        if e.ino == 0 then continue
-        if !mm.copy_to_user(&p.space, va + done, bytes_of(&e)) then return Err(EFAULT)
-        done += u64(DIRENT_SIZE)
+    if done == 0 && slot < count then return Err(EINVAL)
     f.offset = u64(slot * DIRENT_SIZE)
     Ok(i64(done))
 
-// unlink(path, path_len) -> 0: a file.
-sys_unlink(p: *Process, regs: *u64) -> Result[i64, Errno]
+// A `linux_dirent64` is 19 bytes, a name of up to 24 and its NUL, padded to 8.
+private const RECORD_ROOM: usize = 48
+
+// Directory entry `e` as a `linux_dirent64` record in `out`, `next` the offset of the entry after it;
+// answers the record's length.
+private record64(e: *Dirent, next: u64, out: []u8) -> usize
+    val name = usize(e.len)
+    val n = (usize(DIRENT64_NAME) + name + 1 + 7) & ~usize(7)
+    put_le(out[0..<8], u64(e.ino))
+    put_le(out[8..<16], next)
+    put_le(out[16..<18], u64(n))
+    out[18] = if u16(e.kind) == KIND_DIR then DT_DIR else DT_REG
+    for i in 0..<name
+        out[usize(DIRENT64_NAME) + i] = e.name[i]
+    n
+
+// `v` little-endian into all of `out`.
+private put_le(out: []u8, v: u64)
+    for i in 0..<out.len
+        out[i] = u8((v >> u64(8 * i)) & 0xff)
+
+// unlinkat(dirfd, path, flags) -> 0: a file, or with AT_REMOVEDIR an empty directory.
+sys_unlinkat(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[2] == AT_REMOVEDIR then return rmdir(p, regs)
+    if regs[2] != 0 then return Err(EINVAL)
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
-    val path = path_in(p, regs[0], regs[1], room[..])?
+    val path = path_at(p, regs[0], regs[1], room[..])?
     val who = cred_of(p)
     val st = lock()
     defer unlock()
@@ -215,10 +261,10 @@ sys_unlink(p: *Process, regs: *u64) -> Result[i64, Errno]
     free_inode(st, f.ino)?
     Ok(0)
 
-// rmdir(path, path_len) -> 0: an empty directory.
-sys_rmdir(p: *Process, regs: *u64) -> Result[i64, Errno]
+// unlinkat's AT_REMOVEDIR: an empty directory.
+private rmdir(p: *Process, regs: *u64) -> Result[i64, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
-    val path = path_in(p, regs[0], regs[1], room[..])?
+    val path = path_at(p, regs[0], regs[1], room[..])?
     val who = cred_of(p)
     val st = lock()
     defer unlock()
@@ -236,13 +282,13 @@ sys_rmdir(p: *Process, regs: *u64) -> Result[i64, Errno]
     free_inode(st, f.ino)?
     Ok(0)
 
-// rename(from, from_len, to, to_len) -> 0. A file may replace a file; a directory moves only to a name
-// that is free, and never into itself.
-sys_rename(p: *Process, regs: *u64) -> Result[i64, Errno]
+// renameat(olddirfd, old, newdirfd, new) -> 0. A file may replace a file; a directory moves only to a
+// name that is free, and never into itself.
+sys_renameat(p: *Process, regs: *u64) -> Result[i64, Errno]
     var from_room: [MAX_PATH]u8 = [0; MAX_PATH]
     var to_room: [MAX_PATH]u8 = [0; MAX_PATH]
-    val from = path_in(p, regs[0], regs[1], from_room[..])?
-    val to = path_in(p, regs[2], regs[3], to_room[..])?
+    val from = path_at(p, regs[0], regs[1], from_room[..])?
+    val to = path_at(p, regs[2], regs[3], to_room[..])?
     val who = cred_of(p)
     val st = lock()
     defer unlock()
@@ -301,9 +347,9 @@ sys_sync() -> Result[i64, Errno]
 
 // --- Shared by the calls above --------------------------------------------------------------------
 
-// Make a file or a directory at `path`, which must not exist, owned by `who`; its parent must exist and
-// let `who` write and search it.
-private create(st: *State, path: []const u8, kind: u16, who: Cred) -> Result[u32, Errno]
+// Make a file or a directory at `path`, which must not exist, owned by `who`, with the permission bits
+// of `mode` less UMASK; its parent must exist and let `who` write and search it.
+private create(st: *State, path: []const u8, kind: u16, who: Cred, mode: u64) -> Result[u32, Errno]
     val (dir_ino, name) = parent_of(st, path, who)?
     if dots(name) then return Err(EEXIST)
     var dir = read_inode(st, dir_ino)?
@@ -312,7 +358,7 @@ private create(st: *State, path: []const u8, kind: u16, who: Cred) -> Result[u32
         Some(_) -> return Err(EEXIST)
         None -> ()
     allowed(&dir, who, MAY_WRITE | MAY_EXEC)?
-    val ino = new_inode(st, kind, who)?
+    val ino = new_inode(st, kind, who, u16(mode & u64(PERMISSION_BITS) & ~u64(UMASK)))?
     if kind == KIND_DIR
         var d = read_inode(st, ino)?
         add_entry(st, &d, ".".bytes, ino, KIND_DIR)?
@@ -342,29 +388,43 @@ private inside(st: *State, dir: u32, ancestor: u32) -> Result[bool, Errno]
         var d = read_inode(st, ino)?
         ino = named(st, &d, "..".bytes)?.ino
 
-// A path argument, copied in. One that does not begin with `/` is taken from the current directory:
-// what comes back is the current directory, a `/`, and the argument, for `resolve` to walk from the
-// root (`.` and `..` are entries every directory has, so the walk needs no help with them).
-private path_in(p: *Process, va: u64, len: u64, room: []u8) -> Result[[]const u8, Errno]
-    if len == 0 then return Err(ENOENT)
-    if len > u64(room.len) then return Err(ENAMETOOLONG)
+// A path argument: a NUL-terminated string at `va`, copied in, of a `*at` call whose directory
+// descriptor is `dirfd`. One that does not begin with `/` is taken from the current directory — what
+// comes back is the current directory, a `/`, and the argument, for `resolve` to walk from the root (`.`
+// and `..` are entries every directory has, so the walk needs no help with them) — and so `dirfd` must
+// be AT_FDCWD for one: keel keeps no path for an open directory, so a relative path from any other
+// answers EOPNOTSUPP (EBADF when it is not open). An absolute path ignores `dirfd`, as Linux's does.
+// An empty path is ENOENT, or the current directory when `empty_ok`.
+private path_at(p: *Process, dirfd: u64, va: u64, room: []u8, empty_ok: bool = false) -> Result[[]const u8, Errno]
     var given: [MAX_PATH]u8 = [0; MAX_PATH]
-    if !mm.copy_from_user(&p.space, va, given[0..<usize(len)]) then return Err(EFAULT)
-    joined(p.cwd[0..<p.cwd_len], given[0..<usize(len)], room)
+    var len = mm.copy_cstr_from_user(&p.space, va, given[..]) match
+        Some(n) -> n
+        None -> return Err(EFAULT)
+    if len == MAX_PATH then return Err(ENAMETOOLONG)
+    if len == 0
+        if !empty_ok then return Err(ENOENT)
+        given[0] = u8('.')
+        len = 1
+    if given[0] != u8('/') && i64(dirfd) != AT_FDCWD
+        if dirfd >= MAX_FDS || p.files[usize(dirfd)].holds == Holds.Free then return Err(EBADF)
+        return Err(EOPNOTSUPP)
+    joined(p.cwd[0..<p.cwd_len], given[0..<len], room)
 
-// getcwd(buf, len) -> bytes of the path; ERANGE when it does not fit.
+// getcwd(buf, size) -> bytes of the path with its NUL; ERANGE when they do not fit.
 sys_getcwd(p: *Process, regs: *u64) -> Result[i64, Errno]
     val n = p.cwd_len
-    if regs[1] < u64(n) then return Err(ERANGE)
+    if regs[1] < u64(n + 1) then return Err(ERANGE)
+    var nul: [1]u8 = [0]
     if !mm.copy_to_user(&p.space, regs[0], p.cwd[0..<n]) then return Err(EFAULT)
-    Ok(i64(n))
+    if !mm.copy_to_user(&p.space, regs[0] + u64(n), nul[..]) then return Err(EFAULT)
+    Ok(i64(n + 1))
 
-// chdir(path, path_len) -> 0. The directory is found by walking the path as given; what is kept is the
-// same path with `.`, `..` and repeated slashes taken out of its text, which names the same directory
-// because keel has no symbolic links.
+// chdir(path) -> 0. The directory is found by walking the path as given; what is kept is the same path
+// with `.`, `..` and repeated slashes taken out of its text, which names the same directory because keel
+// has no symbolic links.
 sys_chdir(p: *Process, regs: *u64) -> Result[i64, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
-    val path = path_in(p, regs[0], regs[1], room[..])?
+    val path = path_at(p, u64(AT_FDCWD), regs[0], room[..])?
     val who = cred_of(p)
     val st = lock()
     defer unlock()
@@ -379,17 +439,17 @@ sys_chdir(p: *Process, regs: *u64) -> Result[i64, Errno]
     p.cwd_len = n
     Ok(0)
 
-// truncate(path, path_len, length) -> 0
+// truncate(path, length) -> 0
 sys_truncate(p: *Process, regs: *u64) -> Result[i64, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
-    val path = path_in(p, regs[0], regs[1], room[..])?
+    val path = path_at(p, u64(AT_FDCWD), regs[0], room[..])?
     val who = cred_of(p)
     val st = lock()
     defer unlock()
     val ino = resolve(st, path, who)?
     var i = read_inode(st, ino)?
     if i.kind == KIND_FILE then allowed(&i, who, MAY_WRITE)?
-    resized(st, ino, regs[2])
+    resized(st, ino, regs[1])
 
 // ftruncate(fd, length) -> 0, on a descriptor open for writing.
 sys_ftruncate(p: *Process, regs: *u64) -> Result[i64, Errno]
@@ -399,11 +459,11 @@ sys_ftruncate(p: *Process, regs: *u64) -> Result[i64, Errno]
     defer unlock()
     resized(st, f.ino, regs[1])
 
-// access(path, path_len, how) -> 0 when the path names something and the caller may do what `how`
+// faccessat(dirfd, path, how) -> 0 when the path names something and the caller may do what `how`
 // asks (its low three bits: r 4, w 2, x 1; 0 asks only whether it is there).
-sys_access(p: *Process, regs: *u64) -> Result[i64, Errno]
+sys_faccessat(p: *Process, regs: *u64) -> Result[i64, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
-    val path = path_in(p, regs[0], regs[1], room[..])?
+    val path = path_at(p, regs[0], regs[1], room[..])?
     if regs[2] > 7 then return Err(EINVAL)
     val who = cred_of(p)
     val st = lock()
@@ -413,11 +473,11 @@ sys_access(p: *Process, regs: *u64) -> Result[i64, Errno]
     allowed(&i, who, u16(regs[2]))?
     Ok(0)
 
-// chmod(path, path_len, mode) -> 0: the set-user-ID and rwx bits of `mode` (others are EINVAL), by
-// the owner or root (EPERM).
-sys_chmod(p: *Process, regs: *u64) -> Result[i64, Errno]
+// fchmodat(dirfd, path, mode) -> 0: the set-user-ID and rwx bits of `mode` (others are EINVAL), by the
+// owner or root (EPERM).
+sys_fchmodat(p: *Process, regs: *u64) -> Result[i64, Errno]
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
-    val path = path_in(p, regs[0], regs[1], room[..])?
+    val path = path_at(p, regs[0], regs[1], room[..])?
     val mode = regs[2]
     if (mode | u64(PERMISSION_BITS)) != u64(PERMISSION_BITS) then return Err(EINVAL)
     val who = cred_of(p)
@@ -430,19 +490,24 @@ sys_chmod(p: *Process, regs: *u64) -> Result[i64, Errno]
     write_inode(st, ino, i)?
     Ok(0)
 
-// chown(path, path_len, uid, gid) -> 0: root only (EPERM). Both ids fit 16 bits on the disk (EINVAL).
-sys_chown(p: *Process, regs: *u64) -> Result[i64, Errno]
+// fchownat(dirfd, path, uid, gid, flags) -> 0: root only (EPERM). An id of -1 is left as it is; any
+// other fits 16 bits on the disk (EINVAL). keel has no links, so AT_SYMLINK_NOFOLLOW changes nothing.
+sys_fchownat(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if (regs[4] & ~AT_SYMLINK_NOFOLLOW) != 0 then return Err(EINVAL)
     var room: [MAX_PATH]u8 = [0; MAX_PATH]
-    val path = path_in(p, regs[0], regs[1], room[..])?
-    if regs[2] > 0xffff || regs[3] > 0xffff then return Err(EINVAL)
+    val path = path_at(p, regs[0], regs[1], room[..])?
+    val uid = u32(regs[2] & 0xffff_ffff)
+    val gid = u32(regs[3] & 0xffff_ffff)
+    val keep: u32 = 0xffff_ffff
+    if (uid != keep && uid > 0xffff) || (gid != keep && gid > 0xffff) then return Err(EINVAL)
     val who = cred_of(p)
     if who.uid != 0 then return Err(EPERM)
     val st = lock()
     defer unlock()
     val ino = resolve(st, path, who)?
     var i = read_inode(st, ino)?
-    i.uid = u16(regs[2])
-    i.gid = u16(regs[3])
+    if uid != keep then i.uid = u16(uid)
+    if gid != keep then i.gid = u16(gid)
     write_inode(st, ino, i)?
     Ok(0)
 
@@ -489,15 +554,20 @@ private file_of(p: *Process, fd: u64) -> Result[*OpenFile, Errno]
     if f.holds != Holds.File then return Err(EBADF)
     Ok(f)
 
-private stat_of(ino: u32, i: Inode) -> Stat =
-    Stat(ino, u32(i.kind), u32(i.mode), u32(i.links), i.size, u32(i.uid), u32(i.gid))
+// Linux's `struct stat` of inode `ino`: no device and no times, which keel keeps none of; `blocks` in
+// 512-byte units, of whole filesystem blocks.
+private stat_of(ino: u32, i: Inode) -> Stat
+    val bs = u64(BLOCK_SIZE)
+    val blocks = (i.size + bs - 1) / bs * (bs / 512)
+    Stat(0, u64(ino), u32(i.mode), u32(i.links), u32(i.uid), u32(i.gid), 0, 0, i64(i.size), i32(BLOCK_SIZE), 0,
+         i64(blocks), 0, 0, 0, 0, 0, 0, 0, 0)
 
 private stat_out(p: *Process, va: u64, s: Stat) -> Result[i64, Errno]
     if !mm.copy_to_user(&p.space, va, bytes_of(&s)) then return Err(EFAULT)
     Ok(0)
 
 // A value's bytes, for copying out to a program whose struct has the same layout (keel.abi's `Stat`
-// and `Dirent`, whose sizes are `@assert`ed on both sides).
+// is Linux's `struct stat`, whose size is `@assert`ed there).
 private bytes_of[T](v: *T) -> []const u8
     val b: *u8 = ptr_cast(v)
     b[0..<sizeof(T)]

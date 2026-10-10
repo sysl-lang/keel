@@ -62,7 +62,7 @@ private struct Datagram
 
 private struct Socket
     open: bool
-    owner: u64                                  // the pid that opened it
+    refs: u32                                   // the descriptors standing for it
     port: u16                                   // 0 until bound
     head: usize                                 // the oldest queued datagram
     count: usize
@@ -395,9 +395,9 @@ echo_wait(timeout: u64) -> (bool, u64)
 
 // -- Sockets -----------------------------------------------------------------------------------------
 //
-// A datagram socket belongs to the process that opened it (`owner`, its pid) and is numbered by its
-// place in the table. Bound to a port, it queues up to SOCKET_QUEUE datagrams for that port; one more is
-// dropped and counted. keel.proc's system calls are these, plus the copying to and from the program.
+// A datagram socket is numbered by its place in the table and counts the descriptors standing for it
+// (keel.proc's): it opens with one, and closes when the last is released. Bound to a port, it queues up
+// to SOCKET_QUEUE datagrams for that port; one more is dropped and counted. keel.proc's system calls are these, plus the copying to and from the program.
 
 enum NetError
     NoNet                                       // no card, or the stack is down
@@ -409,7 +409,7 @@ enum NetError
     TimedOut
     NoRoute                                     // ARP found no address for the next hop
 
-socket_open(owner: u64) -> Result[usize, NetError]
+socket_open() -> Result[usize, NetError]
     val flags = lock.lock()
     var answer: Result[usize, NetError] = Err(TableFull)
     if !stack.running
@@ -418,7 +418,7 @@ socket_open(owner: u64) -> Result[usize, NetError]
         for s in 0..<SOCKETS
             if !sockets[s].open
                 sockets[s].open = true
-                sockets[s].owner = owner
+                sockets[s].refs = 1
                 sockets[s].port = 0
                 sockets[s].head = 0
                 sockets[s].count = 0
@@ -427,17 +427,17 @@ socket_open(owner: u64) -> Result[usize, NetError]
     lock.unlock(flags)
     answer
 
-// Whether `sd` is a socket `owner` opened. Holding `lock`.
-private mine(sd: usize, owner: u64) -> bool = sd < SOCKETS && sockets[sd].open && sockets[sd].owner == owner
+// Whether `sd` is an open socket. Holding `lock`.
+private mine(sd: usize) -> bool = sd < SOCKETS && sockets[sd].open
 
-socket_bind(sd: usize, owner: u64, port: u16) -> Result[unit, NetError]
+socket_bind(sd: usize, port: u16) -> Result[unit, NetError]
     val flags = lock.lock()
-    val answer = bind_locked(sd, owner, port)
+    val answer = bind_locked(sd, port)
     lock.unlock(flags)
     answer
 
-private bind_locked(sd: usize, owner: u64, port: u16) -> Result[unit, NetError]
-    if !mine(sd, owner) then return Err(NoSocket)
+private bind_locked(sd: usize, port: u16) -> Result[unit, NetError]
+    if !mine(sd) then return Err(NoSocket)
     if port == 0 || port == ECHO_PORT then return Err(PortInUse)
     for s in 0..<SOCKETS
         if sockets[s].open && sockets[s].port == port then return Err(PortInUse)
@@ -459,16 +459,16 @@ private deliver(s: usize, from: Ip, from_port: u16, data: []const u8)
 
 // The oldest datagram queued on `sd`, copied into `into` (cut to fit), with its length and sender;
 // waits up to `timeout` ms for one, or for ever if `timeout` is 0.
-socket_recv(sd: usize, owner: u64, into: []u8, timeout: u64) -> Result[(usize, Ip, u16), NetError]
+socket_recv(sd: usize, into: []u8, timeout: u64) -> Result[(usize, Ip, u16), NetError]
     val deadline = if timeout == 0 then 0xffff_ffff_ffff_ffff else now_ms() + timeout
     val flags = lock.lock()
-    val answer = recv_locked(sd, owner, into, deadline)
+    val answer = recv_locked(sd, into, deadline)
     lock.unlock(flags)
     answer
 
-private recv_locked(sd: usize, owner: u64, into: []u8, deadline: u64) -> Result[(usize, Ip, u16), NetError]
+private recv_locked(sd: usize, into: []u8, deadline: u64) -> Result[(usize, Ip, u16), NetError]
     loop
-        if !mine(sd, owner) then return Err(NoSocket)
+        if !mine(sd) then return Err(NoSocket)
         if sockets[sd].port == 0 then return Err(NotBound)
         if sockets[sd].count > 0 then break
         if !stack.running then return Err(NoNet)
@@ -483,15 +483,15 @@ private recv_locked(sd: usize, owner: u64, into: []u8, deadline: u64) -> Result[
     Ok(answer)
 
 // Send `data` from `sd`'s port to `to`:`port`, resolving the next hop first (up to a second).
-socket_send(sd: usize, owner: u64, to: Ip, port: u16, data: []const u8) -> Result[usize, NetError]
+socket_send(sd: usize, to: Ip, port: u16, data: []const u8) -> Result[usize, NetError]
     if data.len > MAX_PAYLOAD then return Err(TooLong)
     val flags = lock.lock()
-    val answer = send_locked(sd, owner, to, port, data)
+    val answer = send_locked(sd, to, port, data)
     lock.unlock(flags)
     answer
 
-private send_locked(sd: usize, owner: u64, to: Ip, port: u16, data: []const u8) -> Result[usize, NetError]
-    if !mine(sd, owner) then return Err(NoSocket)
+private send_locked(sd: usize, to: Ip, port: u16, data: []const u8) -> Result[usize, NetError]
+    if !mine(sd) then return Err(NoSocket)
     if sockets[sd].port == 0 then return Err(NotBound)
     if !stack.running then return Err(NoNet)
     val mac = resolve(to, now_ms() + 1000) match
@@ -500,18 +500,18 @@ private send_locked(sd: usize, owner: u64, to: Ip, port: u16, data: []const u8) 
     if !send_udp(mac, to, sockets[sd].port, port, data) then return Err(NoNet)
     Ok(data.len)
 
-socket_close(sd: usize, owner: u64) -> Result[unit, NetError]
+// One more descriptor stands for `sd` (a dup, or a clone's copy of its parent's table).
+socket_hold(sd: usize)
     val flags = lock.lock()
-    val ok = mine(sd, owner)
-    if ok then sockets[sd].open = false
+    if mine(sd) then sockets[sd].refs += 1
     lock.unlock(flags)
-    if ok then Ok(()) else Err(NoSocket)
 
-// Close every socket `owner` still has; a process's end calls this.
-close_sockets_of(owner: u64)
+// A descriptor standing for `sd` was closed; the last closes the socket.
+socket_release(sd: usize)
     val flags = lock.lock()
-    for s in 0..<SOCKETS
-        if sockets[s].open && sockets[s].owner == owner then sockets[s].open = false
+    if mine(sd)
+        sockets[sd].refs -= 1
+        if sockets[sd].refs == 0 then sockets[sd].open = false
     lock.unlock(flags)
 
 // How many sockets are open.

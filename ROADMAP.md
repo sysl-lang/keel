@@ -21,6 +21,10 @@ the language rather than worked around here.
 - **A C library written in sysl**, exporting the C names (`open`, `read`, `printf`, `malloc`, …)
   over keel's system calls, so C programs can be **ported** to keel with clang. It exists for
   porting only: **everything written for keel that is not a port is written in sysl.**
+- **The system-call interface is Linux aarch64's** (user 2026-10-10): wherever keel has a call Linux
+  has, it takes Linux's number (the asm-generic table), arguments, structure layouts and flag values,
+  so nothing is ruled out for running static Linux binaries later; keel's own calls are numbered from
+  1024.
 
 ## Milestones
 
@@ -44,3 +48,4 @@ the language rather than worked around here.
 | 15 | POSIX processes: `fork` (copy-on-write) + `execve`, signals (`kill`, `sigaction`, SIGINT on Ctrl-C, SIGCHLD, default actions), process groups and job control (`&`, `jobs`, `fg`); `ps`, `kill` | Ctrl-C stops a spinner; a C program forks, execs and waits (a: fork/exec ✅ — `/bin/forktest`, a sysl program, forks with copy-on-write, execs and waits; `sysl.process` has neither, FINDINGS 68) ✅ (b: signals ✅ — Ctrl-C stops `spin` at the shell, `sleep 100 &` is listed by `jobs` and `ps`, killed with `kill %1`, and another brought back with `fg %1` and Ctrl-C'd; `sigtest` runs handlers and returns through `sigreturn`; no stopped state, so no Ctrl-Z; the library has no signal surface, FINDINGS 69) |
 | 16 | Threads in a process: `clone`-style thread creation, futex waits, TLS; pthreads in the libc | a ported threaded C program runs on all four cores |
 | 17 | The rest of a basic POSIX surface: `poll`/`select`, `termios` basics, `clock_gettime`/`nanosleep`, `getcwd`/`opendir` in the libc | a small POSIX-only C program ports unchanged |
+| 18 | Linux binaries: static musl programs (busybox) run unchanged | a static busybox runs at the shell |

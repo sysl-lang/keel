@@ -1,18 +1,24 @@
 module keel.proc
 
-// The datagram socket calls (user/abi has the numbers), over keel.net's socket table. A socket is not a
-// file descriptor: it is numbered by its place in keel.net's table and belongs to the process that
-// opened it, which is all a first slice needs, and a process's sockets are closed when it ends.
+// The datagram socket calls (user/abi has the numbers), over keel.net's socket table, in Linux's shapes.
+// A socket is a descriptor: `Holds.Socket`, its `ino` the socket's place in keel.net's table and its
+// `offset` the receive timeout in milliseconds SO_RCVTIMEO set (0: for ever). keel.net counts the
+// descriptors standing for each socket, and the socket closes with the last.
 //
 // A datagram crosses the user boundary through a kernel buffer on this thread's stack, as the console's
 // bytes do: keel.net copies under its lock, and the copy to or from user memory is made outside it.
 
-import abi.keel.abi.{EADDRINUSE, EBADF, EDESTADDRREQ, EFAULT, EHOSTUNREACH, EMSGSIZE, ENETDOWN, ENFILE, Errno,
-    ETIMEDOUT, SockAddr}
+import abi.keel.abi.{AF_INET, EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, EBADF, EDESTADDRREQ, EFAULT,
+    EHOSTUNREACH, EINVAL, EMFILE, EMSGSIZE, ENETDOWN, ENFILE, ENOPROTOOPT, ENOTSOCK, EOPNOTSUPP, EPROTONOSUPPORT,
+    ESOCKTNOSUPPORT, Errno, FIRST_FILE_FD, IPPROTO_UDP, MAX_FDS, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_TYPE_MASK, SOL_SOCKET,
+    SO_RCVTIMEO, SO_REUSEADDR, SO_SNDTIMEO, SockAddrIn, Timeval, sock_addr_in}
 import keel.mm
 import keel.net
 import keel.net.{Ip, NetError}
-import keel.sched.Process
+import keel.sched.{Holds, OpenFile, Process}
+
+// keel's address on its one interface, 10.0.2.15: the only one a socket may be bound to, besides any.
+private const OUR_IP: u32 = 0x0a00_020f
 
 private errno(e: NetError) -> Errno = e match
     NoNet -> ENETDOWN
@@ -21,55 +27,114 @@ private errno(e: NetError) -> Errno = e match
     PortInUse -> EADDRINUSE
     NotBound -> EDESTADDRREQ
     TooLong -> EMSGSIZE
-    TimedOut -> ETIMEDOUT
+    TimedOut -> EAGAIN
     NoRoute -> EHOSTUNREACH
 
-// socket() -> a socket number
-private[proc] sys_socket(p: *Process) -> Result[i64, Errno] = net.socket_open(p.pid) match
-    Ok(sd) -> Ok(i64(sd))
-    Err(e) -> Err(errno(e))
+// The descriptor `fd` when it is a socket: EBADF when it is not open, ENOTSOCK when it is something else.
+private socket_of(p: *Process, fd: u64) -> Result[*OpenFile, Errno]
+    if fd >= MAX_FDS then return Err(EBADF)
+    val f = &p.files[usize(fd)]
+    if f.holds == Holds.Free then return Err(EBADF)
+    if f.holds != Holds.Socket then return Err(ENOTSOCK)
+    Ok(f)
 
-// bind(sd, port) -> 0
+// socket(domain, type, protocol) -> fd: AF_INET, SOCK_DGRAM (SOCK_CLOEXEC taken and changing nothing),
+// and 0 or IPPROTO_UDP.
+private[proc] sys_socket(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[0] != AF_INET then return Err(EAFNOSUPPORT)
+    if (regs[1] & ~(SOCK_TYPE_MASK | SOCK_CLOEXEC)) != 0 then return Err(EINVAL)
+    if (regs[1] & SOCK_TYPE_MASK) != SOCK_DGRAM then return Err(ESOCKTNOSUPPORT)
+    if regs[2] != 0 && regs[2] != IPPROTO_UDP then return Err(EPROTONOSUPPORT)
+    var fd = FIRST_FILE_FD
+    while fd < MAX_FDS && p.files[usize(fd)].holds != Holds.Free
+        fd += 1
+    if fd == MAX_FDS then return Err(EMFILE)
+    val sd = net.socket_open() match
+        Ok(sd) -> sd
+        Err(e) -> return Err(errno(e))
+    p.files[usize(fd)] = OpenFile(Holds.Socket, u32(sd), 0, 0)
+    Ok(i64(fd))
+
+// A `sockaddr_in` argument, `len` bytes at `va`, copied in.
+private addr_in(p: *Process, va: u64, len: u64) -> Result[SockAddrIn, Errno]
+    if len < u64(sizeof(SockAddrIn)) then return Err(EINVAL)
+    var a = sock_addr_in(0, 0)
+    val raw: *u8 = ptr_cast(&a)
+    if !mm.copy_from_user(&p.space, va, raw[0..<sizeof(SockAddrIn)]) then return Err(EFAULT)
+    if u64(a.family) != AF_INET then return Err(EAFNOSUPPORT)
+    Ok(a)
+
+// bind(fd, *SockAddrIn, len) -> 0
 private[proc] sys_bind(p: *Process, regs: *u64) -> Result[i64, Errno]
-    if regs[1] > 0xffff then return Err(Errno.EINVAL)
-    net.socket_bind(usize(regs[0]), p.pid, u16(regs[1])) match
+    val f = socket_of(p, regs[0])?
+    val a = addr_in(p, regs[1], regs[2])?
+    if a.ip() != 0 && a.ip() != OUR_IP then return Err(EADDRNOTAVAIL)
+    net.socket_bind(usize(f.ino), a.port()) match
         Ok(_) -> Ok(0)
         Err(e) -> Err(errno(e))
 
-// recvfrom(sd, buf, len, *SockAddr, timeout_ms) -> bytes: the oldest datagram, cut to `len`, and who
-// sent it; waits up to `timeout_ms` (0: for ever).
+// recvfrom(fd, buf, len, flags, *SockAddrIn | 0, *u32 len | 0) -> bytes: the oldest datagram, cut to
+// `len`, and who sent it; waits as long as the socket's SO_RCVTIMEO.
 private[proc] sys_recvfrom(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val buf = regs[1]
-    val len = if regs[2] < u64(net.MAX_PAYLOAD) then usize(regs[2]) else net.MAX_PAYLOAD
-    val from = regs[3]
+    val f = socket_of(p, regs[0])?
+    if regs[3] != 0 then return Err(EOPNOTSUPP)
+    received(p, f, regs[1], regs[2], regs[4], regs[5])
+
+// read(fd, buf, len) on a socket: recvfrom with no sender asked for.
+private[proc] socket_read(p: *Process, f: *OpenFile, buf: u64, want: u64) -> Result[i64, Errno] =
+    received(p, f, buf, want, 0, 0)
+
+private received(p: *Process, f: *OpenFile, buf: u64, want: u64, from: u64, from_len: u64) -> Result[i64, Errno]
+    val len = if want < u64(net.MAX_PAYLOAD) then usize(want) else net.MAX_PAYLOAD
     if !mm.user_range(&p.space, buf, u64(len), true) then return Err(EFAULT)
-    if from != 0 && !mm.user_range(&p.space, from, u64(sizeof(SockAddr)), true) then return Err(EFAULT)
+    var room: u32 = 0
+    if from != 0
+        val raw: *u8 = ptr_cast(&room)
+        if from_len == 0 || !mm.copy_from_user(&p.space, from_len, raw[0..<4]) then return Err(EFAULT)
+        if i32(room) < 0 then return Err(EINVAL)
     var bytes: [net.MAX_PAYLOAD]u8 = [0; net.MAX_PAYLOAD]
-    val (n, ip, port) = net.socket_recv(usize(regs[0]), p.pid, bytes[0..<len], regs[4]) match
+    val (n, ip, port) = net.socket_recv(usize(f.ino), bytes[0..<len], f.offset) match
         Ok(got) -> got
         Err(e) -> return Err(errno(e))
     if !mm.copy_to_user(&p.space, buf, bytes[0..<n]) then return Err(EFAULT)
     if from != 0
-        var who = SockAddr(u32(ip), port, 0)
+        var who = sock_addr_in(u32(ip), port)
         val raw: *u8 = ptr_cast(&who)
-        if !mm.copy_to_user(&p.space, from, raw[0..<sizeof(SockAddr)]) then return Err(EFAULT)
+        val take = if usize(room) < sizeof(SockAddrIn) then usize(room) else sizeof(SockAddrIn)
+        if !mm.copy_to_user(&p.space, from, raw[0..<take]) then return Err(EFAULT)
+        var full = u32(sizeof(SockAddrIn))
+        val l: *u8 = ptr_cast(&full)
+        if !mm.copy_to_user(&p.space, from_len, l[0..<4]) then return Err(EFAULT)
     Ok(i64(n))
 
-// sendto(sd, buf, len, *SockAddr) -> bytes
+// sendto(fd, buf, len, flags, *SockAddrIn, len) -> bytes. keel's sockets are never connected, so the
+// address is needed.
 private[proc] sys_sendto(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val f = socket_of(p, regs[0])?
+    if regs[3] != 0 then return Err(EOPNOTSUPP)
+    if regs[4] == 0 then return Err(EDESTADDRREQ)
     if regs[2] > u64(net.MAX_PAYLOAD) then return Err(EMSGSIZE)
+    val to = addr_in(p, regs[4], regs[5])?
     val len = usize(regs[2])
     var bytes: [net.MAX_PAYLOAD]u8 = [0; net.MAX_PAYLOAD]
     if !mm.copy_from_user(&p.space, regs[1], bytes[0..<len]) then return Err(EFAULT)
-    var to = SockAddr(0, 0, 0)
-    val raw: *u8 = ptr_cast(&to)
-    if !mm.copy_from_user(&p.space, regs[3], raw[0..<sizeof(SockAddr)]) then return Err(EFAULT)
-    net.socket_send(usize(regs[0]), p.pid, Ip(to.ip), to.port, bytes[0..<len]) match
+    net.socket_send(usize(f.ino), Ip(to.ip()), to.port(), bytes[0..<len]) match
         Ok(n) -> Ok(i64(n))
         Err(e) -> Err(errno(e))
 
-// sockclose(sd) -> 0
-private[proc] sys_sockclose(p: *Process, regs: *u64) -> Result[i64, Errno] =
-    net.socket_close(usize(regs[0]), p.pid) match
-        Ok(_) -> Ok(0)
-        Err(e) -> Err(errno(e))
+// setsockopt(fd, SOL_SOCKET, option, value, len) -> 0. SO_RCVTIMEO takes a `Timeval` (zero: for ever);
+// SO_SNDTIMEO and SO_REUSEADDR are taken and change nothing — a send never waits, and no port outlives
+// its socket.
+private[proc] sys_setsockopt(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val f = socket_of(p, regs[0])?
+    if regs[1] != SOL_SOCKET then return Err(ENOPROTOOPT)
+    if regs[2] == SO_SNDTIMEO || regs[2] == SO_REUSEADDR then return Ok(0)
+    if regs[2] != SO_RCVTIMEO then return Err(ENOPROTOOPT)
+    if regs[4] < u64(sizeof(Timeval)) then return Err(EINVAL)
+    var t = Timeval(0, 0)
+    val raw: *u8 = ptr_cast(&t)
+    if !mm.copy_from_user(&p.space, regs[3], raw[0..<sizeof(Timeval)]) then return Err(EFAULT)
+    if t.sec < 0 || t.usec < 0 || t.usec >= 1_000_000 then return Err(EINVAL)
+    val ms = u64(t.sec) * 1000 + u64(t.usec + 999) / 1000
+    f.offset = ms
+    Ok(0)

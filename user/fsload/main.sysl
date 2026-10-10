@@ -24,7 +24,7 @@ run() -> Result[bool, Errno]
     user.close(out)?
 
     val back = user.open(name, O_RDONLY)?
-    var good = user.fstat(back)?.size == u64(SIZE)
+    var good = user.fstat(back)?.size == i64(SIZE)
     var at: usize = 0
     loop
         val n = usize(user.read(back, chunk[..])?)

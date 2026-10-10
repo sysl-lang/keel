@@ -1,13 +1,15 @@
 module keel.proc
 
-// `fork` and `execve`.
+// `clone` (as fork) and `execve`.
 //
-// **fork** copies the calling process: its address space copy-on-write (keel.mm's cow.sysl), every
-// descriptor (each counted open once more, so a pipe sees one more reader or writer; a descriptor's
-// offset is copied, not shared, as everywhere in keel), its current directory, uid and gid, and its
-// environment. The child's thread enters EL0 from a copy of the registers the parent's `svc` left in its
-// trap frame, with x0 = 0: it returns from the same system call, answered 0, where the parent is
-// answered the child's pid. Sockets are not descriptors in keel and are not inherited.
+// **clone** with flags SIGCHLD and no new stack — the combination a C library's `fork` makes, and the
+// only one keel takes (anything else is EINVAL) — copies the calling process: its address space
+// copy-on-write (keel.mm's cow.sysl), every descriptor (each counted open once more, so a pipe sees one
+// more reader or writer and a socket one more holder; a descriptor's offset is copied, not shared, as
+// everywhere in keel), its current directory, uid and gid, and its environment. The child's thread
+// enters EL0 from a copy of the registers the parent's `svc` left in its trap frame, with x0 = 0: it
+// returns from the same system call, answered 0, where the parent is answered the child's pid; the
+// parent is sent SIGCHLD when it ends.
 //
 // **execve** replaces the calling process's image: the same pid, parent, descriptors and current
 // directory; a new address space loaded from the file, the arguments and the environment laid on its
@@ -16,7 +18,8 @@ module keel.proc
 // the load, the room for the arguments — is done before the old image is touched, so a failed
 // `execve` returns its error to a caller exactly as it was.
 
-import abi.keel.abi.{ARGS_ROOM, E2BIG, EAGAIN, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOMEM, ENV_ROOM, Errno}
+import abi.keel.abi.{ARGS_ROOM, E2BIG, EAGAIN, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOMEM, ENV_ROOM, Errno,
+    PATH_ROOM, SIGCHLD}
 import keel.cpu
 import keel.fs
 import keel.mm
@@ -24,10 +27,12 @@ import keel.sched
 import keel.sched.{Context, Env, Process}
 import sysl.buf.{Buf, buf}
 
-private const MAX_EXEC_PATH: usize = 256
+private const MAX_EXEC_PATH: usize = usize(PATH_ROOM)
 
-// fork() -> the child's pid; 0 in the child
-private[proc] sys_fork(p: *Process, regs: *u64) -> Result[i64, Errno]
+// clone(flags, stack, parent_tid, tls, child_tid) -> the child's pid; 0 in the child. Only flags
+// SIGCHLD with stack 0 — a fork — is taken; the three addresses mean nothing without other flags.
+private[proc] sys_clone(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[0] != SIGCHLD || regs[1] != 0 then return Err(EINVAL)
     val space = mm.fork_space(&p.space) match
         Some(s) -> s
         None -> return Err(ENOMEM)
@@ -56,21 +61,22 @@ private copied_env(p: *Process) -> &sync Env
         bytes.push(p.env.bytes[i])
     sched.env_of(bytes.view())
 
-// execve(path, path_len, args, args_len, env, env_len) -> does not return; an error leaves the caller
-// as it was. `args` are NUL-separated, argv[0] first; `env` is `NAME=value` entries, each ending in NUL.
+// execve(path, argv, envp) -> does not return; an error leaves the caller as it was. `path` is a
+// NUL-terminated string; `argv` and `envp` are arrays of pointers to them, each ending in a null
+// pointer (a null array is an empty one). Their strings together are at most ARGS_ROOM and ENV_ROOM
+// bytes, NULs included.
 private[proc] sys_execve(p: *Process, regs: *u64) -> Result[i64, Errno]
-    val path_len = regs[1]
-    if path_len == 0 then return Err(ENOENT)
-    if path_len > u64(MAX_EXEC_PATH) then return Err(ENAMETOOLONG)
     var path: [MAX_EXEC_PATH]u8 = [0; MAX_EXEC_PATH]
-    if !mm.copy_from_user(&p.space, regs[0], path[0..<usize(path_len)]) then return Err(EFAULT)
-    if regs[3] > ARGS_ROOM || regs[5] > ENV_ROOM then return Err(E2BIG)
-    val packed = copied_in(p, regs[2], regs[3])?
+    val path_len = mm.copy_cstr_from_user(&p.space, regs[0], path[..]) match
+        Some(n) -> n
+        None -> return Err(EFAULT)
+    if path_len == 0 then return Err(ENOENT)
+    if path_len == MAX_EXEC_PATH then return Err(ENAMETOOLONG)
+    val packed = vector_in(p, regs[1], ARGS_ROOM)?
     val args = unpacked(packed.view())?
-    val env = copied_in(p, regs[4], regs[5])?
-    if env.len() > 0 && env.at(env.len() - 1) != 0 then return Err(EINVAL)
+    val env = vector_in(p, regs[2], ENV_ROOM)?
 
-    val image = fs.read_executable(p.cwd[0..<p.cwd_len], path[0..<usize(path_len)], sched.cred_of(p))?
+    val image = fs.read_executable(p.cwd[0..<p.cwd_len], path[0..<path_len], sched.cred_of(p))?
     var l = load(image.bytes.view()) match
         Ok(l) -> l
         Err(e) -> return Err(errno_of(e))
@@ -100,10 +106,27 @@ private[proc] sys_execve(p: *Process, regs: *u64) -> Result[i64, Errno]
     replace_regs(regs, fresh_regs(l.entry, sp, 0))
     Ok(0)
 
-// `len` bytes from the caller's `va`.
-private copied_in(p: *Process, va: u64, len: u64) -> Result[Buf[u8], Errno]
-    var bytes: Buf[u8] = buf()
-    for _ in 0..<len
-        bytes.push(0)
-    if len > 0 && !mm.copy_from_user(&p.space, va, bytes.view()) then return Err(EFAULT)
-    Ok(bytes)
+// The strings of the null-ended pointer array at the caller's `va`, each followed by its NUL, at most
+// `room` bytes in all (E2BIG past it); none for a null `va`.
+private vector_in(p: *Process, va: u64, room: u64) -> Result[Buf[u8], Errno]
+    var out: Buf[u8] = buf()
+    if va == 0 then return Ok(out)
+    var space: Buf[u8] = buf()
+    for _ in 0..<room
+        space.push(0)
+    var used: usize = 0
+    var at = va
+    loop
+        var ptr: u64 = 0
+        val raw: *u8 = ptr_cast(&ptr)
+        if !mm.copy_from_user(&p.space, at, raw[0..<8]) then return Err(EFAULT)
+        if ptr == 0 then break
+        if used == usize(room) then return Err(E2BIG)
+        val n = mm.copy_cstr_from_user(&p.space, ptr, space.view()[used..]) match
+            Some(n) -> n
+            None -> return Err(EFAULT)
+        if n == usize(room) - used then return Err(E2BIG)
+        used += n + 1
+        at += 8
+    out.extend(space.view()[0..<used])
+    Ok(out)

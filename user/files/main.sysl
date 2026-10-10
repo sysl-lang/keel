@@ -4,8 +4,7 @@
 // the previous boot's /out.txt is still there. scripts/boot-test.sh boots twice on one disk image, so
 // the second boot finds the first one's file. Exits 0 only if every check passed.
 
-import abi.keel.abi.{Dirent, EBADF, EPIPE, EEXIST, EINVAL, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, Errno, KIND_DIR, KIND_FILE,
-    O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY, SEEK_SET, SIGPIPE, SIG_DFL, SIG_IGN, Stat}
+import abi.keel.abi.{DIRENT64_NAME, EBADF, EPIPE, EEXIST, EINVAL, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, Errno, O_CREAT, O_EXCL, O_RDONLY, O_TRUNC, O_WRONLY, SEEK_SET, SIGPIPE, SIG_DFL, SIG_IGN, Stat}
 import rt.keel.user
 import sysl.buf.{Buf, buf}
 import sysl.text.from_utf8
@@ -49,21 +48,28 @@ names(path: string) -> Buf[string]
         Err(_) ->
             fail(s"open $path to list it")
             return out
-    // Three entries at a time, into storage typed as entries; `getdents` takes it as bytes.
-    var room: [3]Dirent = [Dirent(0, 0, 0, 0, [0; 24]); 3]
-    val raw: *u8 = ptr_cast(&room[0])
+    // A few `linux_dirent64` records at a time — a name, its NUL and the 19-byte head, padded to 8 — so
+    // that listing a directory takes several calls, each starting where the last stopped.
+    var room: [96]u8 = [0; 96]
     loop
-        val n = user.getdents(fd, raw[0..<sizeof([3]Dirent)]) match
-            Ok(n) -> usize(n) / sizeof(Dirent)
+        val n = user.getdents(fd, room[..]) match
+            Ok(n) -> usize(n)
             Err(_) ->
                 fail(s"getdents $path")
                 break
         if n == 0 then break
-        for k in 0..<n
-            val name = from_utf8(room[k].name[0..<usize(room[k].len)]) match
+        var at: usize = 0
+        while at < n
+            val reclen = usize(room[at + 16]) | (usize(room[at + 17]) << 8)
+            val first = at + usize(DIRENT64_NAME)
+            var end = first
+            while room[end] != 0
+                end += 1
+            val name = from_utf8(room[first..<end]) match
                 Ok(s) -> s
                 Err(_) -> "?"
             out.push(name)
+            at += reclen
     val _ = user.close(fd)
     out
 
@@ -150,9 +156,9 @@ reread(header: string) -> Result[bool, Errno]
     for k in 0..<few.len
         if few[k] != body_byte(20_000 + k) then seek_ok = false
     val whole = well_formed(back) && back.view()[0..<header.bytes.len] == header.bytes
-    val sized = st.size == u64(header.bytes.len + BODY) && st.kind == KIND_FILE
+    val sized = st.size == i64(header.bytes.len + BODY) && st.is_file()
     if !whole || !sized || !seek_ok
-        print("user: read back", back.len(), "bytes, whole", whole, "; fstat size", st.size, "kind", st.kind,
+        print("user: read back", back.len(), "bytes, whole", whole, "; fstat size", st.size, "mode", st.mode,
             "; lseek to", at, "read", n, "ok", seek_ok)
     Ok(whole && sized && seek_ok)
 
@@ -165,8 +171,8 @@ reread(header) match
 
 dirs() -> Result[unit, Errno]
     val root = user.stat("/")?
-    check(root.kind == KIND_DIR, "/ is not a directory")
-    check(user.stat("/dir")?.kind == KIND_DIR, "mkfs's /dir is not a directory")
+    check(root.is_dir(), "/ is not a directory")
+    check(user.stat("/dir")?.is_dir(), "mkfs's /dir is not a directory")
     check(has(names("/dir"), "inner.txt"), "/dir does not list inner.txt")
 
     user.mkdir("/d1")?
@@ -177,7 +183,7 @@ dirs() -> Result[unit, Errno]
     val listed = names("/d1")
     check(listed.len() == 4 && has(listed, ".") && has(listed, "..") && has(listed, "a") && has(listed, "sub"),
         "/d1 does not list exactly . .. a sub")
-    check(user.stat("/d1")?.links == 3, "/d1's link count is not 3 with one subdirectory")
+    check(user.stat("/d1")?.nlink == 3, "/d1's link count is not 3 with one subdirectory")
 
     // A file renamed into a subdirectory, then the subdirectory moved to the root.
     user.rename("/d1/a", "/d1/sub/b")?
@@ -185,7 +191,7 @@ dirs() -> Result[unit, Errno]
     check(user.stat("/d1/sub/b")?.size == 1, "the renamed file lost its byte")
     user.rename("/d1/sub", "/d2")?
     check(user.stat("/d2/..")?.ino == root.ino, "/d2/.. is not the root after the move")
-    check(user.stat("/d1")?.links == 2, "/d1 still counts the subdirectory that left")
+    check(user.stat("/d1")?.nlink == 2, "/d1 still counts the subdirectory that left")
     check(has(names("/"), "d2"), "/ does not list d2")
 
     // The errors.
