@@ -2629,6 +2629,28 @@ a `sysl.term` mode seam in the hook style — `sysl_term_get(fd, *Mode) -> int` 
 `read_hidden(prompt) -> Option[string]` above it, answered by `tcgetattr`/`tcsetattr` on a host and by
 keel.fsys here.
 
+## 76. The `posix` capability means both "POSIX semantics" and "a C POSIX library", so keel can declare neither honestly
+
+A freestanding manifest provides every capability it does not mention, so a keel program that imports
+a C-calling `sysl.posix.*` module (`sysl.posix.time.sleep`, FINDINGS 74) gets past analysis and fails
+at the link. `capabilities { posix = false }` in the target block turns that into a compile-time
+refusal — but 8 of keel's 41 manifests cannot take it (`sh`, `env`, `id`, `login`, `su`, `whoami`,
+`stdsig`, `forktest`):
+
+    error: a 'sysl.process.Spawned' can die here, and its destructor reaches 'sysl.process', which
+    requires 'posix', and 'aarch64-freestanding' does not provide it
+    error: this reaches 'sysl.env.vars', which needs 'posix', and 'aarch64-freestanding' does not
+    provide it                                                        (user/sh/main.sysl:596)
+
+though `sysl.process`'s own header says it is for exactly this case ("a program answers itself, with an
+`@export` per hook, on a target with no C library: a kernel with its own process calls") and keel.fsys
+answers every hook. keel *is* POSIX in the sense `sysl.process` needs; what it lacks is a C library. One
+capability names both, so the program must either understate (`posix = false`, refusing modules it
+supports) or overstate (posix provided, admitting modules that call C). Clean form: the `sysl.posix.*`
+bindings that call C require `libc` (off by default on freestanding), the hook-backed modules require
+`posix` alone; keel then declares nothing and `sysl.posix.time` is refused for want of libc. keel dev
+70faf3c carries `posix = false` on the 33 manifests that can take it.
+
 ## What worked in milestone 17
 
 - **No sysl gap in the kernel half.** A poller waits on one module `WaitQueue` with an event count under
