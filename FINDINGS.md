@@ -2651,6 +2651,31 @@ bindings that call C require `libc` (off by default on freestanding), the hook-b
 `posix` alone; keel then declares nothing and `sysl.posix.time` is refused for want of libc. keel dev
 70faf3c carries `posix = false` on the 33 manifests that can take it.
 
+## KFS: keel's new filesystem
+
+## 77. A `match` arm of `Err(…)` does not take `Result`'s other type argument from a sibling `Ok(…)` arm (bug)
+
+KFS stage 3's allocator answered a `Result` from a `match` whose arms each name one half of it. The
+shortest input (sysl 0.1.0-alpha.9):
+
+    enum E
+        Bad
+
+    pick(n: int) -> Result[int, E]
+        val r = n match
+            0 -> Err(E.Bad)
+            _ -> Ok(n)
+        r
+
+    error: cannot infer the type argument 'T' of 'Err' here — annotate the expected type
+     --> main.sysl:6:14
+
+The reference says a `match` takes a type from its sibling arm (`reference/compact.md`, the integer
+literal paragraph: "a `match` or an `if` takes it from the sibling arm"), and FINDINGS 67 was the same
+rule failing for a tuple of literals. Here the `Ok(n)` arm fixes `T = int` and the `Err` arm fixes `E`;
+together they determine `Result[int, E]`, as they would if written in the other order or annotated.
+The workaround, which KFS used, is to restructure (or annotate `val r: Result[int, E]`).
+
 ## What worked in milestone 17
 
 - **No sysl gap in the kernel half.** A poller waits on one module `WaitQueue` with an event count under
