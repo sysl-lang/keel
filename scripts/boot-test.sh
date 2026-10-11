@@ -549,6 +549,32 @@ print "for root's eyes only" > $fsroot/etc/secret
 owners=$out/owners
 print -l "/home/alice 1000 100 755" "/bin/su 0 0 4755" "/etc/secret 0 0 600" > $owners
 $mkfs build $disk 4096 $fsroot $owners
+
+# The same tree and owners go into a 32 MiB KFS image through mkfs.kfs (the kernel does not mount it yet):
+# it has to be fsck-clean, and big files must read back byte for byte through kfsdump.
+kfs_disk=$out/kfs-disk.img
+$compiler build -o $out/mkfs.kfs $root/tools/mkfs-kfs
+$compiler build -o $out/kfsdump $root/tools/kfsdump
+$compiler build -o $out/fsck.kfs $root/tools/fsck-kfs
+if ! $out/mkfs.kfs $kfs_disk 8192 -d $fsroot -o $owners; then
+    echo "host: mkfs.kfs could not build the fsroot into 32 MiB"
+    exit 1
+fi
+if ! $out/fsck.kfs -n $kfs_disk; then
+    echo "host: the KFS image of the fsroot is not clean"
+    exit 1
+fi
+for f in /m9/big.bin /bin/busybox /hello.txt /dir/inner.txt; do
+    if ! $out/kfsdump get $kfs_disk $f $out/kfs-out; then
+        echo "host: kfsdump get $f failed"
+        exit 1
+    fi
+    if ! cmp $fsroot$f $out/kfs-out; then
+        echo "host: $f differs after a trip through the KFS image"
+        exit 1
+    fi
+done
+echo "host: kfs fsroot ok"
 sector 7 3 | perl -e 'open(my $f, "+<", $ARGV[0]) or die; seek($f, 512, 0); local $/; print $f <STDIN>' $disk
 
 if [[ $accel == hvf ]]; then
