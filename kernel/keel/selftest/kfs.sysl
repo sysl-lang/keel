@@ -1,0 +1,339 @@
+module keel.selftest
+
+// KFS in the kernel, beside the old filesystem (kfs/SPEC.md section 27): the second disk the boot test
+// attaches holds a KFS image mkfs.kfs built, which this mounts while the old filesystem stays the root.
+//
+//   kfs mounted       the geometry the superblock says
+//   kfs cache ...     the buffer and inode caches under pressure, with numbers
+//   kfs smp ok        four threads on four cores creating, writing, reading back and removing files in
+//                     four directories at once, files held open across their own unlink among them
+//   kfs replayed n    the transactions the mount replayed: 0 on a fresh image, which this boot then
+//                     ends on purpose after three commits and before their checkpoint (a power cut);
+//                     3 on the boot after that, whose files are all there
+//   kfs ended ...     the power cut, or a clean unmount
+//   kfs heap ...      every heap block the mount took came back
+//
+// After each boot `scripts/boot-test.sh` runs `fsck.kfs -n` on the image (after the power cut it replays
+// the log in memory first) and, after the clean unmount, reads the files the threads kept with kfsdump.
+
+import keel.cpu
+import keel.heap
+import keel.kfs.{CACHE_TARGET, ICACHE_TARGET, KFs, Mounted, cache_stats, keep_caches, lock_stats, locks_held, mount_disk,
+    op, pause_committer, power_cut, unmount}
+import keel.sched.{Thread, join, spawn}
+import keel.virtio
+import kfs.keel.kfs as pkg
+import kfs.keel.kfs.{BLOCK_SIZE, Caller, DIR_POS_END, FsError, ROOT_INO, SetAttr, no_change}
+import sysl.buf.{Buf, buf}
+import sysl.sync.{Atomic, Ordering}
+
+private root() -> Caller = Caller(0, 0)
+
+// What the threads do: files each, every third held open across its unlink, and the file each keeps.
+private const KFS_THREADS: u64 = 4
+private const KFS_FILES: u64 = 96
+private const KEEP_BYTES: usize = 10_000
+private const KFS_ONE_AT_A_TIME: bool = false
+
+// The transactions the power cut leaves in the log.
+private const REPLAYED: u64 = 3
+
+// Byte `off` of file `k` of thread `t` (the kept file is file 1000). `scripts/boot-test.sh` has the
+// same formula for the kept files, which it reads back on the host.
+private fill(t: u64, k: u64, off: usize) -> u8 = u8((t * 31 + k * 7 + u64(off) * 13 + u64(off / 251)) & 0xff)
+
+// File `k` of thread `t`'s size: 1 to 12,000 bytes, so files of one, two and three blocks.
+private size_of(t: u64, k: u64) -> usize = usize(1 + (k * 1531 + t * 977) % 12_000)
+
+private content(t: u64, k: u64, n: usize) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    for off in 0..<n
+        b.push(fill(t, k, off))
+    b
+
+kfs_tests()
+    if virtio.count() < 2
+        print("keel: no second disk for KFS")
+        return
+    val heap_before = heap.live()
+    if !kfs_session() then return
+    kfs_read_only()
+    // Everything the mounts allocated went with them when they ended.
+    if heap.live() == heap_before then print("keel: kfs heap reclaimed") else print("keel: kfs heap wrong: blocks live", heap.live(), "of", heap_before)
+
+// Mount, the threads, and the boot's end: the power cut or the check of what it left. False when the
+// image would not mount.
+private kfs_session() -> bool
+    var m = mount_disk(1) match
+        Ok(m) -> m
+        Err(e) ->
+            print("keel: kfs mount failed: errno", pkg.errno(e))
+            return false
+    val p = m.at()
+    print("keel: kfs mounted,", p.sb.blocks, "blocks,", p.sb.group_count, "groups, journal", p.sb.journal_blocks)
+    kfs_smp(p)
+    val first_boot = op(p, () -> pkg.lookup_name(p, ROOT_INO, "replay".bytes)).is_err()
+    if first_boot
+        if p.replayed == 0 then print("keel: kfs replayed 0 transactions") else print("keel: kfs replay wrong: a fresh image replayed", p.replayed)
+        power_cut_after_commits(&m)
+    else
+        check_replayed(p)
+        unmount(&m) match
+            Ok(_) -> print("keel: kfs ended: unmounted clean")
+            Err(e) -> print("keel: kfs unmount failed: errno", pkg.errno(e))
+    true
+
+// The third disk's drive has its write cache off, so the device offers no flush; KFS has no way to order
+// its commit block after what it commits there, and mounts it read-only (section 2).
+private kfs_read_only()
+    if virtio.count() < 3 || virtio.has_flush(2)
+        print("keel: kfs: no third disk without a flush")
+        return
+    var m = mount_disk(2) match
+        Ok(m) -> m
+        Err(e) ->
+            print("keel: kfs mount of the disk without flush failed: errno", pkg.errno(e))
+            return
+    val p = m.at()
+    val ro = p.read_only()
+    val refused = op(p, () -> pkg.create(p, ROOT_INO, "x".bytes, 0o644, root())) match
+        Err(FsError.ReadOnly) -> true
+        _ -> false
+    val clean = unmount(&m).is_ok()
+    if ro && refused && clean
+        print("keel: kfs on a disk without flush: mounted read-only, a create refused")
+    else
+        print("keel: kfs on a disk without flush wrong: read-only", ro, "create refused", refused, "unmounted", clean)
+
+// --- Four threads at once -------------------------------------------------------------------------------
+
+private struct Tally
+    good: Atomic[u64]
+    bad: Atomic[u64]
+    cores: Atomic[u64]
+    first_bad: Atomic[u64]
+
+private kfs_smp(p: *KFs)
+    // /smp/t0 ... /smp/t3, emptied of what a previous boot left.
+    var dirs: [4]u64 = [0; 4]
+    var ok = true
+    val smp = op(p, () -> pkg.lookup_name(p, ROOT_INO, "smp".bytes)) match
+        Ok(e) -> e.ino
+        Err(_) -> op(p, () -> pkg.mkdir(p, ROOT_INO, "smp".bytes, 0o755, root())).unwrap_or(0)
+    for t in 0..<KFS_THREADS
+        val name = s"t$t"
+        dirs[usize(t)] = op(p, () -> pkg.lookup_name(p, smp, name.bytes)) match
+            Ok(e) -> e.ino
+            Err(_) -> op(p, () -> pkg.mkdir(p, smp, name.bytes, 0o755, root())).unwrap_or(0)
+        if dirs[usize(t)] == 0 then ok = false
+        for n in names_in(p, dirs[usize(t)])
+            if op(p, () -> pkg.unlink(p, dirs[usize(t)], n.view())).is_err() then ok = false
+
+    val tally: &sync Tally = Tally(Atomic(0), Atomic(0), Atomic(0), Atomic(0))
+    val threads: Buf[&sync Thread] = buf()
+    for t in 0..<KFS_THREADS
+        val dir = dirs[usize(t)]
+        threads.push(spawn(() -> worker(p, t, dir, tally)))
+        if KFS_ONE_AT_A_TIME then join(threads[threads.len() - 1])
+    if !KFS_ONE_AT_A_TIME
+        for th in threads
+            join(th)
+    if op(p, () -> p.sync()).is_err() then ok = false
+
+    // Each directory holds exactly the file its thread kept.
+    for t in 0..<KFS_THREADS
+        val left = names_in(p, dirs[usize(t)])
+        if left.len() != 1 || !same(left[0].view(), "keep".bytes) then ok = false
+    val good = tally.good.load(Ordering.Acquire)
+    val bad = tally.bad.load(Ordering.Acquire)
+    val cores = popcount(tally.cores.load(Ordering.Acquire))
+    val locks_left = locks_held()
+
+    val (trims, dropped, writebacks, forgotten, peak_buffers, peak_inodes, passes) = cache_stats()
+    val loads = p.loads.load()
+    val (checked, most_held, most_sleepers, sleeps) = lock_stats()
+    print("keel: kfs cache under pressure: target", CACHE_TARGET, "buffers,", loads, "blocks loaded,", dropped,
+          "dropped in", trims, "trims, at most", peak_buffers, "cached,", writebacks, "checkpoints asked;",
+          "inodes: target", ICACHE_TARGET, ",", forgotten, "forgotten, at most", peak_inodes, "cached")
+    print("keel: kfs locks:", checked, "taken in order,", sleeps, "slept, at most", most_held, "held by one thread,",
+          most_sleepers, "sleeping locks at once;", passes, "commit passes")
+    val pressure = loads > u64(CACHE_TARGET) && dropped > 0 && peak_buffers > u64(CACHE_TARGET)
+    if ok && good == KFS_THREADS * (KFS_FILES + 1) && bad == 0 && cores >= 2 && locks_left == 0 && pressure
+        print("keel: kfs smp ok")
+    else
+        print("keel: kfs smp wrong: good", good, "bad", bad, "first bad file", tally.first_bad.load(Ordering.Acquire),
+              "cores", cores, "locks left", locks_left, "pressure", pressure, "setup", ok)
+
+// One thread's work in directory `dir`: KFS_FILES files created, written, read back and removed — every
+// third held open, unlinked while open, read back through the open reference and only then released,
+// which deletes it — then a file kept for the host to read.
+private worker(p: *KFs, t: u64, dir: u64, tally: &sync Tally)
+    var made: Buf[u64] = buf()
+    for k in 0..<KFS_FILES
+        tally.cores.or(u64(1) << cpu.core_id(), Ordering.Relaxed)
+        val r = one_file(p, t, k, dir)
+        if r == 0
+            tally.good.add(1, Ordering.Relaxed)
+        else
+            tally.bad.add(1, Ordering.Relaxed)
+            tally.first_bad.store(t * 1_000_000 + k * 100 + r, Ordering.Relaxed)
+        if k % 3 != 0 then made.push(k)
+    // The files not yet removed are all listed, then removed.
+    val listed = names_in(p, dir)
+    var all_there = listed.len() == made.len()
+    for k in made
+        val name = s"f$k"
+        if op(p, () -> pkg.unlink(p, dir, name.bytes)).is_err() then all_there = false
+    val kept = keep_file(p, t, dir)
+    if all_there && kept
+        tally.good.add(1, Ordering.Relaxed)
+    else
+        tally.bad.add(1, Ordering.Relaxed)
+        tally.first_bad.store(t * 1_000_000 + 999_00, Ordering.Relaxed)
+
+// File `k`: 0 when everything about it was right, else which step went wrong.
+private one_file(p: *KFs, t: u64, k: u64, dir: u64) -> u64
+    val name = s"f$k"
+    val n = size_of(t, k)
+    val data = content(t, k, n)
+    val ino = op(p, () -> pkg.create(p, dir, name.bytes, 0o644, root())) match
+        Ok(i) -> i
+        Err(_) -> return 1
+    val held = k % 3 == 0
+    if held && op(p, () -> pkg.hold(p, ino)).is_err() then return 2
+    if op(p, () -> pkg.write(p, ino, 0, data.view(), 0)).unwrap_or(0) != n then return 3
+    if !reads_back(p, ino, t, k, n) then return 4
+    if !held then return 0
+    // Unlinked while held: the name is gone, the inode and its bytes are not, until the release.
+    if op(p, () -> pkg.unlink(p, dir, name.bytes)).is_err() then return 5
+    if op(p, () -> pkg.lookup_name(p, dir, name.bytes)).is_ok() then return 6
+    if !reads_back(p, ino, t, k, n) then return 7
+    if op(p, () -> pkg.release(p, ino)).is_err() then return 8
+    0
+
+private reads_back(p: *KFs, ino: u64, t: u64, k: u64, n: usize) -> bool
+    var out: Buf[u8] = buf()
+    for _ in 0..<n + 100
+        out.push(0)
+    val got = op(p, () -> pkg.read(p, ino, 0, out.view())) match
+        Ok(g) -> g
+        Err(_) -> return false
+    if got != n then return false
+    for off in 0..<n
+        if out[off] != fill(t, k, off) then return false
+    true
+
+// The file thread `t` keeps, of KEEP_BYTES bytes, read back.
+private keep_file(p: *KFs, t: u64, dir: u64) -> bool
+    val data = content(t, 1000, KEEP_BYTES)
+    val ino = op(p, () -> pkg.create(p, dir, "keep".bytes, 0o644, root())) match
+        Ok(i) -> i
+        Err(_) -> return false
+    if op(p, () -> pkg.write(p, ino, 0, data.view(), 0)).unwrap_or(0) != KEEP_BYTES then return false
+    reads_back(p, ino, t, 1000, KEEP_BYTES)
+
+// The names in directory `dir`, `.` and `..` left out.
+private names_in(p: *KFs, dir: u64) -> Buf[Buf[u8]]
+    var out: Buf[Buf[u8]] = buf()
+    var pos: u64 = 0
+    loop
+        val l = op(p, () -> pkg.read_dir(p, dir, pos, 4096)) match
+            Ok(l) -> l
+            Err(_) -> return out
+        for e in l.entries
+            if !same(e.name.view(), ".".bytes) && !same(e.name.view(), "..".bytes) then out.push(e.name)
+        if l.next == DIR_POS_END then return out
+        pos = l.next
+
+private same(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+// --- The power cut, and the boot after it -----------------------------------------------------------------
+
+// Byte `off` of replay file `k`.
+private replay_fill(k: u64, off: usize) -> u8 = u8((k * 59 + u64(off) * 3 + 1) & 0xff)
+private replay_size(k: u64) -> usize = usize(3000 + k * 2500)
+
+// The first boot's end: /replay/target made, and its inode-table block filled up with /replay/fill<n>
+// files so that nothing made later shares it; everything checkpointed; then four transactions committed
+// — /replay/r0 to r3, one each — and the first of them checkpointed, so the log holds three; then a change
+// to the target (its mode to 0600) that no commit covers, while the cache trims as it does after every
+// operation; then the power cut. The boot after it must replay the three, find all four files whole, and
+// find the target as it was.
+private power_cut_after_commits(m: *Mounted)
+    val p = m.at()
+    pause_committer(m)
+    // Which step went other than planned (0: none).
+    var why: u64 = 0
+    if op(p, () -> pkg.mkdir(p, ROOT_INO, "replay".bytes, 0o755, root())).is_err() then why = 1
+    val dir = op(p, () -> pkg.lookup_name(p, ROOT_INO, "replay".bytes)).map((e) -> e.ino).unwrap_or(0)
+    val target = op(p, () -> pkg.create(p, dir, "target".bytes, 0o644, root())).unwrap_or(0)
+    if why == 0 && target == 0 then why = 2
+    val target_block = p.inode_location(target).block
+    var n: u64 = 0
+    loop
+        val name = s"fill$n"
+        val f = op(p, () -> pkg.create(p, dir, name.bytes, 0o644, root())).unwrap_or(0)
+        n += 1
+        if f == 0 || p.inode_location(f).block != target_block || n > 64 then break
+    if why == 0 && (op(p, () -> p.checkpoint_all()).is_err() || p.logged_count() != 0) then why = 2
+    var file_blocks: Buf[u64] = buf()
+    for k in 0..<REPLAYED + 1
+        val name = s"r$k"
+        val data = replay_bytes(k)
+        val ino = op(p, () -> pkg.create(p, dir, name.bytes, 0o644, root())).unwrap_or(0)
+        if why == 0 && (ino == 0 || op(p, () -> pkg.write(p, ino, 0, data.view(), 0)).is_err()) then why = 3
+        if why == 0 && op(p, () -> p.commit()).is_err() then why = 4
+        if ino != 0 then file_blocks.push(p.inode_location(ino).block)
+    if why == 0 && p.logged_count() != usize(REPLAYED + 1) then why = 50 + u64(p.logged_count())
+    // The change no commit covers, to an inode-table block none of the four transactions logged, or the
+    // replay of their copies would hide whatever happened to it.
+    for b in file_blocks
+        if why == 0 && b == target_block then why = 6
+    var change = no_change()
+    change.mode = Some(0o600)
+    if why == 0 && op(p, () -> pkg.setattr(p, target, change, 0)).is_err() then why = 7
+    keep_caches(p)
+    // The oldest committed transaction checkpointed: its flush makes everything written before it durable.
+    if why == 0 && !op(p, () -> p.checkpoint()).unwrap_or(false) then why = 8
+    if why == 0 && p.logged_count() != usize(REPLAYED) then why = 90 + u64(p.logged_count())
+    power_cut(m)
+    if why == 0 then print("keel: kfs ended: power cut after", REPLAYED, "commits, before their checkpoint")
+    else print("keel: kfs power cut wrong at step", why)
+
+private replay_bytes(k: u64) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    for off in 0..<replay_size(k)
+        b.push(replay_fill(k, off))
+    b
+
+// The boot after the power cut: the mount replayed REPLAYED transactions; r0 (checkpointed before the
+// cut) and r1-r3 (replayed) are whole; the target kept its mode. Then /replay goes again.
+private check_replayed(p: *KFs)
+    var ok = p.replayed == REPLAYED
+    val dir = op(p, () -> pkg.lookup_name(p, ROOT_INO, "replay".bytes)).map((e) -> e.ino).unwrap_or(0)
+    for k in 0..<REPLAYED + 1
+        val name = s"r$k"
+        val ino = op(p, () -> pkg.lookup_name(p, dir, name.bytes)).map((e) -> e.ino).unwrap_or(0)
+        if ino == 0
+            ok = false
+        else
+            val n = replay_size(k)
+            var out: Buf[u8] = buf()
+            for _ in 0..<n + 10
+                out.push(0)
+            val got = op(p, () -> pkg.read(p, ino, 0, out.view())).unwrap_or(0)
+            if got != n then ok = false
+            for off in 0..<got
+                if out[off] != replay_fill(k, off) then ok = false
+    val target = op(p, () -> pkg.lookup_name(p, dir, "target".bytes)).map((e) -> e.ino).unwrap_or(0)
+    val mode = op(p, () -> pkg.stat(p, target)).map((n) -> n.mode & 0o7777).unwrap_or(0)
+    if mode != 0o644 then ok = false
+    for name in names_in(p, dir)
+        if op(p, () -> pkg.unlink(p, dir, name.view())).is_err() then ok = false
+    if op(p, () -> pkg.rmdir(p, ROOT_INO, "replay".bytes)).is_err() then ok = false
+    if ok then print("keel: kfs replayed", p.replayed, "transactions")
+    else print("keel: kfs replay wrong: replayed", p.replayed, "of", REPLAYED, "; the target's mode", mode)

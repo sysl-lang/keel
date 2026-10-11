@@ -21,10 +21,14 @@ allocator {
   free  = "keel_free"
 }
 
-// The system call numbers and error codes, which user programs build against too.
+// The system call numbers and error codes, which user programs build against too; the old filesystem's
+// on-disk structs; and KFS, mounted beside it (keel.kfs).
 dependencies {
   abi { workspace = true }
   ondisk { workspace = true }
+  // Mounted, because the kernel's own glue is `keel.kfs` too (kernel/keel/kfs/): the package's module
+  // is `kfs.keel.kfs` here.
+  kfs { workspace = true, mount = "kfs" }
 }
 
 targets {

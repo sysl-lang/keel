@@ -26,6 +26,24 @@ nap_until(p: *Process, deadline_ns: u64) -> bool
     nap_guard.unlock(flags)
     whole
 
+// A kernel thread's nap, which no signal ends: until the monotonic clock reads `deadline_ns`, or until
+// `woken` is set (non-zero) — whoever sets it then calls `wake_nappers`, so the napper looks at once
+// instead of at the next tick. The flag is read under the nap queue's guard, which `wake_nappers` takes
+// too, so a wake between the look and the sleep is not lost.
+nap_kernel(deadline_ns: u64, woken: *Atomic[u32])
+    val flags = nap_guard.lock()
+    nappers.add(1)
+    while timer.now_ns() < deadline_ns && woken.load(Ordering.Acquire) == 0
+        naps.sleep(&nap_guard)
+    nappers.sub(1)
+    nap_guard.unlock(flags)
+
+// Wake every napper to look again, at the clock or at its flag.
+wake_nappers()
+    val flags = nap_guard.lock()
+    val _ = naps.wake_all()
+    nap_guard.unlock(flags)
+
 // The timer interrupt's part (`tick`): wake the nappers to look at the clock.
 private[sched] nap_tick()
     if nappers.load(Ordering.Acquire) == 0 then return

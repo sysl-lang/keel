@@ -1,0 +1,211 @@
+module keel.kfs
+
+// KFS in the kernel (kfs/SPEC.md section 27, "Where things live"): mounting a disk, the `kfs-commit`
+// thread, and the caches' upkeep around every operation.
+//
+//   mount_disk(d)        mount KFS on virtio disk d and start its commit thread
+//   op(m, f)             run f, an operation on m's filesystem, as one registered operation, then keep
+//                        the caches within their targets
+//   unmount(m)           stop the commit thread, commit and checkpoint everything, mark the disk clean
+//   power_cut(m)         stop the commit thread and cut the disk's power (device.sysl): nothing is
+//                        written after the last flush, and nothing more ever is
+//
+// **The commit thread** (`kfs-commit`) makes passes: it naps until it is asked for one (a handle waiting
+// for log room, `sync`, a closed transaction's last handle) or until PASS_MS has gone by, then runs the
+// package's committer (`journal_step`) until it can do no more — finishing a commit, beginning one that
+// is due, checkpointing when a handle waits for room — and, when the buffer cache has asked for it,
+// checkpoints the oldest committed transaction so its buffers can be dropped. It takes no inode lock, so
+// no operation can block it (section 19).
+//
+// **The buffer cache** is the package's table (table.sysl) with the kernel's rules for what lives in it.
+// After every operation, once more than CACHE_TARGET + CACHE_SLACK buffers are cached, the clean ones no
+// running operation can hold go, least recently used first, down to CACHE_TARGET (`trim_buffers`). A
+// pinned buffer — changed by a transaction that has not committed — is never written home or dropped
+// (section 14, "The buffer-cache rule"); a committed one waiting for its checkpoint stays until the
+// checkpoint writes it, and when those are what holds the cache over its target the commit thread is
+// asked for a checkpoint. The table has room for BUFFER_SLOTS: what may be pinned at once (two
+// transactions of at most `max_transaction` buffers), what may wait for a checkpoint (at most the log's
+// length), and the target, with room to spare.
+//
+// **The inode cache** is the package's in-memory inode table, kept to ICACHE_TARGET records the same way:
+// a record is forgotten only when it is idle (`idle_core`: nothing holds the inode open, it is off the
+// orphan list, everything that changed it has committed, no operation can hold it).
+
+import kfs.keel.kfs as pkg
+import kfs.keel.kfs.{BlockDevice, Fs, FsError, LockId, Platform, TABLE_MAX}
+import keel.sched
+import keel.sched.Thread
+import keel.timer
+import sysl.sync.{Atomic, Ordering}
+
+type KFs = Fs[KfsDisk, KernelPlatform]
+
+// The cache targets; the tables' room is BUFFER_SLOTS and INODE_SLOTS (platform.sysl).
+const CACHE_TARGET: usize = 16
+private const CACHE_SLACK: usize = 8
+const ICACHE_TARGET: usize = 16
+
+// How long the commit thread naps between passes when nobody asks for one.
+private const PASS_MS: u64 = 50
+
+// Off only to show what pinning is for (the control the replay boot fails on): the cache writes every
+// pinned buffer home whenever it trims, uncommitted changes and all.
+private const RESPECT_PINS: bool = true
+
+// Off only to show what the open counts are for (the control `keel: kfs smp ok` fails on): the inode
+// cache forgets records whatever holds them open.
+private const KEEP_OPEN_INODES: bool = true
+
+// Off only to show what the commit thread is for (the control the smp test hangs on): it is started but
+// never makes a pass, so a handle waiting for log room waits for ever.
+private const COMMITTER_RUNS: bool = true
+
+@assert(BUFFER_SLOTS <= TABLE_MAX, "the buffer table's room is within what a table holds")
+
+// The disk device the mounted filesystem reads and writes through: `Fs` keeps its address.
+private var device: KfsDisk
+private var mounted: bool
+
+// Asked of the commit thread (1 for yes): stop after this pass; and a checkpoint for the cache's sake.
+private var stopping: Atomic[u32] = Atomic(0)
+private var writeback: Atomic[u32] = Atomic(0)
+// Cache upkeep runs on one core at a time (1 while it does).
+private var trimming: Atomic[u32] = Atomic(0)
+// What the caches' upkeep has done: trims, buffers dropped, checkpoints asked for, records forgotten,
+// and the most buffers and inode records cached at once.
+private var trims: Atomic[u64] = Atomic(0)
+private var dropped: Atomic[u64] = Atomic(0)
+private var writebacks: Atomic[u64] = Atomic(0)
+private var forgotten: Atomic[u64] = Atomic(0)
+private var peak_buffers: Atomic[u64] = Atomic(0)
+private var peak_inodes: Atomic[u64] = Atomic(0)
+private var pass_count: Atomic[u64] = Atomic(0)
+
+// A mounted filesystem: the box that owns it, and its commit thread.
+struct Mounted
+    fs: &KFs
+    committer: Option[&sync Thread]
+
+    // The filesystem, by address: what operations and the commit thread are handed.
+    at(self) -> *KFs = &*self.fs
+
+// Mount KFS on virtio disk `d` and start its commit thread. One mount at a time.
+mount_disk(d: u64) -> Result[Mounted, FsError]
+    if mounted then panic("keel.kfs: one KFS mount at a time")
+    device = kfs_disk(d)
+    val fs = pkg.mount(&device, KernelPlatform(1))?
+    val boxed: &KFs = fs
+    mounted = true
+    stopping.store(0, Ordering.Release)
+    writeback.store(0, Ordering.Release)
+    val p = &*boxed
+    set_committer(true)
+    val t = sched.spawn(() -> commit_thread(p))
+    Ok(Mounted(boxed, Some(t)))
+
+// The `kfs-commit` thread.
+private commit_thread(p: *KFs)
+    loop
+        if stopping.load(Ordering.Acquire) != 0 then break
+        sched.nap_kernel(timer.now_ns() + PASS_MS * 1_000_000, kicked())
+        kicked().store(0, Ordering.Release)
+        if COMMITTER_RUNS then pass(p)
+        pass_done()
+
+// One pass: everything the committer can do now, then the checkpoint the cache asked for.
+private pass(p: *KFs)
+    pass_count.add(1, Ordering.Relaxed)
+    loop
+        p.journal_step() match
+            Ok(true) -> ()
+            _ -> break
+    if writeback.swap(0, Ordering.AcqRel) != 0
+        writebacks.add(1, Ordering.Relaxed)
+        p.checkpoint() match
+            // The oldest list holds a buffer the running transaction pins: commit that first, and the
+            // checkpoint follows on a later pass.
+            Ok(false) ->
+                val _ = p.commit_begin()
+                writeback.store(1, Ordering.Release)
+            _ -> ()
+
+// Stop the commit thread, after the pass it is making; from then on commits run inline.
+private stop_committer(m: *Mounted)
+    stopping.store(1, Ordering.Release)
+    kicked().store(1, Ordering.Release)
+    sched.wake_nappers()
+    m.committer match
+        Some(t) -> sched.join(t)
+        None -> ()
+    m.committer = None
+    set_committer(false)
+    pass_done()
+
+// Stop the commit thread and run commits inline from now on, as on the host: what a test that needs
+// each commit where it asks for it calls.
+pause_committer(m: *Mounted) = stop_committer(m)
+
+// Unmount: the commit thread stops, then everything is committed and checkpointed and the superblock
+// marked clean (section 18).
+unmount(m: *Mounted) -> Result[unit, FsError]
+    stop_committer(m)
+    val r = m.at().unmount()
+    mounted = false
+    r
+
+// The power cut: the commit thread stops and the disk loses everything written since its last flush.
+// The filesystem is not unmounted; the next mount recovers what the flushes made durable.
+power_cut(m: *Mounted)
+    stop_committer(m)
+    device.cut()
+    mounted = false
+
+// Run `f`, an operation on `p`, registered for the clock of operations (platform.sysl), then keep the
+// caches within their targets.
+op[T](p: *KFs, f: &Fn() -> T) -> T
+    val t = begin_op()
+    val r = f()
+    end_op(t)
+    keep_caches(p)
+    r
+
+// Keep the buffer and inode caches within their targets: see the header.
+keep_caches(p: *KFs)
+    if trimming.swap(1, Ordering.Acquire) != 0 then return
+    val buffers = p.cached_count()
+    if u64(buffers) > peak_buffers.load(Ordering.Relaxed) then peak_buffers.store(u64(buffers), Ordering.Relaxed)
+    if !RESPECT_PINS then write_pinned_home(p)
+    if buffers > CACHE_TARGET + CACHE_SLACK
+        trims.add(1, Ordering.Relaxed)
+        dropped.add(u64(p.trim_buffers(CACHE_TARGET, oldest_op())), Ordering.Relaxed)
+        if p.cached_count() > CACHE_TARGET + CACHE_SLACK && writeback.swap(1, Ordering.AcqRel) == 0
+            val _ = p.plat.wake_committer()
+    val live = pkg.cores_live(p)
+    if u64(live) > peak_inodes.load(Ordering.Relaxed) then peak_inodes.store(u64(live), Ordering.Relaxed)
+    if live > ICACHE_TARGET
+        val before = oldest_op()
+        for i in 0..<pkg.core_slots(p)
+            if !KEEP_OPEN_INODES
+                val (ino, held) = pkg.core_at(p, i)
+                if held > 0 then pkg.forget_core(p, ino)
+            if pkg.drop_idle_core(p, i, before) then forgotten.add(1, Ordering.Relaxed)
+    trimming.store(0, Ordering.Release)
+
+// The control RESPECT_PINS = false: every pinned buffer written to its home block now.
+private write_pinned_home(p: *KFs)
+    for id in 0..<p.slots()
+        if p.holds(id) && p.pinned(id)
+            val b = p.block_of(id)
+            p.plat.lock(LockId.Buffer(b))
+            val _ = p.dev.write(b, p.bytes(id))
+            p.plat.unlock(LockId.Buffer(b))
+
+// What the caches' upkeep and the commit thread have done: trims, buffers dropped, checkpoints asked for,
+// inode records forgotten, the most buffers and records cached at once, and the commit thread's passes.
+cache_stats() -> (u64, u64, u64, u64, u64, u64, u64)
+    (trims.load(Ordering.Relaxed), dropped.load(Ordering.Relaxed), writebacks.load(Ordering.Relaxed),
+     forgotten.load(Ordering.Relaxed), peak_buffers.load(Ordering.Relaxed), peak_inodes.load(Ordering.Relaxed),
+     pass_count.load(Ordering.Relaxed))
+
+// The mounted device's write-cache counters (device.sysl).
+device_stats() -> (u64, u64, u64, u64) = device.flush_stats()

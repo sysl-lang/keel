@@ -1,0 +1,186 @@
+module keel.kfs
+
+// The block device KFS runs on in the kernel: a virtio-blk disk, through a write cache that makes the
+// device model of kfs/SPEC.md section 2 something a boot can observe.
+//
+// **Why a write cache here.** A disk keeps the writes it has completed in a volatile cache until it is
+// told to flush, and a power cut loses whatever subset of them it had not written out (section 2, rule 2).
+// QEMU's disk is a file on the host, which keeps every write whatever happens to the guest, so on QEMU
+// nothing a flush promises could ever be seen to fail. This cache is the disk's volatile cache moved into
+// the kernel where a test can cut the power on it: a write lands here, a read sees it here first, and
+// `flush` writes everything here to the disk — a request of eight sectors per block — then sends the
+// disk's own flush (VIRTIO_BLK_T_FLUSH) and empties it. `cut` is the power cut: everything not flushed is
+// lost and the device answers nothing more. So a boot that ends with `cut` leaves on the disk exactly what
+// the flushes made durable, and the boot after it finds out whether that was enough.
+//
+// The cache is guarded by a sleeping lock held across the flush's I/O, so a read or write waits for a
+// flush in progress rather than seeing a block half written out. Its record lives in frames of its own
+// and each block it holds in a frame, so it holds no count and needs no allocation but frames; it has
+// room for every block of the disk at once, so it is never full.
+
+import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice, DeviceError}
+import keel.mm
+import keel.sched.{Mutex, mutex}
+import keel.virtio
+
+// Off only to show what the flush is for (the control `scripts/boot-test.sh`'s replay boot fails on):
+// `flush` answers that everything is durable without writing anything out or flushing the disk, so
+// nothing written after the mount reaches the disk at all, and the power cut loses every commit.
+private const SEND_FLUSH: bool = true
+
+private const SECTORS_PER_BLOCK: u64 = 8
+
+// The most blocks a cached disk may have: the cache has a place for each.
+const MAX_CACHED_BLOCKS: usize = 16384
+
+// What the cache holds: the blocks written since the last flush, in the order first written, each with
+// the frame holding its bytes.
+private struct WriteCache
+    count: usize
+    dead: bool
+    // Blocks the flushes have written out, flushes done, and the most blocks waiting at once.
+    written: u64
+    flushes: u64
+    most: u64
+    blocks: [MAX_CACHED_BLOCKS]u64
+    data: [MAX_CACHED_BLOCKS]*u8
+
+// One cache per disk keel drives, each a record in frames of its own (null until the disk is cached).
+private var caches: [virtio.MAX_DISKS]Mutex[*WriteCache]
+
+private const CACHE_FRAMES: u64 = u64((sizeof(WriteCache) + 4095) / 4096)
+
+private frame_ptr(f: mm.Frame) -> *u8 = ptr_cast(usize(u64(mm.to_virt(mm.frame_addr(f)))))
+private frame_back(p: *u8) -> mm.Frame = mm.frame_of(mm.to_phys(mm.VirtAddr(u64(usize(p)))))
+
+struct KfsDisk
+    disk: u64
+    count: u64
+
+    // The cache's counters: blocks written out by flushes, flushes, blocks waiting now, and the most
+    // that ever waited at once.
+    flush_stats(self) -> (u64, u64, u64, u64)
+        val m = &caches[usize(self.disk)]
+        val c = *m.lock()
+        val answer = (c.written, c.flushes, u64(c.count), c.most)
+        m.unlock()
+        answer
+
+    // The power cut: every write not yet flushed is lost, and nothing more is read or written.
+    cut(*self)
+        val m = &caches[usize(self.disk)]
+        val c = *m.lock()
+        drop_all(c)
+        c.dead = true
+        m.unlock()
+
+// The device over virtio disk `d`, with an empty cache.
+kfs_disk(d: u64) -> KfsDisk
+    val blocks = virtio.capacity_of(d) / SECTORS_PER_BLOCK
+    if blocks > u64(MAX_CACHED_BLOCKS) then panic("keel.kfs: a disk larger than the write cache has places for")
+    val m = &caches[usize(d)]
+    val slot = m.lock()
+    if *slot == null
+        val f = mm.alloc_frames(CACHE_FRAMES) match
+            Some(f) -> f
+            None -> panic("keel.kfs: no frames for the write cache")
+        val words: *u64 = ptr_cast(frame_ptr(f))
+        for i in 0..<CACHE_FRAMES * 512
+            words[i] = 0
+        *slot = ptr_cast(words)
+    else
+        val c = *slot
+        drop_all(c)
+        c.dead = false
+    m.unlock()
+    KfsDisk(d, blocks)
+
+// Give back every waiting block's frame: they are lost.
+private drop_all(c: *WriteCache)
+    for i in 0..<c.count
+        mm.free_frame(frame_back(c.data[i]))
+    c.count = 0
+
+private io(r: Result[unit, virtio.DiskError]) -> Result[unit, DeviceError] =
+    if r.is_ok() then Ok(()) else Err(DeviceError.Io)
+
+// Where block `b` waits in the cache, if it does.
+private place(c: *WriteCache, b: u64) -> Option[usize]
+    for i in 0..<c.count
+        if c.blocks[i] == b then return Some(i)
+    None
+
+impl BlockDevice for KfsDisk
+    blocks(self) -> u64 = self.count
+
+    read(*self, b: u64, out: []u8) -> Result[unit, DeviceError]
+        if out.len != BLOCK_SIZE then return Err(DeviceError.BadLength)
+        if b >= self.count then return Err(DeviceError.OutOfRange)
+        val m = &caches[usize(self.disk)]
+        val c = *m.lock()
+        if c.dead
+            m.unlock()
+            return Err(DeviceError.Io)
+        place(c, b) match
+            Some(i) ->
+                val src = c.data[i]
+                for k in 0..<BLOCK_SIZE
+                    out[k] = src[k]
+                m.unlock()
+                return Ok(())
+            None -> ()
+        m.unlock()
+        io(virtio.read(self.disk, b * SECTORS_PER_BLOCK, out))
+
+    write(*self, b: u64, data: []const u8) -> Result[unit, DeviceError]
+        if data.len != BLOCK_SIZE then return Err(DeviceError.BadLength)
+        if b >= self.count then return Err(DeviceError.OutOfRange)
+        val m = &caches[usize(self.disk)]
+        val c = *m.lock()
+        if c.dead
+            m.unlock()
+            return Err(DeviceError.Io)
+        val dst = place(c, b) match
+            Some(i) -> c.data[i]
+            None ->
+                val f = mm.alloc_frame() match
+                    Some(f) -> f
+                    None ->
+                        m.unlock()
+                        return Err(DeviceError.Io)
+                val p = frame_ptr(f)
+                c.blocks[c.count] = b
+                c.data[c.count] = p
+                c.count += 1
+                if u64(c.count) > c.most then c.most = u64(c.count)
+                p
+        for k in 0..<BLOCK_SIZE
+            dst[k] = data[k]
+        m.unlock()
+        Ok(())
+
+    flush(*self) -> Result[unit, DeviceError]
+        val m = &caches[usize(self.disk)]
+        val c = *m.lock()
+        if c.dead
+            m.unlock()
+            return Err(DeviceError.Io)
+        if !SEND_FLUSH
+            m.unlock()
+            return Ok(())
+        for i in 0..<c.count
+            val w = virtio.write(self.disk, c.blocks[i] * SECTORS_PER_BLOCK, c.data[i][0..<BLOCK_SIZE])
+            if w.is_err()
+                m.unlock()
+                return Err(DeviceError.Io)
+        c.written += u64(c.count)
+        drop_all(c)
+        // A disk without a flush writes through: what it has completed is on the disk already.
+        if virtio.has_flush(self.disk) && virtio.flush(self.disk).is_err()
+            m.unlock()
+            return Err(DeviceError.Io)
+        c.flushes += 1
+        m.unlock()
+        Ok(())
+
+    override has_flush(self) -> bool = virtio.has_flush(self.disk)

@@ -1,25 +1,38 @@
 module keel.virtio
 
-// A virtio block device: one request queue, 512-byte sectors, completion by interrupt.
+// virtio block devices: every one the machine has, each with one request queue and its own interrupt;
+// 512-byte sectors, requests of up to a 4 KiB block, and a flush.
 //
-//   read_sector(n, buf)    blocking; any kernel thread, any core
-//   write_sector(n, buf)
+//   init()                      find and set up every disk, in slot order; answers how many
+//   read(d, sector, buf)        blocking; any kernel thread, any core. `buf` is 1-8 sectors long
+//   write(d, sector, buf)
+//   flush(d)                    everything written to disk d before it is durable when it returns
 //
-// The queue is a split virtqueue (virtio 1.2 § 2.7) in two physically contiguous frames from the frame
-// allocator, which the device reads and writes by physical address (`Shared`). It holds SLOTS requests
-// in flight at once. A request is three descriptors, chained once at `init` and never re-linked —
-// slot s owns descriptors 3s (the 16-byte header), 3s+1 (its 512-byte bounce buffer) and 3s+2 (the
-// status byte the device writes) — so submitting one is: fill the header, put 3s in the available ring,
-// publish the index, notify. The device answers in the used ring and raises its interrupt (an SPI,
-// routed to the core that ran `init`); the handler takes everything new from the used ring, marks each
-// slot done and wakes the thread asleep on it.
+// Disk 0, the first in slot order, is also reached through the one-disk calls the old filesystem and the
+// milestone-7 test use: `read_sector`, `write_sector`, `capacity()`, `stats()`.
 //
-// `lock` (an IrqLock: the interrupt handler takes it too) guards the slots, both rings' indices and the
-// counters. A caller holds it from taking a slot to giving it back, except while asleep.
+// Each disk's queue is a split virtqueue (virtio 1.2 § 2.7) in one frame from the frame allocator, which
+// the device reads and writes by physical address (`Shared`). It holds SLOTS requests in flight at once.
+// A request is three descriptors — slot s owns descriptors 3s (the 16-byte header), 3s+1 (its 4 KiB
+// bounce buffer, a frame of its own) and 3s+2 (the status byte the device writes) — so submitting one
+// is: fill the header, set the data descriptor's length and direction, put 3s in the available ring,
+// publish the index, notify. A flush carries no data: its header descriptor is chained straight to the
+// status for the request and back afterwards. The device answers in the used ring and raises its
+// interrupt (an SPI, routed to the core that ran `init`); the handler takes everything new from the
+// used ring, marks each slot done and wakes the thread asleep on it.
+//
+// **The flush (§ 5.2.3).** A device offering VIRTIO_BLK_F_FLUSH (feature bit 9) keeps written data in a
+// volatile cache until a VIRTIO_BLK_T_FLUSH request completes; the driver accepts the feature whenever it
+// is offered, and `has_flush` says whether it was. A device without it (QEMU's, with the drive's write
+// cache off) writes through, and KFS mounts it read-only (kfs/SPEC.md section 2): without a flush it has no
+// way to order its commit block after the blocks it commits.
+//
+// Each disk's `lock` (an IrqLock: its interrupt handler takes it too) guards its slots, both rings'
+// indices and its counters. A caller holds it from taking a slot to giving it back, except while asleep.
 //
 // The caller's buffer is never handed to the device: its bytes are copied to or from the slot's bounce
-// buffer, because a `[]u8` does not say where its storage is (a thread's stack is not in the linear
-// map, and a heap block may straddle frames that are not adjacent) — FINDINGS.md 37.
+// buffer, because a `[]u8` does not say where its storage is (a thread's stack is not in the linear map,
+// and a heap block may straddle frames that are not adjacent) — FINDINGS.md 37.
 
 import keel.cpu
 import keel.gic
@@ -27,9 +40,18 @@ import keel.mm
 import keel.sched.{IrqLock, WaitQueue}
 
 const SECTOR_SIZE: usize = 512
+// The most one request moves: a KFS block, eight sectors.
+const MAX_SECTORS: usize = 8
+const MAX_BYTES: usize = SECTOR_SIZE * MAX_SECTORS
+
+// The most disks keel drives.
+const MAX_DISKS: usize = 4
 
 private const QUEUE_SIZE: usize = 32            // descriptors; a power of two, at most QueueNumMax
 private const SLOTS: usize = 8                  // requests in flight: three descriptors each
+
+// VIRTIO_BLK_F_FLUSH, bit 9 of the first bank: the device has a write cache and a flush command.
+private const F_FLUSH: u32 = 1 << 9
 
 // A block request's header (§ 5.2.6), which the device reads.
 struct ReqHeader
@@ -39,11 +61,12 @@ struct ReqHeader
 
 private const REQ_IN: u32 = 0                   // read: device to memory
 private const REQ_OUT: u32 = 1                  // write: memory to device
+private const REQ_FLUSH: u32 = 4                // flush: what was written is durable
 private const STATUS_OK: u8 = 0
 private const STATUS_UNSET: u8 = 0xff           // written before submitting; the device overwrites it
 
-// Everything the device reaches, laid out in two frames. The descriptor table wants 16-byte alignment,
-// the available ring 2 and the used ring 4; each starts on its own boundary here.
+// Everything the device reaches but the data, in one frame. The descriptor table wants 16-byte
+// alignment, the available ring 2 and the used ring 4; each starts on its own boundary here.
 struct Shared
     desc: [QUEUE_SIZE]Desc                      // 0x000
     avail: Avail[QUEUE_SIZE]                    // 0x200
@@ -53,16 +76,12 @@ struct Shared
     headers: [SLOTS]ReqHeader                   // 0x800
     status: [SLOTS]volatile u8                  // 0x880
     pad2: [1912]u8
-    bounce: [SLOTS][SECTOR_SIZE]u8              // 0x1000, a sector per slot
 
 @assert(offsetof(Shared, avail) == 0x200, "the available ring is at 0x200")
 @assert(offsetof(Shared, used) == 0x400, "the used ring is at 0x400")
 @assert(offsetof(Shared, headers) == 0x800, "the request headers are at 0x800")
 @assert(offsetof(Shared, status) == 0x880, "the status bytes are at 0x880")
-@assert(offsetof(Shared, bounce) == 0x1000, "the bounce buffers are at 0x1000")
-@assert(sizeof(Shared) == 0x2000, "the queue fills two frames")
-
-private const SHARED_FRAMES: u64 = 2
+@assert(sizeof(Shared) == 0x1000, "the queue fills one frame")
 
 private struct Slot
     busy: bool
@@ -73,8 +92,11 @@ private struct Disk
     ready: bool
     regs: *Regs
     irq: u32
+    slot: u64                                   // which virtio-mmio transport it is on
     capacity: u64
+    flush: bool                                 // VIRTIO_BLK_F_FLUSH was agreed
     shared: *Shared
+    bounce: [SLOTS]*u8                          // each slot's 4 KiB bounce buffer, a frame
     next_avail: u16                             // the available index this driver writes next
     last_used: u16                              // the used index up to which completions are taken
     lock: IrqLock
@@ -83,186 +105,269 @@ private struct Disk
     max_in_flight: u64
     interrupts: u64
     completions: u64
+    flushes: u64
+    slots: [SLOTS]Slot
 
 // Zero until `init`: `ready` false, every lock free and every queue empty.
-private var disk: Disk
-private var slots: [SLOTS]Slot
+private var disks: [MAX_DISKS]Disk
+private var disk_count: u64
 
 enum DiskError
     NoDisk
     WrongLength
     PastEnd
+    NoFlush
     Device(status: u8)
 
 // The kernel's physical address for a pointer into the linear map, which is where the frame allocator's
 // frames are reached. Nothing checks that `p` is there (FINDINGS.md 37).
 private phys(p: usize) -> u64 = u64(mm.to_phys(mm.VirtAddr(u64(p))))
 
-// Find the disk, negotiate, set up the request queue and its interrupt (§ 3.1.1, § 4.2.3). Answers the
-// capacity in sectors, or None if there is no usable disk. Run once, from a kernel thread.
-init() -> Option[u64]
-    val t = find(DEVICE_BLOCK) match
-        Some(t) -> t
-        None -> return None
+// Find every disk, in slot order, and set each up: negotiate, the request queue, its interrupt (§ 3.1.1,
+// § 4.2.3). Answers how many are ready. Run once, from a kernel thread.
+init() -> u64
+    var from: u64 = 0
+    loop
+        if disk_count == u64(MAX_DISKS) then break
+        val t = find_from(DEVICE_BLOCK, from) match
+            Some(t) -> t
+            None -> break
+        from = t.slot + 1
+        if init_disk(usize(disk_count), t) then disk_count += 1
+    disk_count
+
+private init_disk(d: usize, t: Transport) -> bool
     val r = t.regs
     if r.version != 2
         print("keel: virtio-blk is legacy (version", r.version, "); QEMU needs force-legacy=false")
-        return None
+        return false
 
-    // No block features: no flush, no read-only, ...
-    if negotiate(r, 0).is_none() then return fail(r, "the device is not virtio 1, or refused it")
+    val agreed = negotiate(r, F_FLUSH) match
+        Some(a) -> a
+        None -> return fail(r, "the device is not virtio 1, or refused it")
 
-    val frame = mm.alloc_frames(SHARED_FRAMES) match
+    val frame = mm.alloc_frame() match
         Some(f) -> f
-        None -> return fail(r, "no frames for the queue")
-    val pa = mm.frame_addr(frame)
-    val sh: *Shared = ptr_cast(usize(u64(mm.to_virt(pa))))
+        None -> return fail(r, "no frame for the queue")
+    val sh: *Shared = ptr_cast(usize(u64(mm.to_virt(mm.frame_addr(frame)))))
     val words: *u64 = ptr_cast(sh)
-    for i in 0..<usize(SHARED_FRAMES * 512)
+    for i in 0..<sizeof(Shared) / 8
         words[i] = 0
+    val k = &disks[d]
+    for s in 0..<SLOTS
+        val f = mm.alloc_frame() match
+            Some(f) -> f
+            None -> return fail(r, "no frames for the bounce buffers")
+        k.bounce[s] = ptr_cast(usize(u64(mm.to_virt(mm.frame_addr(f)))))
 
     for s in 0..<SLOTS
-        val d = 3 * s
-        sh.desc[d].addr = phys(usize(&sh.headers[s]))
-        sh.desc[d].len = 16
-        sh.desc[d].flags = DESC_NEXT
-        sh.desc[d].next = u16(d + 1)
-        sh.desc[d + 1].addr = phys(usize(&sh.bounce[s][0]))
-        sh.desc[d + 1].len = u32(SECTOR_SIZE)
-        sh.desc[d + 1].flags = DESC_NEXT
-        sh.desc[d + 1].next = u16(d + 2)
-        sh.desc[d + 2].addr = phys(usize(&sh.status[s]))
-        sh.desc[d + 2].len = 1
-        sh.desc[d + 2].flags = DESC_WRITE
+        val i = 3 * s
+        sh.desc[i].addr = phys(usize(&sh.headers[s]))
+        sh.desc[i].len = 16
+        sh.desc[i].flags = DESC_NEXT
+        sh.desc[i].next = u16(i + 1)
+        sh.desc[i + 1].addr = phys(usize(k.bounce[s]))
+        sh.desc[i + 1].len = u32(MAX_BYTES)
+        sh.desc[i + 1].flags = DESC_NEXT
+        sh.desc[i + 1].next = u16(i + 2)
+        sh.desc[i + 2].addr = phys(usize(&sh.status[s]))
+        sh.desc[i + 2].len = 1
+        sh.desc[i + 2].flags = DESC_WRITE
 
     if !set_queue(r, 0, QUEUE_SIZE, phys(usize(&sh.desc[0])), phys(usize(&sh.avail)), phys(usize(&sh.used)))
         return fail(r, "queue 0 is live already or too small")
 
-    val flags = disk.lock.lock()
-    disk.regs = r
-    disk.irq = t.irq
-    disk.capacity = config_u64(r, 0)            // virtio_blk_config.capacity, in 512-byte sectors
-    disk.shared = sh
-    disk.ready = true
-    disk.lock.unlock(flags)
+    val flags = k.lock.lock()
+    k.regs = r
+    k.irq = t.irq
+    k.slot = t.slot
+    k.capacity = config_u64(r, 0)               // virtio_blk_config.capacity, in 512-byte sectors
+    k.flush = (agreed & F_FLUSH) != 0
+    k.shared = sh
+    k.ready = true
+    k.lock.unlock(flags)
 
     gic.enable_spi(t.irq, cpu.core_id())
     driver_ok(r)
-    Some(disk.capacity)
+    true
 
-private fail(r: *Regs, why: string) -> Option[u64]
+private fail(r: *Regs, why: string) -> bool
     mark_failed(r)
     print("keel: virtio-blk:", why)
-    None
+    false
 
-// The interrupt this disk raises; `gic.SPURIOUS` (no interrupt keel.irq will ever see) before `init`.
-irq() -> u32 = if disk.ready then disk.irq else gic.SPURIOUS
+// How many disks are ready.
+count() -> u64 = disk_count
 
-// The disk's size in sectors; 0 before `init`.
-capacity() -> u64 = if disk.ready then disk.capacity else 0
+private ready(d: u64) -> bool = d < disk_count && disks[usize(d)].ready
 
-read_sector(n: u64, buf: []u8) -> Result[unit, DiskError]
-    if buf.len != SECTOR_SIZE then return Err(WrongLength)
-    transfer_in(n, buf)
+// Disk d's size in sectors, its transport slot, its interrupt, and whether it has a flush; 0 / false
+// for a disk there is not.
+capacity_of(d: u64) -> u64 = if ready(d) then disks[usize(d)].capacity else 0
+slot_of(d: u64) -> u64 = if ready(d) then disks[usize(d)].slot else 0
+irq_of(d: u64) -> u32 = if ready(d) then disks[usize(d)].irq else gic.SPURIOUS
+has_flush(d: u64) -> bool = ready(d) && disks[usize(d)].flush
 
-write_sector(n: u64, buf: []const u8) -> Result[unit, DiskError]
-    if buf.len != SECTOR_SIZE then return Err(WrongLength)
-    transfer_out(n, buf)
+// Whether interrupt `id` is a disk's.
+owns(id: u32) -> bool
+    for d in 0..<disk_count
+        if disks[usize(d)].irq == id then return true
+    false
 
-private transfer_out(n: u64, buf: []const u8) -> Result[unit, DiskError]
-    if !disk.ready then return Err(NoDisk)
-    if n >= disk.capacity then return Err(PastEnd)
-    val flags = disk.lock.lock()
-    val s = take_slot()
-    for i in 0..<SECTOR_SIZE
-        disk.shared.bounce[s][i] = buf[i]
-    val status = run(s, REQ_OUT, n)
-    give_back(s)
-    disk.lock.unlock(flags)
-    answer(status)
-
-private transfer_in(n: u64, buf: []u8) -> Result[unit, DiskError]
-    if !disk.ready then return Err(NoDisk)
-    if n >= disk.capacity then return Err(PastEnd)
-    val flags = disk.lock.lock()
-    val s = take_slot()
-    val status = run(s, REQ_IN, n)
+// Read `buf.len` bytes (1 to MAX_SECTORS whole sectors) from disk `d` at `sector`.
+read(d: u64, sector: u64, buf: []u8) -> Result[unit, DiskError]
+    val n = check(d, sector, buf.len)?
+    val k = &disks[usize(d)]
+    val flags = k.lock.lock()
+    val s = take_slot(k)
+    val status = run(k, s, REQ_IN, sector, n)
     if status == STATUS_OK
-        for i in 0..<SECTOR_SIZE
-            buf[i] = disk.shared.bounce[s][i]
-    give_back(s)
-    disk.lock.unlock(flags)
+        val src = k.bounce[s]
+        for i in 0..<buf.len
+            buf[i] = src[i]
+    give_back(k, s)
+    k.lock.unlock(flags)
     answer(status)
+
+// Write `buf` (1 to MAX_SECTORS whole sectors) to disk `d` at `sector`.
+write(d: u64, sector: u64, buf: []const u8) -> Result[unit, DiskError]
+    val n = check(d, sector, buf.len)?
+    val k = &disks[usize(d)]
+    val flags = k.lock.lock()
+    val s = take_slot(k)
+    val dst = k.bounce[s]
+    for i in 0..<buf.len
+        dst[i] = buf[i]
+    val status = run(k, s, REQ_OUT, sector, n)
+    give_back(k, s)
+    k.lock.unlock(flags)
+    answer(status)
+
+// Make everything disk `d` has completed durable. `NoFlush` for a disk that offered none.
+flush(d: u64) -> Result[unit, DiskError]
+    if !ready(d) then return Err(NoDisk)
+    val k = &disks[usize(d)]
+    if !k.flush then return Err(NoFlush)
+    val flags = k.lock.lock()
+    val s = take_slot(k)
+    val status = run(k, s, REQ_FLUSH, 0, 0)
+    if status == STATUS_OK then k.flushes += 1
+    give_back(k, s)
+    k.lock.unlock(flags)
+    answer(status)
+
+// The sectors a request of `len` bytes at `sector` moves, or why it may not: a length that is not 1 to
+// MAX_SECTORS whole sectors, or a range that does not end inside the disk.
+private check(d: u64, sector: u64, len: usize) -> Result[u64, DiskError]
+    if !ready(d) then return Err(NoDisk)
+    if len == 0 || len > MAX_BYTES || len % SECTOR_SIZE != 0 then return Err(WrongLength)
+    val n = u64(len / SECTOR_SIZE)
+    val cap = disks[usize(d)].capacity
+    if sector >= cap || n > cap - sector then return Err(PastEnd)
+    Ok(n)
 
 private answer(status: u8) -> Result[unit, DiskError] =
     if status == STATUS_OK then Ok(()) else Err(Device(status))
 
-// A free slot, sleeping until one is given back if all are in flight. Holding `lock`.
-private take_slot() -> usize
+// A free slot, sleeping until one is given back if all are in flight. Holding the disk's lock.
+private take_slot(k: *Disk) -> usize
     loop
         for s in 0..<SLOTS
-            if !slots[s].busy
-                slots[s].busy = true
-                slots[s].done = false
-                disk.in_flight += 1
-                if disk.in_flight > disk.max_in_flight then disk.max_in_flight = disk.in_flight
+            if !k.slots[s].busy
+                k.slots[s].busy = true
+                k.slots[s].done = false
+                k.in_flight += 1
+                if k.in_flight > k.max_in_flight then k.max_in_flight = k.in_flight
                 return s
-        disk.free_waiters.sleep(&disk.lock)
+        k.free_waiters.sleep(&k.lock)
 
-private give_back(s: usize)
-    slots[s].busy = false
-    disk.in_flight -= 1
-    disk.free_waiters.wake_one()
+private give_back(k: *Disk, s: usize)
+    k.slots[s].busy = false
+    k.in_flight -= 1
+    k.free_waiters.wake_one()
 
-// Submit slot `s`'s request and sleep until the interrupt handler has seen it complete; answer the
-// status the device wrote. Holding `lock`, which the sleep releases.
-private run(s: usize, kind: u32, sector: u64) -> u8
-    val sh = disk.shared
+// Submit slot `s`'s request of `n` sectors (none for a flush) and sleep until the interrupt handler has
+// seen it complete; answer the status the device wrote. Holding the disk's lock, which the sleep
+// releases.
+private run(k: *Disk, s: usize, kind: u32, sector: u64, n: u64) -> u8
+    val sh = k.shared
     sh.headers[s].kind = kind
     sh.headers[s].reserved = 0
     sh.headers[s].sector = sector
     sh.status[s] = STATUS_UNSET
-    sh.desc[3 * s + 1].flags = if kind == REQ_IN then DESC_NEXT | DESC_WRITE else DESC_NEXT
+    val head = 3 * s
+    if kind == REQ_FLUSH
+        // No data: the header leads straight to the status.
+        sh.desc[head].next = u16(head + 2)
+    else
+        sh.desc[head].next = u16(head + 1)
+        sh.desc[head + 1].len = u32(n * u64(SECTOR_SIZE))
+        sh.desc[head + 1].flags = if kind == REQ_IN then DESC_NEXT | DESC_WRITE else DESC_NEXT
 
-    val i = disk.next_avail
-    sh.avail.ring[usize(i) % QUEUE_SIZE] = u16(3 * s)
-    // The device may read the ring entry, the header and the descriptor once it sees the new index, so
+    val i = k.next_avail
+    sh.avail.ring[usize(i) % QUEUE_SIZE] = u16(head)
+    // The device may read the ring entry, the header and the descriptors once it sees the new index, so
     // they are ordered before it (§ 2.7.13.3.1).
     dmb(ishst)
-    disk.next_avail = next_index(i)
-    sh.avail.idx = disk.next_avail
+    k.next_avail = next_index(i)
+    sh.avail.idx = k.next_avail
     // And the index before the notification, a store to Device memory (Linux's `writel` barrier).
     dmb(oshst)
-    disk.regs.queue_notify = 0
+    k.regs.queue_notify = 0
 
-    while !slots[s].done
-        slots[s].waiters.sleep(&disk.lock)
+    while !k.slots[s].done
+        k.slots[s].waiters.sleep(&k.lock)
     sh.status[s]
 
-// The disk's interrupt, from keel.irq.dispatch (IRQ context, so under keel.trap's `@no_alloc`):
-// acknowledge it, then take every completion the used ring holds. Acknowledging first means a
+// Disk interrupt `id`, from keel.irq.dispatch (IRQ context, so under keel.trap's `@no_alloc`):
+// acknowledge it, then take every completion the disk's used ring holds. Acknowledging first means a
 // completion that lands after the ring was read raises the interrupt again rather than being lost.
-interrupt()
-    val r = disk.regs
-    val flags = disk.lock.lock()
-    disk.interrupts += 1
+interrupt(id: u32)
+    for d in 0..<disk_count
+        val k = &disks[usize(d)]
+        if k.irq == id then take_completions(k)
+
+private take_completions(k: *Disk)
+    val r = k.regs
+    val flags = k.lock.lock()
+    k.interrupts += 1
     r.interrupt_ack = r.interrupt_status
-    val sh = disk.shared
+    val sh = k.shared
     loop
         val idx = sh.used.idx
-        if idx == disk.last_used then break
+        if idx == k.last_used then break
         // The device writes an element, then the index: read them in that order.
         dmb(ishld)
-        val s = usize(sh.used.ring[usize(disk.last_used) % QUEUE_SIZE].id) / 3
-        slots[s].done = true
-        slots[s].waiters.wake_one()
-        disk.completions += 1
-        disk.last_used = next_index(disk.last_used)
-    disk.lock.unlock(flags)
+        val s = usize(sh.used.ring[usize(k.last_used) % QUEUE_SIZE].id) / 3
+        k.slots[s].done = true
+        k.slots[s].waiters.wake_one()
+        k.completions += 1
+        k.last_used = next_index(k.last_used)
+    k.lock.unlock(flags)
 
-// What the disk has done: interrupts taken, requests completed, and the most in flight at once.
-stats() -> (u64, u64, u64)
-    val flags = disk.lock.lock()
-    val answer = (disk.interrupts, disk.completions, disk.max_in_flight)
-    disk.lock.unlock(flags)
+// What disk `d` has done: interrupts taken, requests completed, the most in flight at once, and flushes.
+stats_of(d: u64) -> (u64, u64, u64, u64)
+    if !ready(d) then return (0, 0, 0, 0)
+    val k = &disks[usize(d)]
+    val flags = k.lock.lock()
+    val answer = (k.interrupts, k.completions, k.max_in_flight, k.flushes)
+    k.lock.unlock(flags)
     answer
+
+// -- Disk 0, as the one-disk callers know it -------------------------------------------------------------
+
+// Disk 0's size in sectors; 0 before `init`.
+capacity() -> u64 = capacity_of(0)
+
+read_sector(n: u64, buf: []u8) -> Result[unit, DiskError]
+    if buf.len != SECTOR_SIZE then return Err(WrongLength)
+    read(0, n, buf)
+
+write_sector(n: u64, buf: []const u8) -> Result[unit, DiskError]
+    if buf.len != SECTOR_SIZE then return Err(WrongLength)
+    write(0, n, buf)
+
+// Disk 0's interrupts taken, requests completed, and the most in flight at once.
+stats() -> (u64, u64, u64)
+    val (i, c, m, _) = stats_of(0)
+    (i, c, m)

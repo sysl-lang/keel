@@ -1,0 +1,381 @@
+module keel.kfs
+
+// KFS's platform in the kernel (kfs/SPEC.md sections 19 and 27): section 19's locks as keel.sched's,
+// with their order checked on every acquisition; the clocks; the `kfs-commit` thread's hooks; and the
+// clock of operations the caches are stamped with.
+//
+// **The locks.** The package names a lock (`LockId`) and never holds one, so the platform keeps them:
+//
+//   rename_lock, orphans.lock, inode.lock (per inode), group[g].lock, buffer.lock (per block)
+//                         sleeping — a thread that finds one held sleeps on its wait queue, and the
+//                         unlock hands the lock straight to the first sleeper, as keel.sched's Mutex does
+//   journal.lock, cache.lock, icache.lock
+//                         spinning, with this core's interrupts masked: leaves, held for a few
+//                         instructions and never across a sleep
+//
+// A sleeping lock lives in a table entry for as long as a thread holds it or waits for it, found by kind
+// and key under one IrqLock, so a lock for each of 2^64 blocks costs nothing until it is taken. A
+// directory's lock and the same inode's ordinary lock are one entry (`Dir(n)` and `Inode(n)` name the
+// rule they are taken under, not two locks).
+//
+// **The order** of section 19 is checked on every acquisition against what the calling thread already
+// holds, by the same rules as the host platform's (`rank` in the package): a lock may be taken only while
+// every lock held ranks strictly lower, except directories (rank 2) held together and non-directories
+// (rank 3) held together in increasing number; an inode's lock taken again under either name, two group
+// locks, or anything taken under a leaf is a violation, and keel stops (`keel.kfs: a lock taken out of
+// section 19's order`). Each thread's held locks are a short list in a table keyed by the thread, an
+// entry living while the list is not empty.
+//
+// **The commit thread** (kfs.sysl) is woken by `wake_committer`, which answers false while it runs, so
+// a handle waiting for log room sleeps in `wait_for_commit` until the thread has made a pass: every pass
+// bumps a generation and wakes the waiters, and a waiter returns once the generation has moved past the
+// one it saw. With no commit thread (before it starts, and after it is stopped) `wake_committer` answers
+// true and the caller commits inline, as on the host.
+//
+// **The clock of operations** (`stamp`) is what makes it safe to drop cached records while other cores
+// use the filesystem. Every operation the kernel runs on KFS registers at its start (`begin_op`), taking
+// the clock's current reading as its start and moving it on; every lookup of a buffer or an inode record
+// is stamped with the clock's reading then, which is later than the start of the operation doing it. A
+// record stamped before the start of the oldest operation still running is held by none of them
+// (`oldest_op`), and only such a record is dropped.
+
+import kfs.keel.kfs.{Fatal, LockId, Platform, Time, rank}
+import keel.sched
+import keel.sched.{IrqLock, Thread, WaitQueue}
+import keel.timer
+import sysl.sync.{Atomic, Ordering}
+
+// -- Sleeping locks --------------------------------------------------------------------------------------
+
+private const KIND_RENAME: u32 = 1
+private const KIND_INODE: u32 = 2
+private const KIND_ORPHANS: u32 = 3
+private const KIND_GROUP: u32 = 4
+private const KIND_BUFFER: u32 = 5
+
+private const SLEEPERS: usize = 256
+
+private struct Sleeper
+    kind: u32                                   // 0: a free entry
+    key: u64
+    users: u32                                  // the holder and every thread waiting for it
+    held: bool
+    waiters: WaitQueue
+
+private var sleepers: [SLEEPERS]Sleeper
+private var sleepers_guard: IrqLock
+// The most sleeping locks held or waited for at once, and how many acquisitions had to sleep.
+private var sleepers_most: u64
+private var sleeps: u64
+
+private kind_of(l: LockId) -> u32 = l match
+    LockId.Rename -> KIND_RENAME
+    LockId.Dir(_) -> KIND_INODE
+    LockId.Inode(_) -> KIND_INODE
+    LockId.Orphans -> KIND_ORPHANS
+    LockId.Group(_) -> KIND_GROUP
+    LockId.Buffer(_) -> KIND_BUFFER
+    _ -> 0
+
+private key_of(l: LockId) -> u64 = l match
+    LockId.Dir(i) -> i
+    LockId.Inode(i) -> i
+    LockId.Group(g) -> u64(g)
+    LockId.Buffer(b) -> b
+    _ -> 0
+
+// The entry for (kind, key), claimed if no thread holds or waits for it. Under `sleepers_guard`.
+private entry(kind: u32, key: u64) -> *Sleeper
+    var free: *Sleeper = null
+    var live: u64 = 0
+    for i in 0..<SLEEPERS
+        val e = &sleepers[i]
+        if e.kind == kind && e.key == key then return e
+        if e.kind == 0
+            if free == null then free = e
+        else
+            live += 1
+    if free == null then panic("keel.kfs: more sleeping locks in use at once than the table holds")
+    if live + 1 > sleepers_most then sleepers_most = live + 1
+    free.kind = kind
+    free.key = key
+    free.users = 0
+    free.held = false
+    free
+
+private lock_sleeping(kind: u32, key: u64)
+    val flags = sleepers_guard.lock()
+    val e = entry(kind, key)
+    e.users += 1
+    if e.held
+        sleeps += 1
+        // The unlock hands the lock over: `held` stays true.
+        e.waiters.sleep(&sleepers_guard)
+    else
+        e.held = true
+    sleepers_guard.unlock(flags)
+
+private unlock_sleeping(kind: u32, key: u64)
+    val flags = sleepers_guard.lock()
+    var e: *Sleeper = null
+    for i in 0..<SLEEPERS
+        val s = &sleepers[i]
+        if s.kind == kind && s.key == key then e = s
+    if e == null || !e.held then panic("keel.kfs: a sleeping lock released that is not held")
+    if !e.waiters.wake_one() then e.held = false
+    e.users -= 1
+    if e.users == 0 then e.kind = 0
+    sleepers_guard.unlock(flags)
+
+// -- Spinning leaves ---------------------------------------------------------------------------------
+
+private struct Leaf
+    lock: IrqLock
+    flags: u64                                  // what `unlock` puts back; written by the holder
+
+private var leaves: [3]Leaf
+
+private leaf_of(l: LockId) -> usize = l match
+    LockId.Journal -> 0
+    LockId.Cache -> 1
+    _ -> 2
+
+// -- The order -----------------------------------------------------------------------------------------
+
+private const HOLDERS: usize = 32
+private const MOST_HELD: usize = 16
+
+private struct Holder
+    thread: usize                               // 0: a free entry
+    n: usize
+    ranks: [MOST_HELD]u32
+    keys: [MOST_HELD]u64
+
+private var holders: [HOLDERS]Holder
+private var holders_guard: IrqLock
+// Acquisitions checked, and the most locks one thread held at once.
+private var checked: u64
+private var most_held: u64
+
+// Off only to show what the check is for: with it off, `scripts/boot-test.sh` still passes, and a lock
+// taken out of order would deadlock some later run instead of stopping this one at the line that did it.
+private const CHECK_ORDER: bool = true
+
+// Check that the calling thread may take `l` now, and record that it holds it.
+private take(l: LockId)
+    val me = usize(sched.current())
+    val r = rank(l)
+    val k = key_of(l)
+    val flags = holders_guard.lock()
+    var h: *Holder = null
+    var free: *Holder = null
+    for i in 0..<HOLDERS
+        val e = &holders[i]
+        if e.thread == me then h = e
+        if e.thread == 0 && free == null then free = e
+    if h == null
+        if free == null then fail_order(flags, "more threads hold KFS locks at once than the table holds")
+        h = free
+        h.thread = me
+        h.n = 0
+    checked += 1
+    if CHECK_ORDER
+        for i in 0..<h.n
+            val hr = h.ranks[i]
+            val hk = h.keys[i]
+            if (hr == 2 || hr == 3) && (r == 2 || r == 3) && hk == k
+                fail_order(flags, "an inode's lock taken while it is held")
+            val together = (hr == 2 && r == 2) || (hr == 3 && r == 3 && hk < k)
+            if hr >= r && !together then fail_order(flags, "a lock taken out of section 19's order")
+    if h.n == MOST_HELD then fail_order(flags, "one thread holds more KFS locks than the table holds")
+    h.ranks[h.n] = r
+    h.keys[h.n] = k
+    h.n += 1
+    if u64(h.n) > most_held then most_held = u64(h.n)
+    holders_guard.unlock(flags)
+
+// Record that the calling thread no longer holds `l`.
+private give(l: LockId)
+    val me = usize(sched.current())
+    val r = rank(l)
+    val k = key_of(l)
+    val flags = holders_guard.lock()
+    var h: *Holder = null
+    for i in 0..<HOLDERS
+        if holders[i].thread == me then h = &holders[i]
+    if h == null then fail_order(flags, "a lock released by a thread holding none")
+    var found = false
+    var i = h.n
+    while i > 0 && !found
+        i -= 1
+        if h.ranks[i] == r && h.keys[i] == k
+            for j in i..<h.n - 1
+                h.ranks[j] = h.ranks[j + 1]
+                h.keys[j] = h.keys[j + 1]
+            h.n -= 1
+            found = true
+    if !found then fail_order(flags, "a lock released that the thread does not hold")
+    if h.n == 0 then h.thread = 0
+    holders_guard.unlock(flags)
+
+private fail_order(flags: u64, why: string) -> never
+    holders_guard.unlock(flags)
+    print("keel.kfs:", why)
+    panic("keel.kfs: a lock taken out of section 19's order")
+
+// What the lock layer has done: acquisitions checked, the most locks one thread held at once, the most
+// sleeping locks in use at once, and acquisitions that slept.
+lock_stats() -> (u64, u64, u64, u64)
+    val f1 = holders_guard.lock()
+    val a = checked
+    val b = most_held
+    holders_guard.unlock(f1)
+    val f2 = sleepers_guard.lock()
+    val c = sleepers_most
+    val d = sleeps
+    sleepers_guard.unlock(f2)
+    (a, b, c, d)
+
+// Whether any thread holds a KFS lock: none should, between operations.
+locks_held() -> u64
+    val flags = holders_guard.lock()
+    var n: u64 = 0
+    for i in 0..<HOLDERS
+        n += u64(holders[i].n)
+    holders_guard.unlock(flags)
+    n
+
+// -- The commit thread's hooks ----------------------------------------------------------------------------
+
+// Whether the commit thread runs (1); while it does, `wake_committer` answers false.
+private var committer_up: Atomic[u32] = Atomic(0)
+// Set (1) to ask the commit thread for a pass; it naps on this flag.
+private var kick: Atomic[u32] = Atomic(0)
+// Passes the commit thread has finished, and the waiters for the next one.
+private var passes: u64
+private var pass_waiters: WaitQueue
+private var pass_guard: IrqLock
+
+// Ask the commit thread for a pass now.
+private nudge()
+    kick.store(1, Ordering.Release)
+    sched.wake_nappers()
+
+// The commit thread finished a pass: wake whoever waits for one.
+private[kfs] pass_done()
+    val flags = pass_guard.lock()
+    passes += 1
+    val _ = pass_waiters.wake_all()
+    pass_guard.unlock(flags)
+
+// Sleep until the commit thread has finished a pass begun after this call.
+private[kfs] wait_for_pass()
+    val flags = pass_guard.lock()
+    // A pass already under way may have looked before the caller's change: wait for the one after it.
+    val target = passes + 2
+    nudge()
+    while passes < target && committer_up.load(Ordering.Acquire) != 0
+        pass_waiters.sleep(&pass_guard)
+        if passes + 1 == target then nudge()
+    pass_guard.unlock(flags)
+
+private[kfs] set_committer(up: bool) = committer_up.store(if up then 1 else 0, Ordering.Release)
+private[kfs] kicked() -> *Atomic[u32] = &kick
+
+// -- The clock of operations ----------------------------------------------------------------------------
+
+private const OPS: usize = 64
+
+private var clock: u64 = 1
+private var op_starts: [OPS]u64                 // 0: a free entry
+private var ops_guard: IrqLock
+
+// Register an operation starting now; the answer is what `end_op` takes.
+private[kfs] begin_op() -> usize
+    val flags = ops_guard.lock()
+    for i in 0..<OPS
+        if op_starts[i] == 0
+            op_starts[i] = clock
+            clock += 1
+            ops_guard.unlock(flags)
+            return i
+    ops_guard.unlock(flags)
+    panic("keel.kfs: more operations at once than the table holds")
+
+private[kfs] end_op(i: usize)
+    val flags = ops_guard.lock()
+    op_starts[i] = 0
+    ops_guard.unlock(flags)
+
+// The start of the oldest operation still running, or the clock's reading if none is: a record stamped
+// before it is held by no operation.
+private[kfs] oldest_op() -> u64
+    val flags = ops_guard.lock()
+    var oldest = clock
+    for i in 0..<OPS
+        if op_starts[i] != 0 && op_starts[i] < oldest then oldest = op_starts[i]
+    ops_guard.unlock(flags)
+    oldest
+
+private read_clock() -> u64
+    val flags = ops_guard.lock()
+    val now = clock
+    ops_guard.unlock(flags)
+    now
+
+// -- The platform ---------------------------------------------------------------------------------------
+
+// The cache sizes the kernel gives the package's tables (kfs.sysl keeps what lives within them).
+const BUFFER_SLOTS: usize = 2048
+const INODE_SLOTS: usize = 1024
+
+struct KernelPlatform
+    // Which mount this platform serves; one at a time (kfs.sysl).
+    mount: u32
+
+impl Platform for KernelPlatform
+    lock(*self, l: LockId)
+        take(l)
+        val kind = kind_of(l)
+        if kind != 0
+            lock_sleeping(kind, key_of(l))
+        else
+            val i = leaf_of(l)
+            val f = leaves[i].lock.lock()
+            leaves[i].flags = f
+
+    unlock(*self, l: LockId)
+        val kind = kind_of(l)
+        if kind != 0
+            unlock_sleeping(kind, key_of(l))
+        else
+            val i = leaf_of(l)
+            val f = leaves[i].flags
+            leaves[i].lock.unlock(f)
+        give(l)
+
+    now(*self) -> Time
+        val ns = timer.realtime_ns()
+        Time(i64(ns / 1_000_000_000), u32(ns % 1_000_000_000))
+
+    monotonic_ms(*self) -> u64 = timer.now_ns() / 1_000_000
+
+    wake_committer(*self) -> bool
+        if committer_up.load(Ordering.Acquire) == 0 then return true
+        nudge()
+        false
+
+    wait_for_commit(*self) = wait_for_pass()
+
+    fatal(*self, f: Fatal)
+        f match
+            Fatal.CreditOverrun(op, n) -> print("keel.kfs: operation", op, "went past its", n, "credits")
+            Fatal.RevokeOverrun(op, n) -> print("keel.kfs: operation", op, "revoked past its", n, "credits")
+            Fatal.Deadlock(op) -> print("keel.kfs: operation", op, "waits for log room nothing can make")
+            Fatal.LogOverrun(seq) -> print("keel.kfs: transaction", seq, "overran the log")
+            Fatal.TableFull(what) -> print("keel.kfs: the", what, "is full")
+        panic("keel.kfs: a bug in KFS")
+
+    override stamp(*self) -> u64 = read_clock()
+    override buffer_slots(self) -> usize = BUFFER_SLOTS
+    override inode_slots(self) -> usize = INODE_SLOTS

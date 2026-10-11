@@ -89,8 +89,12 @@ struct Transport
     slot: u64
 
 // The first transport holding a device of type `device`.
-find(device: u32) -> Option[Transport]
-    for i in 0..<SLOT_COUNT
+find(device: u32) -> Option[Transport] = find_from(device, 0)
+
+// The first transport at slot `from` or after it holding a device of type `device`: every such device,
+// in slot order, is found by starting each search one past the last one found.
+find_from(device: u32, from: u64) -> Option[Transport]
+    for i in from..<SLOT_COUNT
         val r: *Regs = mm.io(mm.PhysAddr(SLOTS_BASE + i * SLOT_SIZE))
         if r.magic == MAGIC && r.device_id == device
             return Some(Transport(r, FIRST_SPI + u32(i), i))

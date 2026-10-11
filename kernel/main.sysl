@@ -115,6 +115,8 @@ kmain(dtb_pa: u64) -> never
     // Every program is read from the filesystem's /bin, so the disk and the filesystem come before the
     // first process.
     selftest.disk()
+    // KFS on the second disk, beside the old filesystem, which stays the root.
+    selftest.kfs_tests()
     if !selftest.mount()
         system_off()
     selftest.user()

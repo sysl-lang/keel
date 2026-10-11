@@ -55,6 +55,18 @@ before_user_line=(
     "keel: disk read ok"    # sector 1 read back the bytes this script put there
     "keel: disk write ok"   # a pattern written to sector 2 read back the same
     "keel: disk smp ok"     # 4 threads x 100 reads at once, on >= 2 cores, every byte right
+    "keel: virtio-blk 3 disks in slot order, each its own interrupt"   # the old filesystem's, KFS's, and one without a flush
+    "keel: virtio-blk multi-sector ok"   # 8, 2 and 3 sectors in one request each, the same bytes as one at a time
+    "keel: virtio-blk last block ok, past the end refused"   # the last 4 KiB in one request; past it by a sector refused
+    "keel: virtio-blk flush ok"   # VIRTIO_BLK_T_FLUSH answered on each disk that offers it, refused on the one that does not
+    "keel: kfs mounted, 8192 blocks, 4 groups, journal 1024"   # KFS on the second disk, the old filesystem still to come
+    "keel: kfs cache under pressure: target 16 buffers,"   # more blocks loaded than the cache keeps (numbers checked below)
+    "keel: kfs locks: "     # section 19's locks, the order checked on every acquisition
+    "keel: kfs smp ok"      # 4 threads on 4 cores: 96 files each created, written, read back, removed; every third unlinked while open
+    "keel: kfs replayed "   # 0 on boot 1, which then ends KFS with a power cut; 3 on boot 2 (checked below)
+    "keel: kfs ended: "     # boot 1's power cut, boot 2's clean unmount (checked below)
+    "keel: kfs on a disk without flush: mounted read-only, a create refused"   # section 2: no flush, no ordering
+    "keel: kfs heap reclaimed"   # every heap block the mounts took came back
     "keel: fs mounted, 4096 blocks"   # the superblock mkfs wrote, checked against the disk's size
     "user: hello from EL0"  # a sysl program read from /bin, at EL0 in its own address space, printing through `write`
     "keel: process 1 exited 0"   # ...and ending with `exit(0)`
@@ -446,6 +458,7 @@ shutdown=(
 not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login ended by signal"
     "keel: processes left unreaped" "keel: processes still running before init" "linuxpoll: FAILED"
     "linuxfp: FAILED"
+    "keel: kfs smp wrong" "keel: kfs replay wrong" "keel: kfs power cut wrong" "keel: kfs heap wrong" "keel.kfs:"
     "keelroot" "wonderland" "nope")
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
@@ -575,6 +588,14 @@ for f in /m9/big.bin /bin/busybox /hello.txt /dir/inner.txt; do
     fi
 done
 echo "host: kfs fsroot ok"
+# That image is the second disk: keel mounts it beside the old filesystem (keel.selftest's kfs.sysl). A
+# third, an empty KFS image, goes on a drive with its write cache off, so the device offers no flush and
+# KFS has to mount it read-only.
+kfs_noflush=$out/kfs-noflush.img
+if ! $out/mkfs.kfs $kfs_noflush 4096 > /dev/null; then
+    echo "host: mkfs.kfs could not build the 16 MiB image for the disk without a flush"
+    exit 1
+fi
 sector 7 3 | perl -e 'open(my $f, "+<", $ARGV[0]) or die; seek($f, 512, 0); local $/; print $f <STDIN>' $disk
 
 if [[ $accel == hvf ]]; then
@@ -584,8 +605,14 @@ else
 fi
 
 # QEMU's virtio-mmio transport is the legacy (version 1) interface unless told otherwise; keel drives
-# the modern one.
-drive=(-drive file=$disk,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0
+# the modern one. Three disks, which keel finds in slot order: the old filesystem's, KFS's, and the KFS
+# image whose drive writes through and offers no flush (`cache=writethrough` turns the drive's write
+# cache off and `config-wce=off` keeps the device from offering to turn it on, so VIRTIO_BLK_F_FLUSH is
+# not offered). QEMU puts the first virtio device it is given in the LAST free slot (31) and works down,
+# so the disks are listed here in the reverse of the order keel finds them in.
+drive=(-drive file=$kfs_noflush,if=none,format=raw,id=d2,cache=writethrough -device virtio-blk-device,drive=d2,config-wce=off
+       -drive file=$kfs_disk,if=none,format=raw,id=d1 -device virtio-blk-device,drive=d1
+       -drive file=$disk,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0
        -global virtio-mmio.force-legacy=false)
 
 # The network: QEMU's user-mode stack (slirp), keel at 10.0.2.15, with two host UDP ports forwarded —
@@ -739,6 +766,64 @@ fsck() {
     fi
 }
 
+# KFS on the second disk, after boot $1. Boot 1 replays nothing (a fresh image) and ends KFS with a power
+# cut after three commits and before their checkpoint: the log holds them, and `fsck.kfs -n` — which
+# replays a log in memory and writes nothing — must find the image clean once it has. Boot 2 replays the
+# three, finds their files, and unmounts: the log is empty, the image clean, and the file each of the four
+# threads kept reads back through kfsdump byte for byte. Both boots' caches must have dropped buffers:
+# more blocks loaded than the cache's target of 16.
+kfs_after() {
+    local log=$out/boot$1.log report n want ended loaded dropped t
+    n=${${(M)${(f)"$(<$log)"}:#keel: kfs replayed *}#keel: kfs replayed }
+    n=${n% transactions}
+    if [[ $1 == 1 ]]; then
+        want=0 ended="keel: kfs ended: power cut after 3 commits, before their checkpoint"
+    else
+        want=3 ended="keel: kfs ended: unmounted clean"
+    fi
+    if [[ $n != $want ]]; then
+        print -r -- "FAIL: boot $1: 'keel: kfs replayed $n transactions', where $want were to be replayed"
+        return 1
+    fi
+    if [[ $(<$log) != *"$ended"* ]]; then
+        print -r -- "FAIL: boot $1: KFS did not end as planned: '$ended' is not in the log"
+        return 1
+    fi
+    loaded=${${(M)${(f)"$(<$log)"}:#keel: kfs cache under pressure: *}#*buffers, }
+    dropped=${${loaded#* blocks loaded, }%% dropped*}
+    loaded=${loaded%% blocks loaded*}
+    if [[ $loaded != <-> || $dropped != <-> ]] || (( loaded <= 16 || dropped == 0 )); then
+        print -r -- "FAIL: boot $1: the KFS cache was not under pressure: $loaded blocks loaded, $dropped dropped"
+        return 1
+    fi
+    if ! report=$($out/fsck.kfs -n $kfs_disk); then
+        print -r -- "FAIL: after boot $1, fsck.kfs finds the KFS image damaged:"
+        print -r -- $report
+        return 1
+    fi
+    if [[ $1 == 1 && $report != *"recovery replayed 3 transactions"* ]]; then
+        print -r -- "FAIL: after boot 1, the KFS log does not hold the 3 committed transactions: $report"
+        return 1
+    fi
+    if [[ $1 == 2 && $report == *"recovery replayed"* ]]; then
+        print -r -- "FAIL: after boot 2's unmount, the KFS log is not empty: $report"
+        return 1
+    fi
+    if [[ $1 == 2 ]]; then
+        for t in 0 1 2 3; do
+            rm -f $out/kfs-keep
+            perl -e 'my $t = shift; print map { chr(($t * 31 + 7000 + $_ * 13 + int($_ / 251)) & 0xff) } 0..9999' $t > $out/kfs-keep.expected
+            if ! $out/kfsdump get $kfs_disk /smp/t$t/keep $out/kfs-keep > /dev/null || ! cmp -s $out/kfs-keep $out/kfs-keep.expected; then
+                print -r -- "FAIL: after boot 2, /smp/t$t/keep on the KFS image is not what thread $t wrote"
+                return 1
+            fi
+        done
+        print -r -- "host: kfs after boot 2: fsck.kfs clean, the log empty, the 4 files keel's threads kept read back"
+    else
+        print -r -- "host: kfs after boot 1: fsck.kfs clean once the log's 3 transactions are replayed"
+    fi
+}
+
 boot 1 "user: first boot, no /out.txt yet" session1 transcript1
 first=$waited
 
@@ -750,10 +835,12 @@ if [[ $(od -An -tx1 -v -j 1024 -N 512 $disk) != $(od -An -tx1 -v $out/sector2.ex
 fi
 print -r -- "keel: disk persisted"
 fsck 1
+kfs_after 1
 
 boot 2 "user: persisted across reboot" session2 transcript2
 second=$waited
 fsck 2
+kfs_after 2
 
 # `sleep 100 | sleep 100 &` printed its last stage's pid, as a POSIX shell does: `echo $!` printed the
 # same number, and ps lists it as a sleep whose group is another number — the first stage's, which ps

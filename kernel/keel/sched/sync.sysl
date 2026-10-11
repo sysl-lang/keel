@@ -87,7 +87,10 @@ end WaitQueue
 empty_wait_queue() -> WaitQueue = WaitQueue(Queue(null, null))
 
 // Mutual exclusion that owns what it protects. `lock` answers the address of the value; the caller
-// writes `defer m.unlock()` beside it.
+// writes `defer m.unlock()` beside it. `@guards(value)`: the value is reached only through the lock, so
+// a `Mutex` crosses between threads whatever it holds (reference/memory.md § A guarded value crosses
+// with its lock) — a `Mutex[T]` in module storage may hold a `Buf` and still be reached from a thread.
+@guards(value)
 struct Mutex[T]
     private guard: IrqLock
     private held: bool

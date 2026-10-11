@@ -18,20 +18,24 @@ private sector1_byte(i: usize) -> u8 = u8((i * 7 + 3) & 0xff)
 private sector2_byte(i: usize) -> u8 = u8((i * 13 + 0x5a) & 0xff)
 
 disk()
-    val capacity = virtio.init() match
-        Some(n) -> n
-        None ->
-            print("keel: no virtio-blk disk")
-            return
-    print("keel: virtio-blk found, capacity", capacity, "sectors")
+    val disks = virtio.init()
+    if disks == 0
+        print("keel: no virtio-blk disk")
+        return
+    print("keel: virtio-blk found, capacity", virtio.capacity(), "sectors")
     disk_read()
     disk_write()
     disk_smp()
+    disk_slots(disks)
+    disk_multi_sector()
+    disk_edges()
+    disk_flush(disks)
 
 private error_name(e: DiskError) -> string = e match
     NoDisk -> "no disk"
     WrongLength -> "wrong length"
     PastEnd -> "past the end"
+    NoFlush -> "no flush"
     Device(_) -> "device error"
 
 // Whether `b` holds sector `n`'s known contents (1 from the image, 2 once `disk_write` has run).
@@ -114,3 +118,101 @@ private read_many(r: &sync Readers)
         if ok then r.good.add(1, Ordering.Relaxed) else r.bad.add(1, Ordering.Relaxed)
         for i in 0..<SECTOR
             b[i] = 0
+
+// --- More than one disk -----------------------------------------------------------------------------
+//
+// The boot test attaches the old filesystem's disk and KFS's (and a third, whose drive has its write
+// cache off, so it offers no flush). They are found in slot order, each on its own virtio-mmio transport
+// and so its own interrupt, SPI 16 + slot (INTID 48 + slot); a read on one raises that disk's interrupt
+// and no other's.
+
+private const KFS_DISK: u64 = 1
+
+private disk_slots(n: u64)
+    var ordered = n >= 2
+    for d in 0..<n
+        val flush = if virtio.has_flush(d) then "yes" else "no"
+        print("keel: virtio-blk disk", d, "slot", virtio.slot_of(d), "interrupt", virtio.irq_of(d), "capacity",
+              virtio.capacity_of(d), "sectors, flush", flush)
+        if virtio.irq_of(d) != 48 + u32(virtio.slot_of(d)) then ordered = false
+        if d > 0 && virtio.slot_of(d) <= virtio.slot_of(d - 1) then ordered = false
+    // Each disk's own interrupt: a read on disk d is taken by d's handler and by no other's.
+    var own = true
+    var b: [SECTOR]u8 = [0; SECTOR]
+    for d in 0..<n
+        var before: [virtio.MAX_DISKS]u64 = [0; virtio.MAX_DISKS]
+        for e in 0..<n
+            before[e] = virtio.stats_of(e).0
+        if virtio.read(d, 0, b[..]).is_err() then own = false
+        for e in 0..<n
+            val moved = virtio.stats_of(e).0 > before[e]
+            if moved != (e == d) then own = false
+    if ordered && own
+        print("keel: virtio-blk", n, "disks in slot order, each its own interrupt")
+    else
+        print("keel: virtio-blk disks wrong: in slot order", ordered, "own interrupts", own)
+
+// A 4 KiB block in one request, and requests of two and three sectors, against the same sectors read one
+// at a time; each multi-sector read is one completion.
+private disk_multi_sector()
+    var whole: [4096]u8 = [0; 4096]
+    var one: [SECTOR]u8 = [0; SECTOR]
+    var ok = true
+    for count in [8u64, 2, 3]
+        val bytes = usize(count) * SECTOR
+        val (_, done_before, _, _) = virtio.stats_of(KFS_DISK)
+        if virtio.read(KFS_DISK, 8, whole[0..<bytes]).is_err() then ok = false
+        val (_, done_after, _, _) = virtio.stats_of(KFS_DISK)
+        if done_after - done_before != 1 then ok = false
+        for s in 0..<count
+            if virtio.read(KFS_DISK, 8 + s, one[..]).is_err() then ok = false
+            for i in 0..<SECTOR
+                if one[i] != whole[usize(s) * SECTOR + i] then ok = false
+    // Block 1 is the superblock, which opens with its magic.
+    if virtio.read(KFS_DISK, 8, whole[..]).is_err() then ok = false
+    if ok && whole[0] != 0 then print("keel: virtio-blk multi-sector ok") else print("keel: virtio-blk multi-sector wrong")
+
+// The edges of the disk: the last block read and written (with the bytes it holds) as one request; any
+// request reaching past the last sector, by one sector or by a whole block, refused before it is sent;
+// lengths that are not 1-8 whole sectors refused; a disk there is not refused.
+private disk_edges()
+    val cap = virtio.capacity_of(KFS_DISK)
+    var blk: [4096]u8 = [0; 4096]
+    var again: [4096]u8 = [0; 4096]
+    var ok = virtio.read(KFS_DISK, cap - 8, blk[..]).is_ok()
+    ok = ok && virtio.write(KFS_DISK, cap - 8, blk[..]).is_ok()
+    ok = ok && virtio.read(KFS_DISK, cap - 8, again[..]).is_ok()
+    for i in 0..<4096
+        if blk[i] != again[i] then ok = false
+    ok = ok && virtio.read(KFS_DISK, cap - 1, blk[0..<SECTOR]).is_ok()
+    val (_, done_before, _, _) = virtio.stats_of(KFS_DISK)
+    ok = ok && refused(virtio.read(KFS_DISK, cap - 7, blk[..]), "past the end")
+    ok = ok && refused(virtio.read(KFS_DISK, cap, blk[0..<SECTOR]), "past the end")
+    ok = ok && refused(virtio.write(KFS_DISK, cap, blk[0..<SECTOR]), "past the end")
+    ok = ok && refused(virtio.read(KFS_DISK, 0xFFFF_FFFF_FFFF_FFFF, blk[0..<SECTOR]), "past the end")
+    ok = ok && refused(virtio.read(KFS_DISK, 0, blk[0..<SECTOR + 1]), "wrong length")
+    ok = ok && refused(virtio.read(KFS_DISK, 0, blk[0..<0]), "wrong length")
+    var big: [4608]u8 = [0; 4608]
+    ok = ok && refused(virtio.read(KFS_DISK, 0, big[..]), "wrong length")
+    ok = ok && refused(virtio.read(u64(virtio.MAX_DISKS), 0, blk[0..<SECTOR]), "no disk")
+    // None of the refused requests reached the device.
+    val (_, done_after, _, _) = virtio.stats_of(KFS_DISK)
+    ok = ok && done_after == done_before
+    if ok then print("keel: virtio-blk last block ok, past the end refused") else print("keel: virtio-blk edges wrong")
+
+private refused(r: Result[unit, DiskError], want: string) -> bool = r match
+    Ok(_) -> false
+    Err(e) -> error_name(e) == want
+
+// A flush on every disk that offers one, each answered and counted; a disk without one refuses it.
+private disk_flush(n: u64)
+    var ok = virtio.has_flush(KFS_DISK)
+    for d in 0..<n
+        val (_, _, _, before) = virtio.stats_of(d)
+        if virtio.has_flush(d)
+            ok = ok && virtio.flush(d).is_ok()
+            val (_, _, _, after) = virtio.stats_of(d)
+            ok = ok && after == before + 1
+        else
+            ok = ok && refused(virtio.flush(d), "no flush")
+    if ok then print("keel: virtio-blk flush ok") else print("keel: virtio-blk flush wrong")
