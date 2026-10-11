@@ -2676,6 +2676,44 @@ rule failing for a tuple of literals. Here the `Ok(n)` arm fixes `T = int` and t
 together they determine `Result[int, E]`, as they would if written in the other order or annotated.
 The workaround, which KFS used, is to restructure (or annotate `val r: Result[int, E]`).
 
+## 78. `sysl build-lib` emits a capturing closure inside a generic function without its environment type (bug)
+
+KFS stage 6 changes an inode in place through `change_inode(fs, h, ino, edit: &Fn(*Inode) -> unit)`,
+every caller handing it a closure that captures the new values (`(n) -> set_atime(n, now)`), and every
+caller is generic over the device and the platform, as all of KFS is. `sysl test kfs` compiles, links
+and runs it; `sysl build-lib kfs` (host or `--target aarch64-freestanding`, the stage gate's check)
+fails in clang. The shortest input (sysl 0.1.0-alpha.9), one file of a package:
+
+    module probe
+
+    apply(f: &Fn(u64) -> u64) -> u64 = f(1)
+
+    add[T](x: T, v: u64) -> u64 = apply((n) -> n + v)
+
+    $ sysl build-lib .
+    sysl: error: clang failed (exit 1):
+    …/sysl-std-KiT2oH/sysl.code.o.ll:2568:33: error: load operand must be a pointer to a first class type
+     2568 |   %t3 = load %struct.$closure4, ptr %t2
+
+The emitted `$closure4.call` loads its environment as `%struct.$closure4`, a type the module never
+defines. What decides it, each probed:
+
+| | `build-lib` |
+|---|---|
+| the closure captures `v`, inside generic `add[T]` | **fails** |
+| the same, with a non-generic caller in the library instantiating `add[u32]` | **fails** |
+| a closure capturing nothing, inside a generic function | checks |
+| a capturing closure inside a non-generic function | checks |
+| `sysl build` of a program with the failing function, called or not | builds and runs (`5`) |
+| `sysl test` of the package | passes |
+
+So the program path lowers the closure only per instantiation, with its environment, and `build-lib`
+lowers the generic body's closure once, uninstantiated, without one. Nothing in the reference limits
+where a capturing closure may appear (`reference/functions.md`'s closures; generics are an ordinary
+context for one), and the code is accepted by every analysis pass: this is codegen. The workaround
+would be to give up the closure for a begin/end pair that hands back a `*Inode` and re-seals after — a
+shape that lets a caller forget the seal, chosen only because a check command crashes.
+
 ## What worked in milestone 17
 
 - **No sysl gap in the kernel half.** A poller waits on one module `WaitQueue` with an event count under
