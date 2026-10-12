@@ -7,16 +7,12 @@ package {
 
 dependencies {
   rt { workspace = true }
+  fsys { workspace = true }
 }
 
 targets {
   aarch64-freestanding {
     linker_script = "../user.ld"
     entry         = "_start"
-
-    // keel is not POSIX to the compiler: a sysl.posix module is refused at compile time, not at the link.
-    capabilities {
-      posix = false
-    }
   }
 }

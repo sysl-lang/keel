@@ -15,9 +15,11 @@ import abi.keel.abi.{AF_INET, ANY_CHILD, AT_FDCWD, AT_REMOVEDIR, EACCES, EINTR, 
     SYS_MKDIRAT, SYS_NANOSLEEP, SYS_NEWFSTATAT, SYS_OPENAT, SYS_PIPE2, SYS_PROCS, SYS_READ, SYS_RECVFROM,
     SYS_RENAMEAT, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK, SYS_SENDTO, SYS_SETSOCKOPT, SYS_SOCKET,
     SYS_SPAWN, SYS_SYNC, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE, SigAction, SockAddrIn, SpawnAttr, Stat, TIOCGPGRP,
-    TIOCSPGRP, Timespec, Timeval, WNOHANG, empty_stat, sock_addr_in, ECHO, TCGETS, TCSETS, Termios, console_termios}
+    TIOCSPGRP, Timespec, Timeval, WNOHANG, empty_stat, sock_addr_in}
 import sysl.buf.{Buf, buf}
 import sysl.slices.{as_mut_ptr, as_ptr}
+import sysl.sync.SpinLock
+import sysl.threads.{tls_place, tls_room}
 
 @section(".text.start")
 asm
@@ -35,11 +37,35 @@ asm
 extern "main" program_main(argc: int, argv: **u8) -> int
 
 // Where `_start` goes with the arguments: the environment's vector follows argv's zero, so `environ`
-// is set to it; then the program runs, and what it answered ends the process.
+// is set to it; the first thread's thread-local storage is laid down; then the program runs, and what
+// it answered ends the process.
 @export("keel_user_start")
 start(argc: int, argv: **u8) -> never
     environ = ptr_cast(usize(argv) + (usize(argc) + 1) * 8)
+    place_first_tls()
     exit(program_main(argc, argv))
+
+// `PLACE_FIRST_TLS = false` is the control: the first thread runs with TPIDR_EL0 zero, so its first
+// `@thread_local` read is a fault at the bottom of the address space.
+private const PLACE_FIRST_TLS: bool = true
+
+// The first thread is the one `sysl.threads.spawn` did not start, so nothing else lays its block of
+// `@thread_local` storage out of the program's template: `tls_room()` bytes from the heap, filled by
+// `tls_place`, whose answer is what TPIDR_EL0 holds while the thread runs (the kernel saves and loads it
+// on every switch, and `fork` copies it). A program with no thread-local storage needs no block, and
+// the register stays the zero the kernel started it at.
+private place_first_tls()
+    val room = tls_room()
+
+    if room == 0 || !PLACE_FIRST_TLS then return
+
+    val block = alloc(room)
+
+    if block == null then exit(127)
+
+    tls_place(block[0..<room]) match
+        Some(tp) -> write_sysreg("tpidr_el0", u64(usize(tp)))
+        None -> exit(127)
 
 // The environment, as C keeps it: a zero-ended vector of `NAME=value` strings — the one the kernel laid
 // on the stack. `sysl.env` reads it through keel.fsys's hooks, which ask `env_entry` here. It is a word
@@ -394,41 +420,6 @@ tcgetpgrp(fd: u64) -> Result[u64, Errno]
     done(call(SYS_IOCTL, fd, TIOCGPGRP, u64(usize(&g)), 0))?
     Ok(u64(g))
 
-// The terminal's settings and setting them (TCGETS, TCSETS); `fd` must be the console (ENOTTY).
-tcgetattr(fd: u64) -> Result[Termios, Errno]
-    var t = console_termios()
-    done(call(SYS_IOCTL, fd, TCGETS, u64(usize(&t)), 0))?
-    Ok(t)
-
-tcsetattr(fd: u64, t: Termios) -> Result[unit, Errno]
-    var given = t
-    done(call(SYS_IOCTL, fd, TCSETS, u64(usize(&given)), 0))
-
-// What `shown` needs to put back: the settings echo was turned off from.
-struct Hidden
-    fd: u64
-    saved: Option[Termios]
-
-// Turn the terminal's echo off on `fd` for something not to be shown, a password: what `shown` takes to
-// turn it back on. A descriptor that is not the terminal is left as it is.
-hidden(fd: u64) -> Hidden
-    tcgetattr(fd) match
-        Ok(t) ->
-            var quiet = t
-            quiet.lflag = quiet.lflag & ~ECHO
-            if tcsetattr(fd, quiet).is_err() then return Hidden(fd, None)
-            Hidden(fd, Some(t))
-        Err(_) -> Hidden(fd, None)
-
-// Echo back on, as `hidden` found it; the newline the hidden line ended with was not echoed, so it is
-// written here (C's getpass does the same).
-shown(h: Hidden)
-    h.saved match
-        Some(t) ->
-            val _ = tcsetattr(h.fd, t)
-            val _ = put("\n")
-        None -> ()
-
 // Sleep `nanos` nanoseconds (the kernel's tick is 10 ms). Err(EINTR) and what was left if a signal
 // ended it first.
 nanosleep(nanos: u64) -> Result[unit, (Errno, u64)]
@@ -519,7 +510,9 @@ exit(code: int) -> never
     sys_exit(u64(code))
 
 // The heap: blocks carved from the region `brk` grows, each with a 16-byte header holding its size,
-// and a free list searched first fit. Freed blocks are reused, never returned to the kernel.
+// and a free list searched first fit. Freed blocks are reused, never returned to the kernel. One spin
+// lock keeps the list whole when a program's threads allocate at once; a thread preempted holding it
+// costs a waiter at most its time slice.
 private struct Header
     size: usize                 // the whole block, header included
     next: *Header               // the next free block, while this one is free
@@ -529,9 +522,16 @@ private const HEADER: usize = 16
 
 private var free_list: *Header = null
 private var heap_end: u64 = 0
+private var heap_lock: SpinLock = SpinLock(0)
 
 @export("keel_user_alloc")
 alloc(n: usize) -> *u8
+    heap_lock.lock()
+    val p = carve(n)
+    heap_lock.unlock()
+    p
+
+private carve(n: usize) -> *u8
     val need = (n + HEADER + 15) & ~usize(15)
     var prev: *Header = null
     var h = free_list
@@ -555,5 +555,7 @@ alloc(n: usize) -> *u8
 free(p: *u8)
     if p == null then return
     val h: *Header = ptr_cast(usize(p) - HEADER)
+    heap_lock.lock()
     h.next = free_list
     free_list = h
+    heap_lock.unlock()

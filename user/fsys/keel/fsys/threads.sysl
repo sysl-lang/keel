@@ -1,0 +1,106 @@
+module keel.fsys
+
+// `sysl.threads` on keel: the six hooks of `sysl.threads.sys` over keel's Linux calls — a thread is a
+// `clone` with musl's flag set, joined through the word CLONE_CHILD_CLEARTID clears; `gettid`,
+// `sched_yield`, and `futex` WAIT/WAKE for every lock, condition variable and channel the library writes
+// over them. Each hook answers as the system call does: zero or more for success, the error number
+// negated otherwise (`sysl.threads.sys`'s contract, which keel's numbers already are).
+
+import abi.keel.abi.{CLONE_CHILD_CLEARTID, CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_THREAD_SET, EAGAIN, EINTR,
+    ETIMEDOUT, FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, SYS_FUTEX, SYS_GETTID, SYS_SCHED_YIELD, Timespec}
+import rt.keel.user.syscall
+import sysl.sync.{Atomic, Ordering}
+import sysl.sys.UNSUPPORTED
+
+// The new thread starts on `clone`'s return with x0 = 0, every other register the caller's, and SP at
+// the top of the stack it was handed — so the part of the start that runs before the thread has a frame
+// of its own is assembly: it calls `entry(arg)` and then `exit` (93), which ends the one thread.
+// x5 and x6 carry `entry` and `arg` across the call into x9 and x10, which the kernel copies into the
+// child with the rest of the caller's registers.
+asm
+    [aarch64]
+        ".text"
+        ".p2align 2"
+        ".globl keel_thread_clone"
+        "keel_thread_clone:"
+        "mov x9, x5"
+        "mov x10, x6"
+        "mov x8, #220"
+        "svc #0"
+        "cbz x0, 1f"
+        "ret"
+        "1:"
+        "mov x29, #0"
+        "mov x30, #0"
+        "mov x0, x10"
+        "blr x9"
+        "mov x0, #0"
+        "mov x8, #93"
+        "svc #0"
+        "brk #1"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "keel runs on aarch64 only"
+
+// clone(flags, stack, parent_tid, tls, child_tid) for a thread that runs `entry(arg)` and ends.
+extern "keel_thread_clone" clone_thread(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64,
+                                        entry: *extern(*u8) -> unit, arg: *u8) -> i64
+
+// The id word goes to the kernel twice: CLONE_PARENT_SETTID writes the id there before the thread can
+// run, and CLONE_CHILD_CLEARTID zeroes it (and wakes a futex waiter on it) once the thread is off its
+// stack. Both are 32-bit stores into the low half of the library's 64-bit word, whose high half the
+// library left zero. keel has no stack of its own to give a thread, so a null `stack` is unsupported.
+@export("sysl_thread_spawn")
+thread_spawn(entry: *extern(*u8) -> unit, arg: *u8, stack: *u8, stack_len: usize, tls: *u8, tid: *u64) -> int
+    if stack == null then return UNSUPPORTED
+
+    val flags = CLONE_THREAD_SET | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID
+    val word = u64(usize(tid))
+    val r = clone_thread(flags, u64(usize(stack) + stack_len), word, u64(usize(tls)), word, entry, arg)
+
+    if r < 0 then int(r) else 0
+
+// Wait until the kernel has cleared the thread's word: a futex wait on its low 32 bits for as long as
+// they hold an id. The kernel's wake on that word is not private, so neither is the wait.
+@export("sysl_thread_join")
+thread_join(tid: *u64) -> int
+    val word: *Atomic[u32] = ptr_cast(tid)
+
+    loop
+        val seen = word.load(Ordering.Acquire)
+
+        if seen == 0 then return 0
+
+        val r = syscall(SYS_FUTEX, u64(usize(tid)), FUTEX_WAIT, u64(seen), 0)
+
+        if r < 0 && r != -i64(EAGAIN) && r != -i64(EINTR) then return int(r)
+
+@export("sysl_thread_self")
+thread_self() -> u64 = u64(syscall(SYS_GETTID, 0, 0, 0, 0))
+
+@export("sysl_thread_yield")
+thread_yield() -> int = int(syscall(SYS_SCHED_YIELD, 0, 0, 0, 0))
+
+// What `sysl_futex_wait` answers when its time ran out: `sysl.threads.sys.TIMED_OUT`, which is
+// `private[sysl]` and so cannot be named from here.
+private const TIMED_OUT: int = 1
+
+// A wait that ended any way but by its time running out answers zero — woken, the word already changed
+// (EAGAIN) or a signal (EINTR) — since the library re-reads the word in every case.
+@export("sysl_futex_wait")
+futex_wait(addr: *u32, expected: u32, timeout_ns: i64) -> int
+    var limit = Timespec(timeout_ns / 1_000_000_000, timeout_ns % 1_000_000_000)
+    val timeout = if timeout_ns < 0 then 0 else u64(usize(&limit))
+    val r = syscall(SYS_FUTEX, u64(usize(addr)), FUTEX_WAIT | FUTEX_PRIVATE_FLAG, u64(expected), timeout)
+
+    if r >= 0 || r == -i64(EAGAIN) || r == -i64(EINTR) then return 0
+
+    if r == -i64(ETIMEDOUT) then TIMED_OUT else int(r)
+
+// `FUTEX_WAKES = false` is the control: a wake that wakes nobody, so a contended `Mutex` and a `Condvar`
+// sleep for ever and `threads` hangs until the boot test's watchdog.
+private const FUTEX_WAKES: bool = true
+
+@export("sysl_futex_wake")
+futex_wake(addr: *u32, n: int) -> int
+    if !FUTEX_WAKES then return 0
+
+    int(syscall(SYS_FUTEX, u64(usize(addr)), FUTEX_WAKE | FUTEX_PRIVATE_FLAG, u64(n), 0))

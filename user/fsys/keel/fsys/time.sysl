@@ -1,10 +1,11 @@
 module keel.fsys
 
-// `sysl.time` on keel: its two seams, `sysl_wall_us` (`now`) and `sysl_monotonic_us` (`monotonic`),
-// over `clock_gettime` with CLOCK_REALTIME and CLOCK_MONOTONIC. The library's own definitions of these
-// are weak on a freestanding target, so these are the ones a keel program links.
+// `sysl.time` on keel: its three seams, `sysl_wall_us` (`now`) and `sysl_monotonic_us` (`monotonic`)
+// over `clock_gettime` with CLOCK_REALTIME and CLOCK_MONOTONIC, and `sysl_sleep_us` (`sleep`) over
+// `nanosleep`. The library's own definitions of these are weak on a freestanding target, so these are
+// the ones a keel program links.
 
-import abi.keel.abi.{CLOCK_MONOTONIC, CLOCK_REALTIME, SYS_CLOCK_GETTIME, Timespec}
+import abi.keel.abi.{CLOCK_MONOTONIC, CLOCK_REALTIME, EINTR, SYS_CLOCK_GETTIME, SYS_NANOSLEEP, Timespec}
 import rt.keel.user.syscall
 
 // `clock` in microseconds; 0 if keel refused it (it has both of these).
@@ -18,3 +19,21 @@ wall_us() -> long = micros_of(CLOCK_REALTIME)
 
 @export("sysl_monotonic_us")
 monotonic_us() -> long = micros_of(CLOCK_MONOTONIC)
+
+private const SLEEP_WAITS: bool = true
+
+// One wait of `us` microseconds, answering what is still owed: zero when it all passed, what nanosleep
+// left (rounded up to a whole microsecond) when a signal cut it short. keel wakes a sleeper at its 10 ms
+// tick, never early. Any other refusal owes nothing, so `sleep`'s loop ends rather than spinning.
+// `SLEEP_WAITS = false` is the control: the hook answers at once, and `threads`' sleep line fails.
+@export("sysl_sleep_us")
+sleep_us(us: long) -> long
+    if !SLEEP_WAITS then return 0
+
+    var want = Timespec(us / 1_000_000, us % 1_000_000 * 1000)
+    var left = Timespec(0, 0)
+    val r = syscall(SYS_NANOSLEEP, u64(usize(&want)), u64(usize(&left)), 0, 0)
+
+    if r != -i64(EINTR) then return 0
+
+    left.sec * 1_000_000 + (left.nsec + 999) / 1000

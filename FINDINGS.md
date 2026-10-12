@@ -2543,6 +2543,11 @@ candidate, whatever kind of thing the import names.
 
 ## 73. `sysl.posix.threads` has no hook layer, so a program for a target with system calls and no C library cannot start a thread
 
+**FIXED in sysl 0.1.0-alpha.10, and adopted**: `keel.fsys` (`user/fsys/keel/fsys/threads.sysl`) answers
+`sysl_thread_spawn/join/self/yield` and `sysl_futex_wait/wake` over clone, gettid, sched_yield and futex;
+`user/rt` places the first thread's TLS block; `user/threads` runs `sysl.threads` Mutex, Condvar, Channel and
+thread-locals on four cores in the boot test (controls `FUTEX_WAKES`, `PLACE_FIRST_TLS`).
+
 Milestone 16 gives keel `clone` with musl's thread flags, `futex`, TLS and `exit`/`exit_group` by
 Linux's numbers. A keel program written in sysl would reach them through the standard library's
 threads, as it reaches files through `sysl.fs` and processes through `sysl.process`. It cannot: the
@@ -2579,6 +2584,9 @@ which is the design question this finding leaves open.
 
 ## 74. `sysl.time` reads a clock through a seam but has no sleep, so a freestanding program cannot wait for a time
 
+**FIXED in sysl 0.1.0-alpha.10, and adopted**: `keel.fsys`'s `time.sysl` answers `sysl_sleep_us` over
+nanosleep; `sleep` and `stdsig` use `sysl.time.sleep` (control `SLEEP_WAITS`).
+
 Milestone 17 gives keel `clock_gettime`, `nanosleep` and `clock_nanosleep` by Linux's numbers, and
 keel.fsys now answers `sysl.time`'s two seams (`sysl_wall_us`, `sysl_monotonic_us`; `user/fsys/keel/fsys/time.sysl`),
 so `sysl.time.now()` and `monotonic()` work from EL0 (`stdsig: time ok`). Sleeping does not: the only
@@ -2610,6 +2618,9 @@ it, answered by `nanosleep` on a host and by keel.fsys (or a board package) on a
 
 ## 75. No terminal-mode surface reaches a freestanding program, so turning echo off for a password is a raw `ioctl`
 
+**FIXED in sysl 0.1.0-alpha.10, and adopted**: `keel.fsys`'s `tty.sysl` answers `sysl_tty_get/set` over the
+TCGETS/TCSETS ioctls; `login` and `su` read passwords through `sysl.tty.hidden()`, and rt's own pair is gone.
+
 keel's console now has Linux's termios (TCGETS/TCSETS, ECHO, ICANON, VMIN/VTIME, ISIG). `login` and `su`
 read passwords and must turn echo off. The library's terminal-mode code is `sysl.posix.tty`
 (`mode.sysl`): `@requires(posix)`, and its raw/cooked switch is two C functions in `__posix__/termios.c`
@@ -2630,6 +2641,9 @@ a `sysl.term` mode seam in the hook style — `sysl_term_get(fd, *Mode) -> int` 
 keel.fsys here.
 
 ## 76. The `posix` capability means both "POSIX semantics" and "a C POSIX library", so keel can declare neither honestly
+
+**FIXED in sysl 0.1.0-alpha.10:** libc is split from posix; `sysl.posix.*` needs posix and libc and is
+refused on a non-POSIX target anyway. The 33 `posix = false` lines are gone from keel's manifests.
 
 A freestanding manifest provides every capability it does not mention, so a keel program that imports
 a C-calling `sysl.posix.*` module (`sysl.posix.time.sleep`, FINDINGS 74) gets past analysis and fails
@@ -2655,6 +2669,10 @@ bindings that call C require `libc` (off by default on freestanding), the hook-b
 
 ## 77. A `match` arm of `Err(…)` does not take `Result`'s other type argument from a sibling `Ok(…)` arm (bug)
 
+**FIXED in sysl 0.1.0-alpha.10:** the `Err` arm takes `Result`'s other type argument from the sibling
+`Ok` arm. The `val next = r match` in `kfs/keel/kfs/extent_tests.sysl` is written without an
+annotation now.
+
 KFS stage 3's allocator answered a `Result` from a `match` whose arms each name one half of it. The
 shortest input (sysl 0.1.0-alpha.9):
 
@@ -2677,6 +2695,9 @@ together they determine `Result[int, E]`, as they would if written in the other 
 The workaround, which KFS used, is to restructure (or annotate `val r: Result[int, E]`).
 
 ## 78. `sysl build-lib` emits a capturing closure inside a generic function without its environment type (bug)
+
+**FIXED in sysl 0.1.0-alpha.10:** `sysl build-lib kfs --target aarch64-freestanding` builds, and the
+probe below builds. The workaround-free source needs alpha.10 for the freestanding build.
 
 KFS stage 6 changes an inode in place through `change_inode(fs, h, ino, edit: &Fn(*Inode) -> unit)`,
 every caller handing it a closure that captures the new values (`(n) -> set_atime(n, now)`), and every

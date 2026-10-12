@@ -1,0 +1,43 @@
+module keel.fsys
+
+// `sysl.tty` on keel: its two hooks over `ioctl` TCGETS and TCSETS on the console. A `Mode` names seven
+// of the kernel's termios settings; `sysl_tty_set` reads the terminal's own settings first and writes
+// back only those seven, so everything else the console has stays as it was. Any descriptor but the
+// console's is ENOTTY, negated, as the hook's contract asks.
+
+import abi.keel.abi.{ECHO, ICANON, ISIG, ONLCR, OPOST, SYS_IOCTL, TCGETS, TCSETS, Termios, VMIN, VTIME,
+    console_termios}
+import rt.keel.user.syscall
+import sysl.tty.sys.Mode
+
+// The terminal at `fd`'s settings, or the error number negated.
+private settings(fd: int, into: *Termios) -> int = int(syscall(SYS_IOCTL, u64(fd), TCGETS, u64(usize(into)), 0))
+
+private has(flags: u32, bit: u32) -> bool = (flags & bit) != 0
+
+private with_bit(flags: u32, bit: u32, on: bool) -> u32 = if on then flags | bit else flags & ~bit
+
+@export("sysl_tty_get")
+tty_get(fd: int, into: *Mode) -> int
+    var t = console_termios()
+    val r = settings(fd, &t)
+
+    if r < 0 then return r
+
+    *into = Mode(has(t.lflag, ECHO), has(t.lflag, ICANON), has(t.lflag, ISIG), has(t.oflag, OPOST),
+                 has(t.oflag, ONLCR), t.cc[VMIN], t.cc[VTIME])
+    0
+
+@export("sysl_tty_set")
+tty_set(fd: int, mode: *Mode) -> int
+    var t = console_termios()
+    val r = settings(fd, &t)
+
+    if r < 0 then return r
+
+    t.lflag = with_bit(with_bit(with_bit(t.lflag, ECHO, mode.echo), ICANON, mode.canonical), ISIG, mode.signals)
+    t.oflag = with_bit(with_bit(t.oflag, OPOST, mode.output), ONLCR, mode.crlf)
+    t.cc[VMIN] = mode.min
+    t.cc[VTIME] = mode.time
+
+    int(syscall(SYS_IOCTL, u64(fd), TCSETS, u64(usize(&t)), 0))

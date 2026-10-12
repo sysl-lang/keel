@@ -286,6 +286,7 @@ session2=(
     'linuxthreads'
     'linuxthreads exec'
     'linuxthreads fds'
+    'threads'
     'linuxfp'
     'linuxpoll'
     '@wait linuxpoll: termios round trip; raw mode, waiting for three bytes'
@@ -384,6 +385,15 @@ transcript2=(
     # by one thread; a read in flight keeps its pipe end through another thread's close; nothing left over.
     $'# linuxthreads fds\nlinuxthreads: 4 threads x 2000 rounds of pipe2, dup, openat and close at once: no descriptor shared, every pipe round-tripped\n'
     $'linuxthreads: a read in flight keeps its pipe end through a close; the table ends with 0-2 alone\n'
+    # sysl.threads and sysl.time.sleep over keel.fsys's hooks (clone, futex, nanosleep): a contended Mutex
+    # across cores, ids and thread-locals per thread (the first thread's laid by keel.user's start), a
+    # Condvar handoff, a Channel's every value once, a sleep measured by the monotonic clock, every join.
+    $'# threads\nthreads: 4 threads x 100000 under a Mutex: 400000, on different cores at once\n'
+    $'threads: every thread its own id; thread-locals laid from the template for the first thread and each spawned one, and kept their own\n'
+    $'threads: a Condvar handed the turn over 2000 times, every turn in order\n'
+    $'threads: a Channel of 8 slots carried 3 producers x 5000 values, every one received once\n'
+    $'threads: sleep(50 ms) took at least 50 ms by the monotonic clock\n'
+    $'threads: 8 threads spawned, every one joined\n'
     # FP/SIMD at EL0: a raw-svc Linux program built without -mgeneral-regs-only. A new process's q registers,
     # FPSR and FPCR are zero; eight threads on four cores each carry their own through a long chain of SIMD
     # adds, across preemption and migration; a fork's child goes on from the parent's; a handler that
@@ -410,7 +420,7 @@ transcript2=(
     $'# busybox echo hello from busybox\nhello from busybox\n'
     $'# busybox uname -a\nkeel keel 0.18 milestone 18 aarch64 Linux\n'
     $'# busybox ls -l /\ntotal 68\n'
-    $'drwxr-xr-x    2 0        root          1504 Jan  1  1970 \e[1;34mbin\e[m\n'
+    $'drwxr-xr-x    2 0        root          1536 Jan  1  1970 \e[1;34mbin\e[m\n'
     $'drwxr-xr-x    2 0        root            96 Jan  1  1970 \e[1;34mdir\e[m\n'
     $'drwxr-xr-x    2 0        root           160 Jan  1  1970 \e[1;34metc\e[m\n'
     $'-rw-r--r--    1 0        root            19 Jan  1  1970 \e[0;0mhello.txt\e[m\n'
@@ -457,13 +467,13 @@ shutdown=(
 # the `files` program failed, the shell was restarted, or a process was left behind.
 not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login ended by signal"
     "keel: processes left unreaped" "keel: processes still running before init" "linuxpoll: FAILED"
-    "linuxfp: FAILED"
+    "linuxfp: FAILED" "threads: FAILED"
     "keel: kfs smp wrong" "keel: kfs replay wrong" "keel: kfs power cut wrong" "keel: kfs heap wrong" "keel.kfs:"
     "keelroot" "wonderland" "nope")
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
     init sh mkdir rm rmdir mv false ppid orphan udpecho login su id whoami chmod chown env wc grep head true forktest
-    sigtest stdsig ps kill sleep)
+    sigtest stdsig ps kill sleep threads)
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred — up to
 # about 650 at -O0 since KFS is in the image.

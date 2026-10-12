@@ -149,12 +149,11 @@ main(args: []string)
     print("stdsig: time ok")
     user.exit(0)
 
-// `sysl.time`'s two clocks through keel.fsys's seams: `monotonic` advances by about what a 100 ms sleep
-// took (the sleep is keel's own call: the standard library has none a freestanding program reaches,
-// FINDINGS 74), and `now` is a wall clock past 2020 — the PL031's, not 0.
+// `sysl.time`'s clocks and its sleep through keel.fsys's seams: `monotonic` advances by about what
+// `sleep(100 ms)` took, and `now` is a wall clock past 2020 — the PL031's, not 0.
 clocks()
     val before = time.monotonic()
-    check(user.nanosleep(100_000_000).is_ok(), "nanosleep")
+    time.sleep(time.millis(100))
     val took = time.monotonic() - before
     check(took >= time.millis(100) && took < time.seconds(3), s"100 ms by sysl.time.monotonic took ${took.us} us")
     val wall = time.now()
@@ -170,7 +169,7 @@ zombie_group()
     while !has_ended(g)
         rounds += 1
         check(rounds < 1000, s"the child $g never ended")
-        val _ = user.nanosleep(10_000_000)
+        time.sleep(time.millis(10))
     val joined = process.run("/bin/stdsig", ["member", s"$g"], group = Group.Join(g))
     check(joined.is_ok(), s"joining group $g, whose only member has ended unreaped, was refused")
     check(joined.unwrap() == Status.Exited(0), "the child that joined an ended leader's group")
@@ -197,9 +196,9 @@ watching()
     val (r, wr) = user.pipe().unwrap()
     val waker = user.fork().unwrap()
     if waker == 0
-        val _ = user.nanosleep(50_000_000)
+        time.sleep(time.millis(50))
         val _ = signal.send(i64(user.getppid()), signal.INT)
-        val _ = user.nanosleep(50_000_000)
+        time.sleep(time.millis(50))
         val _ = user.write_file(wr, "x".bytes)
         user.exit(0)
     var room: [8]u8 = [0; 8]
