@@ -2543,7 +2543,10 @@ candidate, whatever kind of thing the import names.
 
 ## 73. `sysl.posix.threads` has no hook layer, so a program for a target with system calls and no C library cannot start a thread
 
-**FIXED in sysl 0.1.0-alpha.10** (the thread hook layer shipped; not yet adopted by keel).
+**FIXED in sysl 0.1.0-alpha.10, and adopted**: `keel.fsys` (`user/fsys/keel/fsys/threads.sysl`) answers
+`sysl_thread_spawn/join/self/yield` and `sysl_futex_wait/wake` over clone, gettid, sched_yield and futex;
+`user/rt` places the first thread's TLS block; `user/threads` runs `sysl.threads` Mutex, Condvar, Channel and
+thread-locals on four cores in the boot test (controls `FUTEX_WAKES`, `PLACE_FIRST_TLS`).
 
 Milestone 16 gives keel `clone` with musl's thread flags, `futex`, TLS and `exit`/`exit_group` by
 Linux's numbers. A keel program written in sysl would reach them through the standard library's
@@ -2581,7 +2584,8 @@ which is the design question this finding leaves open.
 
 ## 74. `sysl.time` reads a clock through a seam but has no sleep, so a freestanding program cannot wait for a time
 
-**FIXED in sysl 0.1.0-alpha.10** (the sleep seam shipped; not yet adopted by keel).
+**FIXED in sysl 0.1.0-alpha.10, and adopted**: `keel.fsys`'s `time.sysl` answers `sysl_sleep_us` over
+nanosleep; `sleep` and `stdsig` use `sysl.time.sleep` (control `SLEEP_WAITS`).
 
 Milestone 17 gives keel `clock_gettime`, `nanosleep` and `clock_nanosleep` by Linux's numbers, and
 keel.fsys now answers `sysl.time`'s two seams (`sysl_wall_us`, `sysl_monotonic_us`; `user/fsys/keel/fsys/time.sysl`),
@@ -2614,7 +2618,8 @@ it, answered by `nanosleep` on a host and by keel.fsys (or a board package) on a
 
 ## 75. No terminal-mode surface reaches a freestanding program, so turning echo off for a password is a raw `ioctl`
 
-**FIXED in sysl 0.1.0-alpha.10** (the terminal-mode surface shipped; not yet adopted by keel).
+**FIXED in sysl 0.1.0-alpha.10, and adopted**: `keel.fsys`'s `tty.sysl` answers `sysl_tty_get/set` over the
+TCGETS/TCSETS ioctls; `login` and `su` read passwords through `sysl.tty.hidden()`, and rt's own pair is gone.
 
 keel's console now has Linux's termios (TCGETS/TCSETS, ECHO, ICANON, VMIN/VTIME, ISIG). `login` and `su`
 read passwords and must turn echo off. The library's terminal-mode code is `sysl.posix.tty`

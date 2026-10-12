@@ -23,6 +23,18 @@ SECTIONS
 
     . = ALIGN(4096);
 
+    /* The template of a thread's `@thread_local` storage (the PT_TLS segment): `.tdata`'s initial
+       values, then `.tbss`'s size. Nothing reads it in place — keel.user's start and sysl.threads copy
+       it into each thread's block — so it opens the writable segment rather than sharing a page with
+       `.rodata`. */
+    .tdata : {
+        *(.tdata .tdata.*)
+    }
+
+    .tbss : {
+        *(.tbss .tbss.*)
+    }
+
     .data : {
         *(.got .got.plt)
         *(.data .data.*)
