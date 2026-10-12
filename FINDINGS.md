@@ -2714,6 +2714,58 @@ context for one), and the code is accepted by every analysis pass: this is codeg
 would be to give up the closure for a begin/end pair that hands back a `*Inode` and re-seals after — a
 shape that lets a caller forget the seal, chosen only because a check command crashes.
 
+## 79. A read of a shared table's record retains its counted fields, and nothing in the source shows where (gap)
+
+KFS stage 11 runs the package on four cores under section 19's locks: each buffer under its own
+`buffer.lock`, the cache's index under `cache.lock`, the journal's lists under `journal.lock`. The
+filesystem is one `Fs` reached through a `*Fs` (a `&sync Fs` is refused, rightly: it holds `Buf`s), so
+the compiler checks nothing about it — and the four-thread test died in the heap allocator
+(`keel: trap translation fault level 0 … elr=keel.heap$keel_alloc far=0xb0ffff0000401b02`, a free list
+written through a corrupted pointer). The cause was count traffic on objects every core shares, from
+expressions that read nothing counted. Shortest input (`sysl emit-llvm -O2 --target aarch64-freestanding`,
+prerelease dd0abec8):
+
+    struct Item
+        block: u64
+        data: Buf[u8]
+
+    struct Holder
+        items: Buf[Item]
+
+    probe_index(h: *Holder, i: usize) -> u64 = h.items[i].block
+
+emits `@sysl.buf$Buf.index.probe$Item(...)`, which answers a COPY of the element (`arc.copy.probe$Item`:
+the `data` core's count incremented), then `arc.dispose.probe$Item` — a plain `load; add; store` pair on
+a count other cores touch under other locks. Every form found, each confirmed in the IR:
+
+| expression | count traffic |
+|---|---|
+| `table[i].field` on a `Buf` of structs | the element's every counted field, retained and released |
+| `b.view()` | the `Buf`'s core and its storage, the one count all readers share |
+| `self.helper()` where `helper(self)` and the caller is `*self` | **the whole struct copied**: `Fs.cached(self)` called from `Fs.buffer(*self)` retained every `Buf` in the filesystem, on every lookup |
+| `f(s.field)` where the parameter is a struct taken by value | its counted fields (`pending_copy(fs.j.committing, …)` racing the commit thread's own copy) |
+| `val x = fs.j.running` under a lock | released at the end of the function — after the unlock |
+
+None is visible in the source, and none is wrong single-threaded. What the language says: a `&sync`
+crossing requires atomic counts (reference/memory.md), `@guards(field)` lets a `Mutex[T]` cross whatever
+it holds, and `*T` is the raw tier the check looks through. There is no spelling for a table whose
+**records** are each guarded by a lock of their own — the shape a buffer cache, an inode table and a
+page cache all have — so the code is outside every check, and its correctness depends on knowing which
+reads emit retains.
+
+Workaround (used, kfs/keel/kfs/table.sysl and the journal): records in chunks reached by address
+(`Table.at(i) -> *T`), never copied; a buffer's bytes as a `*u8` (a view of a raw address has no
+owner) with the owning `Buf` touched only under `cache.lock`; `*self` on `Fs.cached`; `*Txn` and `*Buf`
+parameters for the journal's lists; a local's `release()` before the unlock that publishes it. Each was
+found by grepping `emit-llvm` for `arc.copy.kfs.keel.kfs$…` in the package's functions; after them the
+only copies of `Fs`, `Txn` and the records are at mount and in the commit thread's own steps, and the
+test passes on four cores, its heap balance exact.
+
+Clean form, any of: an element read through `[]` that is a place (a field load, no copy), as indexing an
+array already is; a warning where a by-value `self` method is called from a `*self` one on a struct with
+counted fields; or a record-level form of `@guards` — a table type whose records the compiler knows are
+reached only under their own lock, so the check could cover the shape instead of being bypassed.
+
 ## What worked in milestone 17
 
 - **No sysl gap in the kernel half.** A poller waits on one module `WaitQueue` with an event count under

@@ -161,9 +161,26 @@ private var most_held: u64
 // taken out of order would deadlock some later run instead of stopping this one at the line that did it.
 private const CHECK_ORDER: bool = true
 
+// Whether the thread `sched.current()` answered is the one running this code: its stack holds this
+// frame. (A diagnostic while a misattributed lock is hunted.)
+private var wrong_current: Atomic[u64] = Atomic(0)
+
+private on_own_stack(t: *Thread) -> bool
+    var probe: u64 = 0
+    val here = u64(usize(&probe))
+    t.stack match
+        Some(s) -> here <= u64(s.top) && here + 16384 >= u64(s.top)
+        None -> true
+
+wrong_currents() -> u64 = wrong_current.load()
+
 // Check that the calling thread may take `l` now, and record that it holds it.
 private take(l: LockId)
-    val me = usize(sched.current())
+    val cur = sched.current()
+    if !on_own_stack(cur)
+        wrong_current.add(1)
+        print("keel.kfs: current() is not the running thread")
+    val me = usize(cur)
     val r = rank(l)
     val k = key_of(l)
     val flags = holders_guard.lock()
@@ -173,11 +190,13 @@ private take(l: LockId)
         val e = &holders[i]
         if e.thread == me then h = e
         if e.thread == 0 && free == null then free = e
+    failing(me, r, k, h)
     if h == null
         if free == null then fail_order(flags, "more threads hold KFS locks at once than the table holds")
         h = free
         h.thread = me
         h.n = 0
+    failing_held = h
     checked += 1
     if CHECK_ORDER
         for i in 0..<h.n
@@ -203,6 +222,7 @@ private give(l: LockId)
     var h: *Holder = null
     for i in 0..<HOLDERS
         if holders[i].thread == me then h = &holders[i]
+    failing(me, r, k, h)
     if h == null then fail_order(flags, "a lock released by a thread holding none")
     var found = false
     var i = h.n
@@ -218,9 +238,32 @@ private give(l: LockId)
     if h.n == 0 then h.thread = 0
     holders_guard.unlock(flags)
 
+// What `fail_order` reports besides why: the thread, the lock it was taking or releasing, and what the
+// thread held. Written under `holders_guard` just before a failure.
+private var failing_thread: usize
+private var failing_rank: u32
+private var failing_key: u64
+private var failing_held: *Holder
+
+private failing(me: usize, r: u32, k: u64, h: *Holder)
+    failing_thread = me
+    failing_rank = r
+    failing_key = k
+    failing_held = h
+
 private fail_order(flags: u64, why: string) -> never
+    print("keel.kfs:", why, "— thread", failing_thread, "lock rank", failing_rank, "key", failing_key)
+    val h = failing_held
+    if h != null
+        for j in 0..<h.n
+            print("keel.kfs:   holding rank", h.ranks[j], "key", h.keys[j])
+    for i in 0..<HOLDERS
+        val e = &holders[i]
+        if e.thread != 0
+            print("keel.kfs:   thread", e.thread, "holds", e.n)
+            for j in 0..<e.n
+                print("keel.kfs:     rank", e.ranks[j], "key", e.keys[j])
     holders_guard.unlock(flags)
-    print("keel.kfs:", why)
     panic("keel.kfs: a lock taken out of section 19's order")
 
 // What the lock layer has done: acquisitions checked, the most locks one thread held at once, the most
@@ -251,8 +294,9 @@ locks_held() -> u64
 private var committer_up: Atomic[u32] = Atomic(0)
 // Set (1) to ask the commit thread for a pass; it naps on this flag.
 private var kick: Atomic[u32] = Atomic(0)
-// Passes the commit thread has finished, and the waiters for the next one.
+// Passes the commit thread has finished, those that moved the journal on, and the waiters for either.
 private var passes: u64
+private var moves: u64
 private var pass_waiters: WaitQueue
 private var pass_guard: IrqLock
 
@@ -261,22 +305,26 @@ private nudge()
     kick.store(1, Ordering.Release)
     sched.wake_nappers()
 
-// The commit thread finished a pass: wake whoever waits for one.
-private[kfs] pass_done()
+// The commit thread finished a pass, which moved the journal on or not: wake whoever waits.
+private[kfs] pass_done(moved: bool)
     val flags = pass_guard.lock()
     passes += 1
+    if moved then moves += 1
     val _ = pass_waiters.wake_all()
     pass_guard.unlock(flags)
 
-// Sleep until the commit thread has finished a pass begun after this call.
+// Sleep until the journal has moved on — a commit or a checkpoint finished — or, should the move this
+// waits for have come before the call, until two whole passes have gone by without one (the second, if
+// no handle asks for it sooner, a timed one: PASS_MS). The caller then looks again. Waiting for a move
+// rather than for any pass keeps a handle that cannot join until others leave from spinning the commit
+// thread through empty passes.
 private[kfs] wait_for_pass()
     val flags = pass_guard.lock()
-    // A pass already under way may have looked before the caller's change: wait for the one after it.
+    val moved = moves
     val target = passes + 2
     nudge()
-    while passes < target && committer_up.load(Ordering.Acquire) != 0
+    while moves == moved && passes < target && committer_up.load(Ordering.Acquire) != 0
         pass_waiters.sleep(&pass_guard)
-        if passes + 1 == target then nudge()
     pass_guard.unlock(flags)
 
 private[kfs] set_committer(up: bool) = committer_up.store(if up then 1 else 0, Ordering.Release)

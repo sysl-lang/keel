@@ -465,8 +465,9 @@ user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fs
     init sh mkdir rm rmdir mv false ppid orphan udpecho login su id whoami chmod chown env wc grep head true forktest
     sigtest stdsig ps kill sleep)
 
-# 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
-frames_min=65000
+# 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred — up to
+# about 650 at -O0 since KFS is in the image.
+frames_min=64800
 frames_max=65536
 
 elf=$out/keel.elf

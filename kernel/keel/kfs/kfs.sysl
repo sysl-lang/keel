@@ -109,25 +109,29 @@ private commit_thread(p: *KFs)
         if stopping.load(Ordering.Acquire) != 0 then break
         sched.nap_kernel(timer.now_ns() + PASS_MS * 1_000_000, kicked())
         kicked().store(0, Ordering.Release)
-        if COMMITTER_RUNS then pass(p)
-        pass_done()
+        val moved = COMMITTER_RUNS && pass(p)
+        pass_done(moved)
 
-// One pass: everything the committer can do now, then the checkpoint the cache asked for.
-private pass(p: *KFs)
+// One pass: everything the committer can do now, then the checkpoint the cache asked for. True when the
+// journal moved on.
+private pass(p: *KFs) -> bool
     pass_count.add(1, Ordering.Relaxed)
+    var moved = false
     loop
         p.journal_step() match
-            Ok(true) -> ()
+            Ok(true) -> moved = true
             _ -> break
     if writeback.swap(0, Ordering.AcqRel) != 0
         writebacks.add(1, Ordering.Relaxed)
         p.checkpoint() match
+            Ok(true) -> moved = true
             // The oldest list holds a buffer the running transaction pins: commit that first, and the
             // checkpoint follows on a later pass.
             Ok(false) ->
                 val _ = p.commit_begin()
                 writeback.store(1, Ordering.Release)
             _ -> ()
+    moved
 
 // Stop the commit thread, after the pass it is making; from then on commits run inline.
 private stop_committer(m: *Mounted)
@@ -139,7 +143,7 @@ private stop_committer(m: *Mounted)
         None -> ()
     m.committer = None
     set_committer(false)
-    pass_done()
+    pass_done(false)
 
 // Stop the commit thread and run commits inline from now on, as on the host: what a test that needs
 // each commit where it asks for it calls.
