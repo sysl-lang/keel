@@ -52,6 +52,7 @@ import sysl.process
 import sysl.process.{Group, Spawned, Status, Stdio, Var}
 import sysl.signal
 import sysl.text.from_utf8
+import sysl.time.{millis, sleep}
 
 // A word of the line, or one of the operators `|`, `<`, `>`, `>>`, `&` when `op` (a quoted `|` is a word).
 struct Token
@@ -400,7 +401,7 @@ reap_jobs(sh: *Shell)
         var naps = if job.signalled then 50 else 0
         while !finished(job) && naps > 0
             naps -= 1
-            val _ = user.nanosleep(10_000_000)
+            sleep(millis(10))
         job.signalled = false
         if !finished(job)
             sh.jobs.set(i, job)

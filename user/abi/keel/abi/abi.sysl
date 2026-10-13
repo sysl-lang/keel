@@ -72,6 +72,30 @@ const SYS_CLONE: u64 = 220          // clone(flags, stack, *ptid, tls, *ctid) ->
 const SYS_EXECVE: u64 = 221         // execve(path, argv, envp) -> never on success
 const SYS_WAIT4: u64 = 260          // wait4(pid, *i32 status | 0, options, *rusage | 0) -> the pid of the child that ended
 
+// Milestone 18: what a static musl busybox asks for, by Linux's numbers.
+const SYS_FCNTL: u64 = 25           // fcntl(fd, cmd, arg): F_DUPFD(_CLOEXEC), F_GETFD/F_SETFD, F_GETFL/F_SETFL
+const SYS_READV: u64 = 65           // readv(fd, *iovec, count) -> bytes read
+const SYS_WRITEV: u64 = 66          // writev(fd, *iovec, count) -> bytes written
+const SYS_PREAD64: u64 = 67         // pread64(fd, buf, len, offset) -> bytes read; the descriptor's offset unmoved
+const SYS_READLINKAT: u64 = 78      // readlinkat(dirfd, path, buf, len) -> EINVAL: keel has no symbolic links
+const SYS_UTIMENSAT: u64 = 88       // utimensat(dirfd, path, *times, flags) -> 0: keel keeps no times; accepted
+const SYS_SCHED_GETAFFINITY: u64 = 123 // sched_getaffinity(pid, len, *mask) -> 8: every core that is up
+const SYS_SCHED_YIELD: u64 = 124    // sched_yield() -> 0
+const SYS_TKILL: u64 = 130          // tkill(tid, sig) -> 0
+const SYS_TGKILL: u64 = 131         // tgkill(tgid, tid, sig) -> 0
+const SYS_RT_SIGSUSPEND: u64 = 133  // rt_sigsuspend(*sigset, 8) -> EINTR, once a signal is handled under that mask
+const SYS_UNAME: u64 = 160          // uname(*utsname) -> 0
+const SYS_UMASK: u64 = 166          // umask(mask) -> the old mask
+const SYS_SYSINFO: u64 = 179        // sysinfo(*sysinfo) -> 0
+const SYS_MUNMAP: u64 = 215         // munmap(addr, len) -> 0
+const SYS_MREMAP: u64 = 216         // mremap(addr, old_len, new_len, flags, new_addr) -> addr: shrinking only
+const SYS_MMAP: u64 = 222           // mmap(addr, len, prot, flags, fd, offset) -> the mapping's address
+const SYS_MPROTECT: u64 = 226       // mprotect(addr, len, prot) -> 0
+const SYS_MADVISE: u64 = 233        // madvise(addr, len, advice) -> 0; MADV_DONTNEED zeroes
+const SYS_PRLIMIT64: u64 = 261      // prlimit64(pid, resource, *new, *old) -> 0
+const SYS_GETRANDOM: u64 = 278      // getrandom(buf, len, flags) -> len
+const SYS_FACCESSAT2: u64 = 439     // faccessat2(dirfd, path, how, flags) -> 0, as faccessat
+
 // keel's own calls, which Linux has nothing like.
 const KEEL_CALLS: u64 = 1024
 const SYS_SPAWN: u64 = 1024         // spawn(path, path_len, args, args_len, *SpawnAttr | 0) -> the child's pid
@@ -81,6 +105,7 @@ const SYS_PROCS: u64 = 1025         // procs(*ProcInfo, count) -> the processes 
 // take.
 const AT_FDCWD: i64 = -100
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100
+const AT_EACCESS: u64 = 0x200                   // faccessat2's: check the effective ids (the same ones, on keel)
 const AT_REMOVEDIR: u64 = 0x200
 const AT_EMPTY_PATH: u64 = 0x1000
 
@@ -157,10 +182,26 @@ struct SigAction
 
 @assert(sizeof(SigAction) == 32, "a SigAction is 32 bytes")
 
+// A thread's FP/SIMD registers, laid out as Linux's `struct user_fpsimd_state`: q0 to q31 (each two
+// words, the low one first), then FPSR and FPCR. Every user thread has its own; a new process starts
+// with them all zero, `clone` and `fork` copy the caller's, `execve` zeroes them.
+@align(16)
+struct FpRegs
+    q: [64]u64
+    fpsr: u32
+    fpcr: u32
+    reserved: [2]u32
+
+@assert(sizeof(FpRegs) == 528, "FpRegs is user_fpsimd_state: 32 q registers, FPSR, FPCR, 8 bytes reserved")
+@assert(offsetof(FpRegs, fpsr) == 512, "FPSR follows the 32 q registers")
+
+no_fp() -> FpRegs = FpRegs([0; 64], 0, 0, [0; 2])
+
 // What delivering a signal to a handler puts on the stack, at the stack pointer the handler starts
 // with: the registers as they were — x0 to x30, then where the program was (ELR), its flags (SPSR) and
-// its stack pointer — the blocked set to restore, and the signal. This frame is keel's own, not Linux's
-// `rt_sigframe`.
+// its stack pointer — the blocked set to restore, the signal, and the FP/SIMD registers, so a handler
+// that computes in them leaves the interrupted code's values as they were. This frame is keel's own,
+// not Linux's `rt_sigframe`.
 struct SigFrame
     x: [31]u64
     pc: u64
@@ -168,8 +209,10 @@ struct SigFrame
     sp: u64
     blocked: u64
     sig: u64
+    fp: FpRegs
 
-@assert(sizeof(SigFrame) == 288, "a SigFrame is 288 bytes, a multiple of 16")
+@assert(offsetof(SigFrame, fp) == 288, "the FP/SIMD registers follow the 36 words, 16-aligned")
+@assert(sizeof(SigFrame) == 816, "a SigFrame is 816 bytes, a multiple of 16")
 
 // A time as `nanosleep` takes it.
 struct Timespec
@@ -385,7 +428,7 @@ const PIPE_ROOM: u64 = 4096
 // renaming an entry needs `w` and `x` on its directory; chdir and every directory a path walks through
 // need `x`. An executable with the set-user-ID bit (`0o4000`) runs as its owner, which is how `su`
 // becomes root to ask for a password. A new file or directory is given the mode its call asked for less
-// the bits of UMASK, which every process has and none can change.
+// the bits of the process's umask: UMASK for one the kernel starts, inherited by a child, set by `umask`.
 const ROOT_UID: u32 = 0
 const S_IFMT: u32 = 0o170000
 const S_IFDIR: u32 = 0o040000
@@ -501,9 +544,9 @@ const STDERR: u64 = 2
 const FIRST_FILE_FD: u64 = 3
 const MAX_FDS: u64 = 16
 
-// `openat`'s flags, as arm64 numbers them. Any others — O_LARGEFILE, O_CLOEXEC, O_NOCTTY, O_NONBLOCK,
-// O_NOFOLLOW — are taken and change nothing: keel has no links, no exec-time closing and no waiting on
-// a file.
+// `openat`'s flags, as arm64 numbers them. O_CLOEXEC marks the descriptor close-on-exec (execve closes
+// it; `fcntl` F_GETFD/F_SETFD read and set the mark as FD_CLOEXEC). Any others — O_LARGEFILE, O_NOCTTY,
+// O_NONBLOCK, O_NOFOLLOW — are taken and change nothing: keel has no links and no waiting on a file.
 const O_RDONLY: u64 = 0
 const O_WRONLY: u64 = 1
 const O_RDWR: u64 = 2
@@ -512,8 +555,19 @@ const O_CREAT: u64 = 0x40
 const O_EXCL: u64 = 0x80
 const O_TRUNC: u64 = 0x200
 const O_APPEND: u64 = 0x400
+const O_NONBLOCK: u64 = 0x800
 const O_DIRECTORY: u64 = 0x4000
+const O_LARGEFILE: u64 = 0x2_0000
 const O_CLOEXEC: u64 = 0x8_0000
+
+// `fcntl`'s commands (asm-generic fcntl.h) and its one descriptor flag.
+const F_DUPFD: u64 = 0
+const F_GETFD: u64 = 1
+const F_SETFD: u64 = 2
+const F_GETFL: u64 = 3
+const F_SETFL: u64 = 4
+const F_DUPFD_CLOEXEC: u64 = 1030
+const FD_CLOEXEC: u64 = 1
 
 // `lseek`'s whence.
 const SEEK_SET: u64 = 0
@@ -575,6 +629,7 @@ enum Errno: i64
     ENOMEM = 12
     EACCES = 13                 // the mode of the file, or of a directory on the way, refuses the caller
     EFAULT = 14                // a pointer argument is not memory the caller may use that way
+    ENODEV = 19                 // mmap: a descriptor that is not a file, or a mapping that would be shared
     EBUSY = 16                  // the file is open
     EEXIST = 17
     ENOTDIR = 20

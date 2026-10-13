@@ -1,0 +1,179 @@
+module keel.proc
+
+// The calls a static musl program makes about the system rather than about its files: uname,
+// getrandom, umask, prlimit64, sysinfo, sched_getaffinity, sched_yield — and the random bytes the
+// auxiliary vector carries (AT_RANDOM).
+
+import abi.keel.abi.{EFAULT, EINVAL, EPERM, ESRCH, Errno, MAX_FDS}
+import keel.mm
+import keel.sched
+import keel.sched.Process
+import keel.timer
+import sysl.sync.{Atomic, Ordering}
+
+// --- Random bytes ---------------------------------------------------------------------------------------
+
+// A splitmix64 sequence (Steele, Lea and Flood, 2014) whose position also takes in the generic counter at
+// every draw, so no two boots and no two draws repeat. Not cryptographic: keel has no entropy source but
+// the timing of the counter, and what it hands out is a stack canary's worth of unpredictability.
+private var mix_position: Atomic[u64] = Atomic(0)
+
+private const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15
+
+private random_u64() -> u64
+    var z = mix_position.add(GOLDEN, Ordering.Relaxed) + GOLDEN + read_sysreg("cntvct_el0") * GOLDEN
+    z = (z ^ (z >> 30)) * 0xbf58_476d_1ce4_e5b9
+    z = (z ^ (z >> 27)) * 0x94d0_49bb_1331_11eb
+    z ^ (z >> 31)
+
+// `out` filled with random bytes.
+private[proc] fill_random(out: []u8)
+    var i: usize = 0
+    while i < out.len
+        val r = random_u64()
+        for k in 0..<8
+            if i == out.len then break
+            out[i] = u8((r >> u64(8 * k)) & 0xff)
+            i += 1
+
+private const GRND_NONBLOCK: u64 = 1
+private const GRND_RANDOM: u64 = 2
+private const GRND_INSECURE: u64 = 4
+
+// getrandom(buf, len, flags) -> len: never blocks, every flag the same.
+private[proc] sys_getrandom(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if (regs[2] & ~(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE)) != 0 then return Err(EINVAL)
+    val va = regs[0]
+    val len = regs[1]
+    if !mm.user_range(&p.space, va, len, true) then return Err(EFAULT)
+    var chunk: [256]u8 = [0; 256]
+    var done: u64 = 0
+    while done < len
+        val n = if len - done < 256 then usize(len - done) else 256
+        fill_random(chunk[0..<n])
+        if !mm.copy_to_user(&p.space, va + done, chunk[0..<n]) then return Err(EFAULT)
+        done += u64(n)
+    Ok(i64(len))
+
+// --- uname ----------------------------------------------------------------------------------------------
+
+// Linux's `struct new_utsname`: six NUL-padded fields of 65 bytes.
+private const UTS_FIELD: usize = 65
+private const UTS_FIELDS: usize = 6
+
+// What keel says it is. Nothing in musl or busybox reads these; `uname` prints them. The machine is
+// what the program runs on, so a script testing for aarch64 finds it.
+// (A function rather than a module `val` of six strings: an initializer that does not fold is never run
+// in an image entered at `_start`, FINDINGS.md 31.)
+private uts(field: usize) -> string = field match
+    0 -> "keel"                 // sysname
+    1 -> "keel"                 // nodename
+    2 -> "0.18"                 // release
+    3 -> "milestone 18"         // version
+    4 -> "aarch64"              // machine
+    else "(none)"               // domainname
+
+// uname(*utsname) -> 0.
+private[proc] sys_uname(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var out: [UTS_FIELDS * UTS_FIELD]u8 = [0; UTS_FIELDS * UTS_FIELD]
+    for f in 0..<UTS_FIELDS
+        val text = uts(f).bytes
+        for i in 0..<text.len
+            out[f * UTS_FIELD + i] = text[i]
+    if !mm.copy_to_user(&p.space, regs[0], out[..]) then return Err(EFAULT)
+    Ok(0)
+
+// --- umask ----------------------------------------------------------------------------------------------
+
+// umask(mask) -> the old mask; only the permission bits are kept.
+private[proc] sys_umask(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val old = p.umask
+    p.umask = u32(regs[0] & 0o777)
+    Ok(i64(old))
+
+// --- prlimit64 ------------------------------------------------------------------------------------------
+
+private const RLIM_NLIMITS: u64 = 16
+private const RLIMIT_STACK: u64 = 3
+private const RLIMIT_NPROC: u64 = 6
+private const RLIMIT_NOFILE: u64 = 7
+private const RLIM_INFINITY: u64 = 0xffff_ffff_ffff_ffff
+
+// What keel's limits are: the stack it grows to, the descriptors a table holds, the processes the table
+// holds; nothing else is limited.
+private limit_of(resource: u64) -> u64 = resource match
+    RLIMIT_STACK -> mm.USER_STACK_MAX
+    RLIMIT_NPROC -> u64(MAX_PROCS)
+    RLIMIT_NOFILE -> MAX_FDS
+    else RLIM_INFINITY
+
+// prlimit64(pid | 0, resource, *rlimit new | 0, *rlimit old | 0) -> 0: the limits are reported, and a
+// new one is accepted when it asks for no more than the limit (and changes nothing: keel's limits are
+// what its tables hold); more is EPERM.
+private[proc] sys_prlimit64(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[0] != 0 && regs[0] != p.pid then return Err(ESRCH)
+    val resource = regs[1]
+    if resource >= RLIM_NLIMITS then return Err(EINVAL)
+    val limit = limit_of(resource)
+    if regs[2] != 0
+        var asked: [2]u64 = [0, 0]
+        val raw: *u8 = ptr_cast(&asked[0])
+        if !mm.copy_from_user(&p.space, regs[2], raw[0..<16]) then return Err(EFAULT)
+        if asked[0] > asked[1] then return Err(EINVAL)
+        if asked[1] > limit then return Err(EPERM)
+    if regs[3] != 0
+        var out: [2]u64 = [limit, limit]
+        val raw: *u8 = ptr_cast(&out[0])
+        if !mm.copy_to_user(&p.space, regs[3], raw[0..<16]) then return Err(EFAULT)
+    Ok(0)
+
+// --- sysinfo --------------------------------------------------------------------------------------------
+
+// Linux's `struct sysinfo` on a 64-bit machine (112 bytes): uptime, loads[3], totalram, freeram,
+// sharedram, bufferram, totalswap, freeswap, procs (u16, padded), totalhigh, freehigh, mem_unit (u32).
+private struct SysInfo
+    uptime: i64
+    loads: [3]u64
+    totalram: u64
+    freeram: u64
+    sharedram: u64
+    bufferram: u64
+    totalswap: u64
+    freeswap: u64
+    procs: u16
+    pad: [3]u16
+    totalhigh: u64
+    freehigh: u64
+    mem_unit: u32
+    pad2: u32
+
+@assert(sizeof(SysInfo) == 112, "struct sysinfo is 112 bytes on a 64-bit machine")
+
+// sysinfo(*sysinfo) -> 0: the uptime, RAM in frames (mem_unit is the page), the process count; no loads,
+// no swap.
+private[proc] sys_sysinfo(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var procs: u16 = 0
+    val flags = family.lock()
+    for i in 0..<MAX_PROCS
+        if table[i] != null then procs += 1
+    family.unlock(flags)
+    var info = SysInfo(i64(timer.now_ns() / 1_000_000_000), [0, 0, 0], mm.frames_total(), mm.frames_free(),
+        0, 0, 0, 0, procs, [0, 0, 0], 0, 0, u32(mm.PAGE_SIZE), 0)
+    val raw: *u8 = ptr_cast(&info)
+    if !mm.copy_to_user(&p.space, regs[0], raw[0..<sizeof(SysInfo)]) then return Err(EFAULT)
+    Ok(0)
+
+// --- Scheduling -----------------------------------------------------------------------------------------
+
+// sched_getaffinity(pid | 0, len, *mask) -> the bytes of mask written (8): every core that is up.
+private[proc] sys_sched_getaffinity(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if regs[1] < 8 || (regs[1] & 7) != 0 then return Err(EINVAL)
+    var mask: u64 = (u64(1) << sched.cores_up()) - 1
+    val raw: *u8 = ptr_cast(&mask)
+    if !mm.copy_to_user(&p.space, regs[2], raw[0..<8]) then return Err(EFAULT)
+    Ok(8)
+
+// sched_yield() -> 0.
+private[proc] sys_sched_yield() -> Result[i64, Errno]
+    sched.yield_now()
+    Ok(0)

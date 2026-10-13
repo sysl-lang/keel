@@ -8,7 +8,10 @@ import abi.keel.abi.{EAGAIN, EFAULT, EINTR, EINVAL, ENOSYS, EPERM, ETIMEDOUT, Er
     SYS_OPENAT, SYS_PIPE2, SYS_PROCS, SYS_READ, SYS_RECVFROM, SYS_RENAMEAT, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK,
     SYS_RT_SIGRETURN, SYS_SENDTO, SYS_SETGID, SYS_SETPGID, SYS_SETSID, SYS_SETSOCKOPT, SYS_SETUID, SYS_SET_TID_ADDRESS,
     SYS_SOCKET, SYS_SPAWN, SYS_SYNC, SYS_TRUNCATE, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE, Timespec, SYS_CLOCK_GETRES,
-    SYS_CLOCK_GETTIME, SYS_CLOCK_NANOSLEEP, SYS_GETTIMEOFDAY, SYS_PPOLL, SYS_PSELECT6}
+    SYS_CLOCK_GETTIME, SYS_CLOCK_NANOSLEEP, SYS_GETTIMEOFDAY, SYS_PPOLL, SYS_PSELECT6, SYS_FACCESSAT2, SYS_FCNTL,
+    SYS_GETRANDOM, SYS_MADVISE, SYS_MMAP, SYS_MPROTECT, SYS_MREMAP, SYS_MUNMAP, SYS_PREAD64, SYS_PRLIMIT64,
+    SYS_READLINKAT, SYS_READV, SYS_RT_SIGSUSPEND, SYS_SCHED_GETAFFINITY, SYS_SCHED_YIELD, SYS_SYSINFO, SYS_TGKILL,
+    SYS_TKILL, SYS_UMASK, SYS_UNAME, SYS_UTIMENSAT, SYS_WRITEV}
 import keel.fs
 import keel.mm
 import keel.sched
@@ -92,7 +95,29 @@ private[proc] system_call(regs: *u64) -> Option[u64]
         SYS_PSELECT6 -> sys_pselect6(p, regs)
         SYS_SPAWN -> sys_spawn(p, regs)
         SYS_PROCS -> sys_procs(p, regs)
-        else Err(ENOSYS)
+        SYS_FCNTL -> sys_fcntl(p, regs)
+        SYS_READV -> sys_readv(p, regs)
+        SYS_WRITEV -> sys_writev(p, regs)
+        SYS_PREAD64 -> sys_pread64(p, regs)
+        SYS_READLINKAT -> fs.sys_readlinkat(p, regs)
+        SYS_UTIMENSAT -> fs.sys_utimensat(p, regs)
+        SYS_FACCESSAT2 -> fs.sys_faccessat2(p, regs)
+        SYS_SCHED_GETAFFINITY -> sys_sched_getaffinity(p, regs)
+        SYS_SCHED_YIELD -> sys_sched_yield()
+        SYS_TKILL -> sys_tkill(p, regs)
+        SYS_TGKILL -> sys_tgkill(p, regs)
+        SYS_RT_SIGSUSPEND -> sys_rt_sigsuspend(p, regs)
+        SYS_UNAME -> sys_uname(p, regs)
+        SYS_UMASK -> sys_umask(p, regs)
+        SYS_SYSINFO -> sys_sysinfo(p, regs)
+        SYS_MMAP -> sys_mmap(p, regs)
+        SYS_MUNMAP -> sys_munmap(p, regs)
+        SYS_MPROTECT -> sys_mprotect(p, regs)
+        SYS_MREMAP -> sys_mremap(p, regs)
+        SYS_MADVISE -> sys_madvise(p, regs)
+        SYS_PRLIMIT64 -> sys_prlimit64(p, regs)
+        SYS_GETRANDOM -> sys_getrandom(p, regs)
+        else unknown(p, regs[8])
     regs[0] = r match
         Ok(v) -> u64(v)
         Err(e) -> u64(-i64(e))
@@ -100,11 +125,30 @@ private[proc] system_call(regs: *u64) -> Option[u64]
         Err(EINTR) if restartable(regs[8]) -> Some(first)
         _ -> None
 
+// On only while bringing a new kind of program up: each number keel has no call for is printed, the
+// first time any process makes it, with the process's name — the list of what to write next.
+private const LOG_UNKNOWN_CALLS: bool = false
+
+private var unknown_seen: [16]u64
+
+// ENOSYS, and the number logged once if LOG_UNKNOWN_CALLS says so.
+private unknown(p: *Process, nr: u64) -> Result[i64, Errno]
+    if LOG_UNKNOWN_CALLS && nr < 1024
+        val bit = u64(1) << (nr % 64)
+        if (unknown_seen[usize(nr / 64)] & bit) == 0
+            unknown_seen[usize(nr / 64)] |= bit
+            var n: usize = 0
+            while n < sched.NAME_ROOM && p.name[n] != 0
+                n += 1
+            print("keel: no system call", nr, "for", str_cast(p.name[0..<n]))
+    Err(ENOSYS)
+
 // Whether a call that answered EINTR is made again for a handler with SA_RESTART: every call but the
 // ones Linux never restarts that way — the sleeps, whose answer says how long was left, and ppoll and
 // pselect6.
 private restartable(nr: u64) -> bool =
-    nr != SYS_NANOSLEEP && nr != SYS_CLOCK_NANOSLEEP && nr != SYS_PPOLL && nr != SYS_PSELECT6
+    nr != SYS_NANOSLEEP && nr != SYS_CLOCK_NANOSLEEP && nr != SYS_PPOLL && nr != SYS_PSELECT6 &&
+        nr != SYS_RT_SIGSUSPEND
 
 // exit(code): the calling thread ends; the process ends with its last thread, and its status is the
 // code its first thread passed, as Linux has it.
@@ -196,13 +240,17 @@ private sys_brk(p: *Process, regs: *u64) -> Result[i64, Errno]
     brk_guard.unlock(flags)
     Ok(r)
 
-// Two threads of a process may move its break at once; one lock for every process's is enough.
-private var brk_guard: IrqLock
+// Two threads of a process may move its break, or map and unmap, at once; one lock for every process's
+// is enough (memory.sysl's calls take it too).
+private[proc] var brk_guard: IrqLock
 
 private brk_locked(p: *Process, want: u64) -> i64
     if want < p.heap_base || want > mm.heap_limit() then return i64(p.brk)
     val old_top = page_up(p.brk)
     val new_top = page_up(want)
+    // A break never grows over a page something else mapped there (mmap's MAP_FIXED, as musl's malloc
+    // puts a PROT_NONE guard just past the break): Linux refuses it, and so the break stays.
+    if new_top > old_top && !mm.range_unused(&p.space, old_top, new_top - old_top) then return i64(p.brk)
     var va = old_top
     while va < new_top
         mm.map_user_page(&p.space, va, mm.UserProt(true, false)) match

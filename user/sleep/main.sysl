@@ -1,16 +1,18 @@
-// sleep N: wait N seconds (keel's `nanosleep`, to the timer's 10 ms). A signal ends it the way its
-// action says — by default, by ending the program.
+// sleep N: wait N seconds (`sysl.time.sleep`, which keel.fsys answers with `nanosleep`, to the timer's
+// 10 ms). A signal ends it the way its action says — by default, by ending the program; a handled one
+// cuts one wait short and `sleep` waits out the rest.
 
 import rt.keel.user
+import sysl.time.{millis, sleep}
 
 main(args: []string)
     if args.len != 2
         print("sleep: usage: sleep seconds")
         exit(1)
-    var n: u64 = 0
+    var n: long = 0
     for c in args[1].bytes
         if c < u8('0') || c > u8('9')
             print(s"sleep: ${args[1]}: not a number of seconds")
             exit(1)
-        n = n * 10 + u64(c - u8('0'))
-    if user.nanosleep(n * 1_000_000_000).is_err() then exit(1)
+        n = n * 10 + long(c - u8('0'))
+    sleep(millis(n * 1000))

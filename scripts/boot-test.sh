@@ -22,7 +22,7 @@ root=${0:A:h:h}
 out=$root/scratch
 mkdir -p $out
 
-limit=${KEEL_TIMEOUT:-15}
+limit=${KEEL_TIMEOUT:-25}
 opt=${KEEL_OPT:-}
 accel=${KEEL_ACCEL:-hvf}
 compiler=${KEEL_SYSL:-sysl}
@@ -53,11 +53,11 @@ before_user_line=(
     "keel: smp ran on "     # threads ran on more than one core (the count is checked below)
     "keel: smp mutex ok"    # 4 threads x 100,000 additions under the Mutex, on >= 2 cores at once
     "keel: smp heap ok"     # 4 threads x 10,000 Bufs on the heap at once; every block and frame back
-    "keel: virtio-blk found, capacity 16384 sectors"   # the 8 MiB image, found in a virtio-mmio slot
+    "keel: virtio-blk found, capacity 32768 sectors"   # the 16 MiB image, found in a virtio-mmio slot
     "keel: disk read ok"    # sector 1 read back the bytes this script put there
     "keel: disk write ok"   # a pattern written to sector 2 read back the same
     "keel: disk smp ok"     # 4 threads x 100 reads at once, on >= 2 cores, every byte right
-    "keel: fs mounted, 2048 blocks"   # the superblock mkfs wrote, checked against the disk's size
+    "keel: fs mounted, 4096 blocks"   # the superblock mkfs wrote, checked against the disk's size
     "user: hello from EL0"  # a sysl program read from /bin, at EL0 in its own address space, printing through `write`
     "keel: process 1 exited 0"   # ...and ending with `exit(0)`
     "keel: process 2 killed: permission fault"   # a program reading kernel memory is killed, alone
@@ -276,6 +276,8 @@ session2=(
     'linuxthreads'
     'linuxthreads exec'
     'linuxthreads fds'
+    'threads'
+    'linuxfp'
     'cstdhello one two'
     'echo $?'
     'linuxpoll'
@@ -284,6 +286,34 @@ session2=(
     '@wait ISIG off, Ctrl-C is a byte'
     '@intr'
     '@wait termios restored'
+    'busybox echo hello from busybox'
+    'busybox uname -a'
+    'busybox ls -l /'
+    'busybox cat /etc/passwd | busybox wc -l'
+    "busybox printf 'pear\\napple\\npear\\nfig\\napple\\n' > /m9/fruit"
+    'busybox sort /m9/fruit'
+    'busybox sort /m9/fruit | busybox uniq -c'
+    "busybox sh -c 'for i in 1 2 3; do echo \$i; done'"
+    "busybox sh -c 'false || echo fallback; echo \$?'"
+    "busybox sh -c 'busybox ls / | busybox grep bin'"
+    'busybox sleep 0.1'
+    'busybox date -u +%Y'
+    "busybox stat -c '%s %n' /hello.txt"
+    'busybox du -s /dir'
+    "busybox sh -c 'echo sleeping; exec busybox sleep 100'"
+    $'@wait \nsleeping\n'
+    '@intr'
+    'busybox rm /m9/fruit'
+    'busybox find /etc | busybox sort'
+    'busybox md5sum /hello.txt'
+    'busybox sha256sum /m9/big.bin'
+    "busybox seq 3 | busybox tr '\\n' ' '"
+    'busybox expr 6 * 7'
+    'busybox sh'
+    'echo interactive $((6 * 7))'
+    'cd /etc; pwd'
+    'exit 3'
+    'echo $?'
     'exit'
     $'\x04'
 )
@@ -347,6 +377,24 @@ transcript2=(
     # by one thread; a read in flight keeps its pipe end through another thread's close; nothing left over.
     $'# linuxthreads fds\nlinuxthreads: 4 threads x 2000 rounds of pipe2, dup, openat and close at once: no descriptor shared, every pipe round-tripped\n'
     $'linuxthreads: a read in flight keeps its pipe end through a close; the table ends with 0-2 alone\n'
+    # sysl.threads and sysl.time.sleep over keel.fsys's hooks (clone, futex, nanosleep): a contended Mutex
+    # across cores, ids and thread-locals per thread (the first thread's laid by keel.user's start), a
+    # Condvar handoff, a Channel's every value once, a sleep measured by the monotonic clock, every join.
+    $'# threads\nthreads: 4 threads x 100000 under a Mutex: 400000, on different cores at once\n'
+    $'threads: every thread its own id; thread-locals laid from the template for the first thread and each spawned one, and kept their own\n'
+    $'threads: a Condvar handed the turn over 2000 times, every turn in order\n'
+    $'threads: a Channel of 8 slots carried 3 producers x 5000 values, every one received once\n'
+    $'threads: sleep(50 ms) took at least 50 ms by the monotonic clock\n'
+    $'threads: 8 threads spawned, every one joined\n'
+    # FP/SIMD at EL0: a raw-svc Linux program built without -mgeneral-regs-only. A new process's q registers,
+    # FPSR and FPCR are zero; eight threads on four cores each carry their own through a long chain of SIMD
+    # adds, across preemption and migration; a fork's child goes on from the parent's; a handler that
+    # overwrites them all leaves the interrupted chain exact; execve (of itself, `linuxfp fresh`) zeroes them.
+    $'# linuxfp\nlinuxfp: a new process starts with every q register, FPSR and FPCR zero\n'
+    $'linuxfp: 8 threads x 1000000 rounds through q0-q31 on 4 cores: every sum exact, FPCR and FPSR their own\n'
+    $'linuxfp: fork: parent and child each carried the q registers on; both sums exact\n'
+    $'linuxfp: a handler that overwrote q0-q31, FPSR and FPCR left the interrupted sums exact\n'
+    $'linuxfp: execve zeroed every q register, FPSR and FPCR\n'
     # A C program written against the C library alone: cstd's headers, crt0, printf (floats too), malloc
     # over brk, atexit, and open/read/write/lseek/fstat/unlink, all over Linux's calls; it exits 0.
     $'# cstdhello one two\ncstdhello: printf: -42 0x2a \'keel\' 3.142 2.50e-03 1e+21 !%\n'
@@ -362,7 +410,48 @@ transcript2=(
     $'linuxpoll: pselect6 woke on a child\'s write; a blocked SIGUSR1 came in through the call\'s mask alone: EINTR, handled, blocked again\n'
     $'linuxpoll: CLOCK_MONOTONIC advanced across nanosleep; clock_nanosleep TIMER_ABSTIME woke after its time; CLOCK_REALTIME is the RTC\'s date\n'
     $'linuxpoll: termios round trip; raw mode, waiting for three bytes\nlinuxpoll: raw read "abc" with no newline and no echo; ISIG off, Ctrl-C is a byte\n'
-    $'linuxpoll: read Ctrl-C as 0x03; VTIME timed out an idle read; termios restored\n# exit\nlogin: \n'
+    $'linuxpoll: read Ctrl-C as 0x03; VTIME timed out an idle read; termios restored\n'
+    # Milestone 18: Alpine's static musl busybox 1.37.0, unmodified, from keel's own shell. A static PIE,
+    # loaded at 0x400000 and relocating itself from the auxiliary vector; uname answers keel's own names
+    # (busybox adds "Linux", its compiled-in OS name); ls colours its names because isatty(1) holds on the
+    # console; the owner is a number because keel's /etc/passwd has six fields and musl's getpwuid wants
+    # Linux's seven, while /etc/group is Linux's format.
+    $'# busybox echo hello from busybox\nhello from busybox\n'
+    $'# busybox uname -a\nkeel keel 0.18 milestone 18 aarch64 Linux\n'
+    $'# busybox ls -l /\ntotal 68\n'
+    $'drwxr-xr-x    2 0        root          1536 Jan  1  1970 \e[1;34mbin\e[m\n'
+    $'drwxr-xr-x    2 0        root            96 Jan  1  1970 \e[1;34mdir\e[m\n'
+    $'drwxr-xr-x    2 0        root           160 Jan  1  1970 \e[1;34metc\e[m\n'
+    $'-rw-r--r--    1 0        root            19 Jan  1  1970 \e[0;0mhello.txt\e[m\n'
+    $'drwxr-xr-x    3 0        root            96 Jan  1  1970 \e[1;34mhome\e[m\n'
+    $'drwxr-xr-x    2 0        root           224 Jan  1  1970 \e[1;34mm9\e[m\n'
+    $'-rw-r--r--    1 0        root         45022 Jan  1  1970 \e[0;0mout.txt\e[m\n'
+    # cat's sendfile (71) is ENOSYS on keel; busybox falls back to read and write, as it does on Linux
+    # for a descriptor sendfile refuses.
+    $'# busybox cat /etc/passwd | busybox wc -l\n2\n'
+    $'# busybox printf \'pear\\napple\\npear\\nfig\\napple\\n\' > /m9/fruit\n'
+    $'# busybox sort /m9/fruit\napple\napple\nfig\npear\npear\n'
+    $'# busybox sort /m9/fruit | busybox uniq -c\n      2 apple\n      1 fig\n      2 pear\n'
+    # busybox's own shell (ash): a loop, ||, $?, and a pipeline it forks and execs itself.
+    $'# busybox sh -c \'for i in 1 2 3; do echo $i; done\'\n1\n2\n3\n'
+    $'# busybox sh -c \'false || echo fallback; echo $?\'\nfallback\n0\n'
+    $'# busybox sh -c \'busybox ls / | busybox grep bin\'\nbin\n'
+    $'# busybox sleep 0.1\n# busybox date -u +%Y\n'"$(date -u +%Y)"$'\n'
+    $'# busybox stat -c \'%s %n\' /hello.txt\n19 /hello.txt\n'
+    $'# busybox du -s /dir\n8\t/dir\n'
+    # Ctrl-C reaches the busybox sleep ash exec'd: it is in the console's foreground group.
+    $'# busybox sh -c \'echo sleeping; exec busybox sleep 100\'\nsleeping\nsh: busybox: killed by signal 2\n'
+    $'# busybox rm /m9/fruit\n'
+    $'# busybox find /etc | busybox sort\n/etc\n/etc/group\n/etc/passwd\n/etc/secret\n'
+    # The sums are the host's, over the same bytes the script puts on the disk below.
+    $'# busybox md5sum /hello.txt\n'"$(print -n 'hello from the disk' | md5 -q)"$'  /hello.txt\n'
+    $'# busybox sha256sum /m9/big.bin\n'"$(perl -e 'srand(9); print map { chr(int(rand(256))) } 1..204800' | shasum -a 256 | cut -d' ' -f1)"$'  /m9/big.bin\n'
+    $'# busybox seq 3 | busybox tr \'\\n\' \' \'\n1 2 3 # busybox expr 6 * 7\n42\n'
+    # busybox's shell, interactive: its line editor puts the console in raw mode and echoes for itself;
+    # ~ is HOME (root's is /), and `exit 3` comes back to keel's shell as the job's status.
+    $'# busybox sh\n~ # echo interactive $((6 * 7))\ninteractive 42\n~ # cd /etc; pwd\n/etc\n'
+    $'/etc # exit 3\nsh: busybox: exit status 3\n# echo $?\n3\n'
+    $'# exit\nlogin: \n'
     "init: the console closed after 1 sessions; orphans reaped: 0"
     "keel: init exited 0"
     "keel: every process reaped"
@@ -377,12 +466,12 @@ shutdown=(
 # the `files` program failed, the shell was restarted, or a process was left behind.
 not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login ended by signal"
     "keel: processes left unreaped" "keel: processes still running before init" "linuxpoll: FAILED"
-    "cstdhello: FAILED"
+    "linuxfp: FAILED" "threads: FAILED" "cstdhello: FAILED"
     "keelroot" "wonderland" "nope")
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
     init sh mkdir rm rmdir mv false ppid orphan udpecho login su id whoami chmod chown env wc grep head true forktest
-    sigtest stdsig ps kill sleep)
+    sigtest stdsig ps kill sleep threads)
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred.
 frames_min=65000
@@ -391,7 +480,7 @@ frames_max=65536
 elf=$out/keel.elf
 mkfs=$out/mkfs
 
-# The disk: an 8 MiB keel filesystem (2048 blocks; 28 programs at -O0 overflow 1024) that mkfs builds from a directory holding
+# The disk: a 16 MiB keel filesystem (4096 blocks; the programs at -O0 and busybox's 273 overflow 2048) that mkfs builds from a directory holding
 # /hello.txt and /dir/inner.txt. Its block 0 is a boot block the filesystem never uses, which is where
 # milestone 7's test lives: sector 1 gets byte i = (7i + 3) mod 256 here, the kernel writes sector 2
 # with byte i = (13i + 0x5a) mod 256, and after the first boot the script reads it back from the file.
@@ -423,6 +512,38 @@ $linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/
 $linux_cc --target=aarch64-linux-gnu -ffreestanding -fno-builtin -nostdlib -static -fno-pic -O2 -mgeneral-regs-only \
     -mno-outline-atomics -c -o $out/linuxpoll.o $root/linux/poll.c
 $linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/linuxpoll $out/linuxpoll.o
+# The one built WITHOUT -mgeneral-regs-only: it computes in the FP/SIMD registers on purpose.
+$linux_cc --target=aarch64-linux-gnu -ffreestanding -fno-builtin -nostdlib -static -fno-pic -O2 \
+    -mno-outline-atomics -c -o $out/linuxfp.o $root/linux/fp.c
+$linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/linuxfp $out/linuxfp.o
+
+# Milestone 18: a static aarch64 musl busybox, UNMODIFIED — Alpine's own `busybox-static` package (an
+# apk is a gzip'd tar; the program is bin/busybox.static, a static PIE). It is fetched once into a
+# directory of its own under scratch/, both the package and the program are checked against the
+# sha256s below, and it is never run on the host. The test fails, saying so, if it is not there and
+# cannot be fetched.
+busybox_url=https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/busybox-static-1.37.0-r31.apk
+busybox_apk_sha256=965777e06b94bf11981d5f4ecdfcd577879f4b0dda544294d1dd3f72b217bc75
+busybox_sha256=999cb969d09093a71716cfc747bb53cdada3f332c05eb5046c56e0f66a4d6d22
+busybox_dir=$out/busybox-1.37.0-r31
+busybox=$busybox_dir/bin/busybox.static
+if [[ ! -f $busybox ]]; then
+    rm -rf $busybox_dir
+    mkdir -p $busybox_dir
+    if ! curl -sfL -o $busybox_dir/busybox-static.apk $busybox_url; then
+        print -r -- "FAIL: busybox is not in $busybox_dir and could not be fetched from $busybox_url"
+        return 1
+    fi
+    if [[ $(shasum -a 256 $busybox_dir/busybox-static.apk) != "$busybox_apk_sha256 "* ]]; then
+        print -r -- "FAIL: $busybox_url is not the package this test was written against (sha256)"
+        return 1
+    fi
+    tar -xzf $busybox_dir/busybox-static.apk -C $busybox_dir bin/busybox.static
+fi
+if [[ $(shasum -a 256 $busybox) != "$busybox_sha256 "* ]]; then
+    print -r -- "FAIL: $busybox is not busybox 1.37.0-r31's bin/busybox.static (sha256)"
+    return 1
+fi
 
 # A C program against a C library: cstd's Linux half is archived for aarch64 with the portable half
 # inside it (its `_start` calls the program's `main`), and the program is compiled against cstd's
@@ -436,12 +557,14 @@ $linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/
 
 rm -rf $fsroot
 mkdir -p $fsroot/dir $fsroot/bin
+cp $busybox $fsroot/bin/busybox
 for prog in $user_programs; do
     cp $out/user/$prog.elf $fsroot/bin/$prog
 done
 cp $out/linuxhello $fsroot/bin/linuxhello
 cp $out/linuxthreads $fsroot/bin/linuxthreads
 cp $out/linuxpoll $fsroot/bin/linuxpoll
+cp $out/linuxfp $fsroot/bin/linuxfp
 cp $out/cstdhello $fsroot/bin/cstdhello
 print -n "hello from the disk" > $fsroot/hello.txt
 print "inside a directory" > $fsroot/dir/inner.txt
@@ -457,7 +580,33 @@ print -l "root:x:0:" "users:x:100:alice" > $fsroot/etc/group
 print "for root's eyes only" > $fsroot/etc/secret
 owners=$out/owners
 print -l "/home/alice 1000 100 755" "/bin/su 0 0 4755" "/etc/secret 0 0 600" > $owners
-$mkfs build $disk 2048 $fsroot $owners
+$mkfs build $disk 4096 $fsroot $owners
+
+# The same tree and owners go into a 32 MiB KFS image through mkfs.kfs (the kernel does not mount it yet):
+# it has to be fsck-clean, and big files must read back byte for byte through kfsdump.
+kfs_disk=$out/kfs-disk.img
+$compiler build -o $out/mkfs.kfs $root/tools/mkfs-kfs
+$compiler build -o $out/kfsdump $root/tools/kfsdump
+$compiler build -o $out/fsck.kfs $root/tools/fsck-kfs
+if ! $out/mkfs.kfs $kfs_disk 8192 -d $fsroot -o $owners; then
+    echo "host: mkfs.kfs could not build the fsroot into 32 MiB"
+    exit 1
+fi
+if ! $out/fsck.kfs -n $kfs_disk; then
+    echo "host: the KFS image of the fsroot is not clean"
+    exit 1
+fi
+for f in /m9/big.bin /bin/busybox /hello.txt /dir/inner.txt; do
+    if ! $out/kfsdump get $kfs_disk $f $out/kfs-out; then
+        echo "host: kfsdump get $f failed"
+        exit 1
+    fi
+    if ! cmp $fsroot$f $out/kfs-out; then
+        echo "host: $f differs after a trip through the KFS image"
+        exit 1
+    fi
+done
+echo "host: kfs fsroot ok"
 sector 7 3 | perl -e 'open(my $f, "+<", $ARGV[0]) or die; seek($f, 512, 0); local $/; print $f <STDIN>' $disk
 
 if [[ $accel == hvf ]]; then

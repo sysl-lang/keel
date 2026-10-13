@@ -17,7 +17,7 @@ module keel.proc
 // parent to reap it. `wait4` sleeps on `changed`, which every ending wakes.
 
 import abi.keel.abi.{ANY_CHILD, ARGS_ROOM, E2BIG, EAGAIN, ECHILD, EFAULT, EINTR, EINVAL, ENAMETOOLONG, ENOENT,
-    ENOEXEC, EBADF, ENOMEM, ENV_ROOM, EPERM, Errno, ExitStatus, INIT_PID, MAX_FDS, NO_FD, RUSAGE_SIZE, SIGCHLD,
+    ENOEXEC, EBADF, ENOMEM, ENV_ROOM, EPERM, Errno, ExitStatus, INIT_PID, MAX_FDS, NO_FD, O_CLOEXEC, RUSAGE_SIZE, SIGCHLD,
     SPAWN_FOREGROUND, SPAWN_SETPGROUP, SpawnAttr, WCONTINUED, WNOHANG, WUNTRACED, exit_status, signal_status}
 import keel.fs
 import keel.mm
@@ -145,7 +145,9 @@ private standard_files(p: *Process, fds: [3]u64) -> Result[[3]OpenFile, Errno]
     var std: [3]OpenFile = [sched.free_file(); 3]
     for i in 0..<3
         val fd = if fds[i] == NO_FD then usize(i) else usize(fds[i])
+        // The child's own descriptors, as a dup2 would make them: not close-on-exec.
         std[i] = t.slots[fd]
+        std[i].flags &= ~u32(O_CLOEXEC)
         duplicate(std[i])
     Ok(std)
 

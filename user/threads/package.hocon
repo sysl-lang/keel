@@ -1,0 +1,28 @@
+// `threads`: sysl.threads on keel — Mutex, Condvar, Channel, thread-locals and sysl.time.sleep, over
+// keel.fsys's thread, futex and sleep hooks.
+
+package {
+  name    = "threads"
+  version = "0.0.1"
+}
+
+dependencies {
+  rt { workspace = true }
+  fsys { workspace = true }
+}
+
+// `@thread_local` storage is read at TPIDR_EL0, which the kernel switches with the thread.
+codegen {
+  thread_pointer = "tpidr_el0"
+}
+
+targets {
+  aarch64-freestanding {
+    linker_script = "../user.ld"
+    entry         = "_start"
+
+    capabilities {
+      posix = false
+    }
+  }
+}

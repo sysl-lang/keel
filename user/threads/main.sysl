@@ -1,0 +1,199 @@
+// threads: the standard library's threads on keel. Every thread here is started by `sysl.threads.spawn`
+// (keel.fsys answers its hook with `clone`), every wait sleeps in keel's `futex`, and every line printed
+// is a property checked with exact numbers:
+//
+// - four threads add one to a `Mutex[u64]` 100,000 times each, on different cores at once, and the
+//   total is exact; each has its own id, and its own copy of a `@thread_local` — laid out of the
+//   template for it (7 when it starts) and for the first thread too (which keeps its own value);
+// - a `Condvar` hands a turn back and forth 1,000 times, every turn taken in order;
+// - three producers send 5,000 values each through an 8-slot `Channel[u64]`, and the first thread
+//   receives every one exactly once;
+// - `sysl.time.sleep(50 ms)` takes at least 50 ms by `sysl.time.monotonic`;
+// - every thread is joined.
+
+import rt.keel.user
+import sysl.buf.{Buf, buf}
+import sysl.sync.Atomic
+import sysl.threads.{Channel, Condvar, Mutex, Thread, channel, current, spawn}
+import sysl.time.{millis, monotonic, sleep, whole_millis}
+
+const WORKERS: u64 = 4
+const ROUNDS: u64 = 100_000
+const HANDOFFS: u64 = 1000
+const PRODUCERS: u64 = 3
+const VALUES: u64 = 5000
+
+// Each thread's own copy, starting at 7: the template's initialized bytes.
+@thread_local static var mine: u64 = 7
+
+failed(what: string) -> never
+    print(s"threads: FAILED $what")
+    exit(1)
+
+// --- the Mutex, the ids and the thread-locals ----------------------------------------------------
+
+struct Counting
+    total: Mutex[u64]
+    tls_own: Atomic[u64]        // threads whose thread-local started at 7 and stayed their own
+    ids: [4]Atomic[u64]
+
+struct Worker
+    shared: *Counting
+    index: u64
+
+count(w: *Worker)
+    val s = w.shared
+    val started_at_template = mine == 7
+
+    mine = 1000 + w.index
+    s.ids[w.index].store(current().id)
+
+    for _ in 0..<ROUNDS
+        s.total.with((n) -> *n = *n + 1)
+
+    if started_at_template && mine == 1000 + w.index then val _ = s.tls_own.add(1)
+
+// --- the Condvar ---------------------------------------------------------------------------------
+
+struct Turn
+    whose: u64                  // 0: the first thread's turn, 1: the partner's
+    taken: u64                  // turns taken so far
+    out_of_order: u64           // turns taken when the count said it was the other side's
+
+struct Turns
+    turn: Mutex[Turn]
+    changed: Condvar
+
+// Take `HANDOFFS` turns as side `me`, each when the other side has handed it over.
+take_turns(t: *Turns, me: u64)
+    for _ in 0..<HANDOFFS
+        val state = t.turn.lock_raw()
+
+        while state.whose != me
+            t.changed.wait(&t.turn)
+
+        if state.taken % 2 != me then state.out_of_order += 1
+
+        state.taken += 1
+        state.whose = 1 - me
+        t.turn.unlock_raw()
+        t.changed.notify_all()
+
+partner(t: *Turns)
+    take_turns(t, 1)
+
+// --- the Channel ---------------------------------------------------------------------------------
+
+struct Producer
+    ch: *Channel[u64]
+    base: u64
+
+produce(p: *Producer)
+    for i in 0..<VALUES
+        if !p.ch.send(p.base + i) then return
+
+// --- the run -------------------------------------------------------------------------------------
+
+var threads: Buf[Thread] = buf()
+
+started(t: Option[Thread]) -> Thread = t match
+    Some(h) -> h
+    None -> failed("spawn answered None")
+
+if mine != 7 then failed(s"the first thread's thread-local was $mine, not the template's 7")
+
+mine = 1
+
+var counting = Counting(Mutex.new(0), Atomic(0), [Atomic(0); 4])
+var workers: [4]Worker = [Worker(&counting, 0); 4]
+
+for i in 0..<WORKERS
+    workers[i].index = i
+    threads.push(started(spawn(&count, &workers[i])))
+
+for t in threads
+    if !t.join() then failed("a worker was not joined")
+
+val total = counting.total.with((n) -> *n)
+
+if total != WORKERS * ROUNDS then failed(s"the Mutex's total was $total")
+
+val me = current().id
+
+for i in 0..<WORKERS
+    val id = counting.ids[i].load()
+
+    if id == 0 || id == me then failed(s"worker $i's id was $id, the first thread's $me")
+
+    for j in 0..<i
+        if counting.ids[j].load() == id then failed(s"workers $j and $i had one id, $id")
+
+if counting.tls_own.load() != WORKERS then failed(s"${counting.tls_own.load()} threads kept their thread-local")
+
+if mine != 1 then failed(s"the first thread's thread-local became $mine")
+
+val parallel = user.procs() match
+    Ok(all) ->
+        var most: u32 = 0
+        for p in all
+            if p.pid == user.getpid() then most = p.parallel
+        most
+    Err(_) -> 0
+
+if parallel < 2 then failed(s"the most threads running at once was $parallel")
+
+print(s"threads: $WORKERS threads x $ROUNDS under a Mutex: $total, on different cores at once")
+print("threads: every thread its own id; thread-locals laid from the template for the first thread and each spawned one, and kept their own")
+
+var turns = Turns(Mutex.new(Turn(0, 0, 0)), Condvar.new())
+var other = started(spawn(&partner, &turns))
+
+take_turns(&turns, 0)
+
+if !other.join() then failed("the partner was not joined")
+
+val turned = turns.turn.with((t) -> *t)
+
+if turned.taken != 2 * HANDOFFS || turned.out_of_order != 0
+    failed(s"turns taken ${turned.taken}, out of order ${turned.out_of_order}")
+
+print(s"threads: a Condvar handed the turn over ${turned.taken} times, every turn in order")
+
+var slots: [8]u64 = [0; 8]
+var ch = channel(slots[..])
+var producers: [3]Producer = [Producer(&ch, 0); 3]
+var feeders: Buf[Thread] = buf()
+
+for p in 0..<PRODUCERS
+    producers[p].base = p * VALUES
+    feeders.push(started(spawn(&produce, &producers[p])))
+
+var seen: [15000]u8 = [0; 15000]
+var received: u64 = 0
+
+while received < PRODUCERS * VALUES
+    ch.receive() match
+        Some(v) ->
+            if v >= PRODUCERS * VALUES then failed(s"received $v, which nobody sent")
+            seen[v] += 1
+            received += 1
+        None -> failed(s"the channel closed after $received values")
+
+for t in feeders
+    if !t.join() then failed("a producer was not joined")
+
+for v in 0..<PRODUCERS * VALUES
+    if seen[v] != 1 then failed(s"value $v was received ${seen[v]} times")
+
+print(s"threads: a Channel of ${ch.capacity()} slots carried $PRODUCERS producers x $VALUES values, every one received once")
+
+val before = monotonic()
+
+sleep(millis(50))
+
+val slept = whole_millis(monotonic() - before)
+
+if slept < 50 || slept > 2000 then failed(s"sleep(50 ms) took $slept ms")
+
+print("threads: sleep(50 ms) took at least 50 ms by the monotonic clock")
+print(s"threads: ${threads.len() + 1 + feeders.len()} threads spawned, every one joined")

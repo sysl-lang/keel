@@ -1,0 +1,121 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+
+// The platform on the host, where one thread runs everything: the locks are bookkeeping rather than
+// exclusion, the clocks are counters a test sets, and by default there is no commit thread, so a request
+// to commit is answered "commit it yourself".
+//
+// The bookkeeping is what makes it more than a stub. Every acquisition is checked against section 19's
+// order (`rank`): taking a lock while holding one of the same or a higher rank panics, which is how a
+// host test catches the two-group-locks mistake or a buffer lock taken outside its group lock. The two
+// exceptions are rule 2's directories, held together (their ancestor order is not something a lock name
+// can show), and rule 3's non-directories, held together in increasing number; an inode's lock taken
+// while it is held, under either name, panics. Every release must be of a lock that is held. `fatal`
+// panics unless a test asked to record it.
+//
+// **A simulated commit thread.** With `committer_thread` set, `wake_committer` answers that a thread
+// was woken, as the kernel's does; nothing runs it, so the test plays that thread itself by calling
+// `Fs.journal_step` between the steps of its simulated operations. A handle that must wait is then the
+// test's to retry (`Fs.try_start`), never a blocking `start`: `wait_for_commit` panics, because on one
+// thread there is nobody to wake it.
+
+struct HostPlatform
+    private held_rank: Buf[u32]
+    private held_key: Buf[u64]
+    // The wall clock: seconds, advanced by one at every reading so two inodes made in a row differ.
+    clock: i64
+    // A `fatal` is counted and returned from instead of panicking.
+    record_fatal: bool
+    fatals: u64
+    // How many times a commit was asked for.
+    commit_requests: u64
+    // Acquisitions of a group lock, and the most group locks ever held at once.
+    group_locks: u64
+    most_groups_held: u32
+    // The monotonic clock in milliseconds; it moves only when a test moves it.
+    ms: u64
+    // Whether a (simulated) commit thread exists; see above.
+    committer_thread: bool
+    // The last fatal reported, as a number: 1 credit overrun, 2 revoke overrun, 3 deadlock, 4 log
+    // overrun.
+    last_fatal: u32
+    // Milliseconds the monotonic clock moves after every reading: a test that sets it lets
+    // `COMMIT_INTERVAL` pass inside one long operation, so the operation's steps commit apart.
+    ms_step: u64
+
+    // How many locks are held now.
+    held(self) -> usize = self.held_rank.len()
+
+host_platform() -> HostPlatform = HostPlatform(buf(), buf(), 1_700_000_000, false, 0, 0, 0, 0, 0, false, 0, 0)
+
+private key_of(l: LockId) -> u64
+    l match
+        LockId.Group(g) -> u64(g)
+        LockId.Buffer(b) -> b
+        LockId.Inode(i) -> i
+        LockId.Dir(i) -> i
+        _ -> 0
+
+impl Platform for HostPlatform
+    lock(*self, l: LockId)
+        val r = rank(l)
+        val k = key_of(l)
+        for i in 0..<self.held_rank.len()
+            val hr = self.held_rank[i]
+            val hk = self.held_key[i]
+            // `Dir(n)` and `Inode(n)` are one lock: taking it twice is a deadlock.
+            if (hr == 2 || hr == 3) && (r == 2 || r == 3) && hk == k then panic("keel.kfs: an inode's lock taken while it is held")
+            val together = (hr == 2 && r == 2) || (hr == 3 && r == 3 && hk < k)
+            if hr >= r && !together then panic("keel.kfs: a lock taken out of section 19's order")
+        self.held_rank.push(r)
+        self.held_key.push(k)
+        if r == 6
+            self.group_locks += 1
+            var groups: u32 = 0
+            for i in 0..<self.held_rank.len()
+                if self.held_rank[i] == 6 then groups += 1
+            if groups > self.most_groups_held then self.most_groups_held = groups
+
+    unlock(*self, l: LockId)
+        val r = rank(l)
+        val k = key_of(l)
+        var found = false
+        var i = self.held_rank.len()
+        while i > 0 && !found
+            i -= 1
+            if self.held_rank[i] == r && self.held_key[i] == k
+                self.held_rank.remove(i)
+                self.held_key.remove(i)
+                found = true
+        if !found then panic("keel.kfs: a lock released that was not held")
+
+    now(*self) -> Time
+        self.clock += 1
+        Time(self.clock, 500)
+
+    monotonic_ms(*self) -> u64
+        val t = self.ms
+        self.ms += self.ms_step
+        t
+
+    wake_committer(*self) -> bool
+        self.commit_requests += 1
+        !self.committer_thread
+
+    wait_for_commit(*self)
+        panic("keel.kfs: a blocking start with a simulated commit thread; use try_start")
+
+    fatal(*self, f: Fatal)
+        self.fatals += 1
+        self.last_fatal = f match
+            Fatal.CreditOverrun(_, _) -> 1
+            Fatal.RevokeOverrun(_, _) -> 2
+            Fatal.Deadlock(_) -> 3
+            Fatal.LogOverrun(_) -> 4
+        if !self.record_fatal
+            f match
+                Fatal.CreditOverrun(_, _) -> panic("keel.kfs: a handle went past its credits")
+                Fatal.RevokeOverrun(_, _) -> panic("keel.kfs: a handle revoked past its credits")
+                Fatal.Deadlock(_) -> panic("keel.kfs: a handle waits for log room nothing can make")
+                Fatal.LogOverrun(_) -> panic("keel.kfs: a transaction overran the log")

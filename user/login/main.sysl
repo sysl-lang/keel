@@ -6,8 +6,8 @@
 //
 // A wrong name or password says `login incorrect` and asks again. The end of the input at the name
 // prompt (Ctrl-D on an empty line) exits with passwd.CONSOLE_CLOSED, which tells init the console is
-// gone. The password is read with the terminal's echo off (rt's `hidden`, TCGETS/TCSETS): the standard
-// library has no terminal-mode call a freestanding program can reach (FINDINGS 75).
+// gone. The password is read with the terminal's echo off (`sysl.tty.hidden`, which keel.fsys answers
+// with TCGETS/TCSETS), and the newline the hidden line ended with is printed afterwards, as getpass does.
 
 import passwd.keel.passwd
 import passwd.keel.passwd.User
@@ -16,6 +16,7 @@ import sysl.fs
 import sysl.fs.IoError
 import sysl.io.{lines, stdin}
 import sysl.process
+import sysl.tty
 
 session(u: User) -> never
     process.set_group(u.gid) match
@@ -56,9 +57,11 @@ loop
             exit(passwd.CONSOLE_CLOSED)
     if name == "" then continue
     prints("password: ")
-    val quiet = user.hidden(0)
+    val quiet = tty.hidden()
     val line = reader.getline()
-    user.shown(quiet)
+    if quiet
+        tty.cooked()
+        print("")
     val password = line match
         Some(p) -> p
         None -> exit(passwd.CONSOLE_CLOSED)

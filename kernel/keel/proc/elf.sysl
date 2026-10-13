@@ -5,8 +5,13 @@ import keel.cpu
 import keel.mm
 
 // A static aarch64 ELF executable (ELF-64 Object File Format; the AArch64 ELF ABI): the file header,
-// and one program header per segment. keel loads ET_EXEC files only — linked at fixed addresses, no
-// relocation, no interpreter — and of their program headers reads only PT_LOAD.
+// and one program header per segment. keel loads an ET_EXEC file at the addresses it was linked at, and
+// an ET_DYN one — a static position-independent executable, as Alpine's busybox is — at `DYN_BASE`, as
+// Linux loads one with no PT_INTERP at its ELF_ET_DYN_BASE: every segment moved by the same amount, and
+// nothing relocated by the kernel. Such a program relocates itself (musl's `rcrt1.o`): it finds where it
+// was put from AT_PHDR and its own PT_DYNAMIC, which is why the auxiliary vector has to be right. A file
+// asking for an interpreter (PT_INTERP: a dynamically linked program) is refused; PT_TLS, PT_GNU_STACK,
+// PT_GNU_RELRO and the rest are the program's own business, and only PT_LOAD and PT_PHDR are read.
 
 struct ElfHeader
     ident: [16]u8               // 0x7f 'E' 'L' 'F', class, data (byte order), version, ABI, padding
@@ -41,9 +46,16 @@ struct ProgramHeader
 @assert(offsetof(ProgramHeader, memsz) == 40, "p_memsz is at 40")
 
 private const ET_EXEC: u16 = 2
+private const ET_DYN: u16 = 3
 private const EM_AARCH64: u16 = 183
 private const PT_LOAD: u32 = 1
+private const PT_INTERP: u32 = 3
+private const PT_PHDR: u32 = 6
 private const PF_X: u32 = 1
+
+// Where an ET_DYN program's address 0 goes: where keel's own programs are linked (mm.USER_BASE), 64 KiB
+// aligned as busybox's segments ask, so the heap follows the image as it does for them.
+private const DYN_BASE: u64 = 0x40_0000
 private const PF_W: u32 = 2
 private const MAX_SEGMENTS: u16 = 16
 
@@ -58,11 +70,15 @@ enum LoadError
     Unreadable(why: Errno)      // the file could not be read: not there, a directory, too big
     NoRoom                      // the process table is full
 
-// What loading made: the address space, where to start, and where the heap begins.
+// What loading made: the address space, where to start, and where the heap begins; and what the
+// auxiliary vector tells the program about itself: where its program headers are in its memory, and
+// how many there are.
 struct Loaded
     space: mm.Space
     entry: u64
     heap_base: u64
+    phdr: u64
+    phnum: u64
 
 // A `T` laid out in `bytes` at `at`, copied out byte by byte: an ELF file's fields are little-endian,
 // as aarch64 is, and the copy makes no assumption about the alignment of `bytes` (the kernel is built
@@ -85,9 +101,23 @@ load(image: []const u8) -> Result[Loaded, LoadError]
         None -> return Err(NotElf)
     if h.ident[0] != 0x7f || h.ident[1] != u8('E') || h.ident[2] != u8('L') || h.ident[3] != u8('F')
         return Err(NotElf)
-    if h.ident[4] != 2 || h.ident[5] != 1 || h.kind != ET_EXEC || h.machine != EM_AARCH64
+    if h.ident[4] != 2 || h.ident[5] != 1 || (h.kind != ET_EXEC && h.kind != ET_DYN) || h.machine != EM_AARCH64
         return Err(WrongKind)
     if h.phentsize != 56 || h.phnum == 0 || h.phnum > MAX_SEGMENTS then return Err(WrongKind)
+    val base = if h.kind == ET_DYN then DYN_BASE else 0
+
+    // The headers first, so nothing is mapped for a file keel will refuse.
+    var phdr: u64 = 0
+    for i in 0..<u64(h.phnum)
+        val ph = read_at[ProgramHeader](image, h.phoff + i * 56) match
+            Some(p) -> p
+            None -> return Err(NotElf)
+        if ph.kind == PT_INTERP then return Err(WrongKind)
+        if ph.kind == PT_PHDR then phdr = base + ph.vaddr
+        // Without a PT_PHDR, the headers are wherever the segment holding their bytes in the file put
+        // them, as Linux works it out.
+        if phdr == 0 && ph.kind == PT_LOAD && h.phoff >= ph.offset && h.phoff - ph.offset < ph.filesz
+            phdr = base + ph.vaddr + (h.phoff - ph.offset)
 
     var space = mm.new_space() match
         Some(s) -> s
@@ -95,13 +125,18 @@ load(image: []const u8) -> Result[Loaded, LoadError]
 
     var end: u64 = mm.USER_BASE
     var entry_ok = false
+    val entry = base + h.entry
     for i in 0..<u64(h.phnum)
-        val ph = read_at[ProgramHeader](image, h.phoff + i * 56) match
+        var ph = read_at[ProgramHeader](image, h.phoff + i * 56) match
             Some(p) -> p
             None ->
                 mm.free_space(&space)
                 return Err(NotElf)
         if ph.kind != PT_LOAD then continue
+        if ph.vaddr > mm.heap_limit() - base
+            mm.free_space(&space)
+            return Err(BadSegment)
+        ph.vaddr += base
         load_segment(&space, image, ph) match
             Err(e) ->
                 mm.free_space(&space)
@@ -109,7 +144,7 @@ load(image: []const u8) -> Result[Loaded, LoadError]
             Ok(_) -> ()
         val seg_end = ph.vaddr + ph.memsz
         if seg_end > end then end = seg_end
-        if ph.flags & PF_X != 0 && h.entry >= ph.vaddr && h.entry < seg_end then entry_ok = true
+        if ph.flags & PF_X != 0 && entry >= ph.vaddr && entry < seg_end then entry_ok = true
 
     if !entry_ok
         mm.free_space(&space)
@@ -125,7 +160,7 @@ load(image: []const u8) -> Result[Loaded, LoadError]
         va += mm.PAGE_SIZE
 
     cpu.sync_icache()
-    Ok(Loaded(space, h.entry, page_up(end)))
+    Ok(Loaded(space, entry, page_up(end), phdr, u64(h.phnum)))
 
 // One segment, mapped and filled.
 private load_segment(space: *mm.Space, image: []const u8, ph: ProgramHeader) -> Result[unit, LoadError]

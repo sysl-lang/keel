@@ -1,0 +1,152 @@
+module keel.mm
+
+import keel.cpu
+
+// The pages `mmap` hands out (keel.proc's memory.sysl has the calls). They go in a window of their own
+// between the heap and the stack:
+//
+//   USER_BASE .. MMAP_BASE             the program's segments, then the heap `brk` grows (heap_limit())
+//   MMAP_BASE .. mmap_top()            mmap's: placed top-down from mmap_top(), as Linux places them
+//   mmap_top() .. stack_limit()        a gap of MMAP_GAP, never mapped
+//   stack_limit() .. USER_STACK_TOP    the stack, 8 MiB at most, grown a page at a time (uspace.sysl)
+//
+// A space keeps no list of its mappings: the translation tables ARE the record. A page is in use when
+// its level-3 descriptor is not zero — a PROT_NONE page included, which is mapped with a descriptor EL0
+// cannot use (AP = EL1 only) and the `NO_ACCESS` software bit — and a search for room walks them. So
+// `fork` copies a mapping with everything else, and `munmap` of part of one needs no splitting.
+//
+// Every page is backed by a frame from the start (nothing is mapped lazily), zeroed, or filled from a
+// file for a file-backed mapping.
+
+const MMAP_BASE: u64 = 0x4000_0000
+private const MMAP_GAP: u64 = 0x10_0000
+
+mmap_top() -> u64 = stack_limit() - MMAP_GAP
+
+// The descriptor's software bits (LeafDesc.software): bit 0 is cow.sysl's copy-on-write mark; bit 1 says
+// the page is mapped PROT_NONE.
+private const NO_ACCESS: u4 = 2
+
+// Linux's PROT_* bits, as `mmap` and `mprotect` take them.
+const PROT_READ: u64 = 1
+const PROT_WRITE: u64 = 2
+const PROT_EXEC: u64 = 4
+
+// Whether a descriptor is there for `va`, whatever it allows.
+page_in_use(s: *Space, va: u64) -> bool = leaf_slot(s, va, false) match
+    Some(slot) -> *slot != 0
+    None -> false
+
+// Whether every page of [va, va + len) is unused, `len` a multiple of the page size.
+range_unused(s: *Space, va: u64, len: u64) -> bool
+    var a = va
+    while a < va + len
+        if page_in_use(s, a) then return false
+        a += PAGE_SIZE
+    true
+
+// Off only to show what the search is for: every mapping with no address asked for is then put at the
+// top of the window, over the last one — the second of musl's malloc's mmaps fails, ENOMEM.
+private const LOOK_FOR_ROOM: bool = true
+
+// The lowest address of `len` bytes of unused pages in the window, the highest such run found looking
+// down from mmap_top(); None when there is no run that long.
+find_room(s: *Space, len: u64) -> Option[u64]
+    if len == 0 || len > mmap_top() - MMAP_BASE then return None
+    if !LOOK_FOR_ROOM then return Some(mmap_top() - len)
+    var top = mmap_top()
+    while top - MMAP_BASE >= len
+        // Look down from `top` for the first page in use below it; the run is long enough if none comes
+        // before `len` bytes have gone by.
+        var a = top
+        var blocked = false
+        while a > top - len
+            a -= PAGE_SIZE
+            if page_in_use(s, a)
+                blocked = true
+                break
+        if !blocked then return Some(top - len)
+        top = a
+    None
+
+// Map a fresh page at `va` (unused, page aligned) with Linux's `prot`, and answer its frame (zeroed).
+map_page_prot(s: *Space, va: u64, prot: u64) -> Option[PhysAddr]
+    val slot = leaf_slot(s, va, true) match
+        Some(p) -> p
+        None -> return None
+    if *slot != 0 then return None
+    val pa = zeroed_frame() match
+        Some(p) -> p
+        None -> return None
+    *slot = cpu.to_word(leaf_with(LeafDesc(1, 1, Normal, 0, UserRo, Inner, 1, 1, frame_of(pa), 0, 0, 0, 0, 1, 1,
+        0, 0), prot, false))
+    s.pages += 1
+    cpu.publish_tables()
+    Some(pa)
+
+// Give the page at `va` the protection `prot`; false when nothing is mapped there. A page another space
+// still shares (a fork's) is never made writable here: it becomes copy-on-write instead, and gets its
+// own frame at the first write. A copy-on-write page that loses PROT_WRITE stops being one: the frame
+// stays shared, read-only in both.
+protect_page(s: *Space, va: u64, prot: u64) -> bool
+    val slot = leaf_slot(s, va, false) match
+        Some(p) -> p
+        None -> return false
+    if *slot == 0 then return false
+    val old: LeafDesc = cpu.from_word(*slot)
+    val shared = (old.software & 1) != 0 || frame_shared(old.oa)
+    val leaf = leaf_with(old, prot, shared)
+    *slot = cpu.to_word(leaf)
+    flush_user_page(s, va)
+    if leaf.uxn == 0 && old.uxn != 0
+        var line: u64 = 0
+        val at = u64(to_virt(frame_addr(leaf.oa)))
+        while line < PAGE_SIZE
+            cpu.clean_dcache_line_pou(at + line)
+            line += 64
+        cpu.sync_icache()
+    true
+
+// Make the page at `va` read as zeros from now on, as MADV_DONTNEED does to private memory: its frame is
+// zeroed where it is, or, when another space still shares it, replaced by a zeroed one of its own.
+// Nothing happens where no page is mapped.
+discard_page(s: *Space, va: u64)
+    val slot = leaf_slot(s, va, false) match
+        Some(p) -> p
+        None -> return
+    if *slot == 0 then return
+    var leaf: LeafDesc = cpu.from_word(*slot)
+    if (leaf.software & 1) != 0 || frame_shared(leaf.oa)
+        val fresh = zeroed_frame() match
+            Some(p) -> p
+            None -> return
+        val old = leaf.oa
+        leaf.oa = frame_of(fresh)
+        if (leaf.software & 1) != 0
+            leaf.software = 0
+            leaf.ap = UserRw
+        *slot = cpu.to_word(leaf)
+        flush_user_page(s, va)
+        release_frame(old)
+        return
+    val t = table_of(frame_addr(leaf.oa))
+    for i in 0..<512
+        t.entries[i] = 0
+
+// `leaf` with what Linux's `prot` allows. PROT_EXEC alone, or PROT_WRITE alone, still reads, as on
+// arm64 Linux; no bit at all is PROT_NONE. `shared`: the frame is another space's too.
+private leaf_with(leaf: LeafDesc, prot: u64, shared: bool) -> LeafDesc
+    var out = leaf
+    out.software = 0
+    out.uxn = if (prot & PROT_EXEC) != 0 then u1(0) else u1(1)
+    if (prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) == 0
+        out.ap = KernelRw
+        out.software = NO_ACCESS
+    else if (prot & PROT_WRITE) == 0
+        out.ap = UserRo
+    else if shared
+        out.ap = UserRo
+        out.software = 1
+    else
+        out.ap = UserRw
+    out

@@ -2543,6 +2543,11 @@ candidate, whatever kind of thing the import names.
 
 ## 73. `sysl.posix.threads` has no hook layer, so a program for a target with system calls and no C library cannot start a thread
 
+**FIXED in sysl 0.1.0-alpha.10, and adopted**: `keel.fsys` (`user/fsys/keel/fsys/threads.sysl`) answers
+`sysl_thread_spawn/join/self/yield` and `sysl_futex_wait/wake` over clone, gettid, sched_yield and futex;
+`user/rt` places the first thread's TLS block; `user/threads` runs `sysl.threads` Mutex, Condvar, Channel and
+thread-locals on four cores in the boot test (controls `FUTEX_WAKES`, `PLACE_FIRST_TLS`).
+
 Milestone 16 gives keel `clone` with musl's thread flags, `futex`, TLS and `exit`/`exit_group` by
 Linux's numbers. A keel program written in sysl would reach them through the standard library's
 threads, as it reaches files through `sysl.fs` and processes through `sysl.process`. It cannot: the
@@ -2579,6 +2584,9 @@ which is the design question this finding leaves open.
 
 ## 74. `sysl.time` reads a clock through a seam but has no sleep, so a freestanding program cannot wait for a time
 
+**FIXED in sysl 0.1.0-alpha.10, and adopted**: `keel.fsys`'s `time.sysl` answers `sysl_sleep_us` over
+nanosleep; `sleep` and `stdsig` use `sysl.time.sleep` (control `SLEEP_WAITS`).
+
 Milestone 17 gives keel `clock_gettime`, `nanosleep` and `clock_nanosleep` by Linux's numbers, and
 keel.fsys now answers `sysl.time`'s two seams (`sysl_wall_us`, `sysl_monotonic_us`; `user/fsys/keel/fsys/time.sysl`),
 so `sysl.time.now()` and `monotonic()` work from EL0 (`stdsig: time ok`). Sleeping does not: the only
@@ -2610,6 +2618,9 @@ it, answered by `nanosleep` on a host and by keel.fsys (or a board package) on a
 
 ## 75. No terminal-mode surface reaches a freestanding program, so turning echo off for a password is a raw `ioctl`
 
+**FIXED in sysl 0.1.0-alpha.10, and adopted**: `keel.fsys`'s `tty.sysl` answers `sysl_tty_get/set` over the
+TCGETS/TCSETS ioctls; `login` and `su` read passwords through `sysl.tty.hidden()`, and rt's own pair is gone.
+
 keel's console now has Linux's termios (TCGETS/TCSETS, ECHO, ICANON, VMIN/VTIME, ISIG). `login` and `su`
 read passwords and must turn echo off. The library's terminal-mode code is `sysl.posix.tty`
 (`mode.sysl`): `@requires(posix)`, and its raw/cooked switch is two C functions in `__posix__/termios.c`
@@ -2631,6 +2642,9 @@ keel.fsys here.
 
 ## 76. The `posix` capability means both "POSIX semantics" and "a C POSIX library", so keel can declare neither honestly
 
+**FIXED in sysl 0.1.0-alpha.10:** libc is split from posix; `sysl.posix.*` needs posix and libc and is
+refused on a non-POSIX target anyway. The 33 `posix = false` lines are gone from keel's manifests.
+
 A freestanding manifest provides every capability it does not mention, so a keel program that imports
 a C-calling `sysl.posix.*` module (`sysl.posix.time.sleep`, FINDINGS 74) gets past analysis and fails
 at the link. `capabilities { posix = false }` in the target block turns that into a compile-time
@@ -2650,6 +2664,76 @@ supports) or overstate (posix provided, admitting modules that call C). Clean fo
 bindings that call C require `libc` (off by default on freestanding), the hook-backed modules require
 `posix` alone; keel then declares nothing and `sysl.posix.time` is refused for want of libc. keel dev
 70faf3c carries `posix = false` on the 33 manifests that can take it.
+
+## KFS: keel's new filesystem
+
+## 77. A `match` arm of `Err(…)` does not take `Result`'s other type argument from a sibling `Ok(…)` arm (bug)
+
+**FIXED in sysl 0.1.0-alpha.10:** the `Err` arm takes `Result`'s other type argument from the sibling
+`Ok` arm. The `val next = r match` in `kfs/keel/kfs/extent_tests.sysl` is written without an
+annotation now.
+
+KFS stage 3's allocator answered a `Result` from a `match` whose arms each name one half of it. The
+shortest input (sysl 0.1.0-alpha.9):
+
+    enum E
+        Bad
+
+    pick(n: int) -> Result[int, E]
+        val r = n match
+            0 -> Err(E.Bad)
+            _ -> Ok(n)
+        r
+
+    error: cannot infer the type argument 'T' of 'Err' here — annotate the expected type
+     --> main.sysl:6:14
+
+The reference says a `match` takes a type from its sibling arm (`reference/compact.md`, the integer
+literal paragraph: "a `match` or an `if` takes it from the sibling arm"), and FINDINGS 67 was the same
+rule failing for a tuple of literals. Here the `Ok(n)` arm fixes `T = int` and the `Err` arm fixes `E`;
+together they determine `Result[int, E]`, as they would if written in the other order or annotated.
+The workaround, which KFS used, is to restructure (or annotate `val r: Result[int, E]`).
+
+## 78. `sysl build-lib` emits a capturing closure inside a generic function without its environment type (bug)
+
+**FIXED in sysl 0.1.0-alpha.10:** `sysl build-lib kfs --target aarch64-freestanding` builds, and the
+probe below builds. The workaround-free source needs alpha.10 for the freestanding build.
+
+KFS stage 6 changes an inode in place through `change_inode(fs, h, ino, edit: &Fn(*Inode) -> unit)`,
+every caller handing it a closure that captures the new values (`(n) -> set_atime(n, now)`), and every
+caller is generic over the device and the platform, as all of KFS is. `sysl test kfs` compiles, links
+and runs it; `sysl build-lib kfs` (host or `--target aarch64-freestanding`, the stage gate's check)
+fails in clang. The shortest input (sysl 0.1.0-alpha.9), one file of a package:
+
+    module probe
+
+    apply(f: &Fn(u64) -> u64) -> u64 = f(1)
+
+    add[T](x: T, v: u64) -> u64 = apply((n) -> n + v)
+
+    $ sysl build-lib .
+    sysl: error: clang failed (exit 1):
+    …/sysl-std-KiT2oH/sysl.code.o.ll:2568:33: error: load operand must be a pointer to a first class type
+     2568 |   %t3 = load %struct.$closure4, ptr %t2
+
+The emitted `$closure4.call` loads its environment as `%struct.$closure4`, a type the module never
+defines. What decides it, each probed:
+
+| | `build-lib` |
+|---|---|
+| the closure captures `v`, inside generic `add[T]` | **fails** |
+| the same, with a non-generic caller in the library instantiating `add[u32]` | **fails** |
+| a closure capturing nothing, inside a generic function | checks |
+| a capturing closure inside a non-generic function | checks |
+| `sysl build` of a program with the failing function, called or not | builds and runs (`5`) |
+| `sysl test` of the package | passes |
+
+So the program path lowers the closure only per instantiation, with its environment, and `build-lib`
+lowers the generic body's closure once, uninstantiated, without one. Nothing in the reference limits
+where a capturing closure may appear (`reference/functions.md`'s closures; generics are an ordinary
+context for one), and the code is accepted by every analysis pass: this is codegen. The workaround
+would be to give up the closure for a begin/end pair that hands back a `*Inode` and re-seals after — a
+shape that lets a caller forget the seal, chosen only because a check command crashes.
 
 ## What worked in milestone 17
 

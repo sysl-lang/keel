@@ -4,13 +4,14 @@
 // keel has one uid per process and only root may change it, so /bin/su is set-user-ID root on the disk
 // (mkfs's owners file): it starts as root whoever runs it, checks the password, and gives root up for
 // the target's group and uid before the shell starts. A wrong password exits 1 having changed nothing.
-// The password is read with echo off, as login's is.
+// The password is read with echo off (`sysl.tty.hidden`), as login's is.
 
 import passwd.keel.passwd
 import rt.keel.user
 import sysl.fs.IoError
 import sysl.io.{lines, stdin}
 import sysl.process
+import sysl.tty
 
 refuse(e: IoError) -> never
     print(s"su: cannot change user: $e")
@@ -26,9 +27,11 @@ main(args: []string)
     prints("password: ")
     var input = stdin()
     var reader = lines(&input)
-    val quiet = user.hidden(0)
+    val quiet = tty.hidden()
     val line = reader.getline()
-    user.shown(quiet)
+    if quiet
+        tty.cooked()
+        print("")
     val password = line match
         Some(p) -> p
         None -> exit(1)

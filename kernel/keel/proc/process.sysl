@@ -1,6 +1,6 @@
 module keel.proc
 
-import abi.keel.abi.{SIGBUS, SIGFPE, SIGILL, SIGKILL, SIGSEGV, SIGTRAP}
+import abi.keel.abi.{FpRegs, SIGBUS, SIGFPE, SIGILL, SIGKILL, SIGSEGV, SIGTRAP, UMASK, no_fp}
 import keel.console
 import keel.cpu
 import keel.fs
@@ -85,7 +85,9 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
         env: []const u8, run_as: Cred, group: Group) -> Result[&sync Process, LoadError]
     if env.len > sched.ENV_ROOM then return Err(TooManyArgs)
     var l = load(image)?
-    val sp = lay_out_args(&l.space, args, env) match
+    // AT_EXECFN is the name the program was started by: spawn has its argv[0] (execve, the path).
+    val execfn = if args.len > 0 then args[0].bytes else "".bytes
+    val sp = lay_out_args(&l.space, args, env, execfn, Aux(l.phdr, l.phnum, l.entry, run_as.uid, run_as.gid)) match
         Some(sp) -> sp
         None ->
             mm.free_space(&l.space)
@@ -95,7 +97,7 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
     val pid = new_pid()
     val p: &sync Process = Process(pid, l.space, l.heap_base, l.heap_base, sched.no_threads(),
         sched.fresh_signals(), 0, 0, 0, sched.no_files(), sched.root_dir(), 1, 0, false, None, run_as.uid,
-        run_as.gid, sched.env_of(env), pid, pid, 0, name_from(args), 0, 0, 0)
+        run_as.gid, sched.env_of(env), pid, pid, 0, name_from(args), 0, 0, 0, UMASK)
     val raw: *Process = &*p
     set_standard(raw, std)
     if parent != null
@@ -103,6 +105,7 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
         raw.cwd = parent.cwd
         raw.cwd_len = parent.cwd_len
         raw.sid = parent.sid
+        raw.umask = parent.umask
         if group.pgid == INHERIT_GROUP then raw.pgid = parent.pgid
     if group.pgid != INHERIT_GROUP && group.pgid != NEW_GROUP then raw.pgid = group.pgid
     if group.foreground && FOREGROUND_AT_SPAWN then console.set_foreground(raw.pgid)
@@ -112,14 +115,14 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
         mm.free_space(&raw.space)
         return Err(NoRoom)
     val regs = fresh_regs(l.entry, sp, 0)
-    start_first_thread(raw, () -> run(raw, regs), 0, 0)
+    start_first_thread(raw, () -> run(raw, regs), 0, 0, no_fp())
     Ok(p)
 
-// Start a new process's first thread, whose id is the pid, with TPIDR_EL0 `tls` and the blocked set
-// `blocked`. A process with no threads yet always has room for one.
+// Start a new process's first thread, whose id is the pid, with TPIDR_EL0 `tls`, the blocked set
+// `blocked` and the FP/SIMD registers `fp`. A process with no threads yet always has room for one.
 @crossing(f)
-private[proc] start_first_thread(p: *Process, f: &sync Fn() -> unit, tls: u64, blocked: u64)
-    sched.spawn_user(p, f, p.pid, tls, blocked) match
+private[proc] start_first_thread(p: *Process, f: &sync Fn() -> unit, tls: u64, blocked: u64, fp: FpRegs)
+    sched.spawn_user(p, f, p.pid, tls, blocked, fp) match
         Some(_) -> ()
         None -> panic("keel: a new process had no room for its first thread")
 
@@ -128,26 +131,77 @@ private[proc] name_from(args: []const string) -> [sched.NAME_ROOM]u8 =
     if args.len == 0 then sched.name_of("".bytes) else sched.name_of(args[0].bytes)
 
 // The most a process's arguments and environment may take at the top of its stack, strings and
-// vectors together: keel.abi's ARGS_ROOM and ENV_ROOM, and room for the pointers to both.
+// vectors together: keel.abi's ARGS_ROOM and ENV_ROOM, and room for the pointers to both and for the
+// auxiliary vector.
 private const ARGS_ROOM: u64 = 8192
 
-// Write `args` and `env` at the top of the new process's stack, Linux's way: the argument strings, each
-// with a NUL after it, at the very top, then the environment's entries as they are (each already ends
-// in a NUL); below them, 16-aligned, argc, the argc pointers and a zero, then a pointer to each entry
-// and a zero. Answers the stack pointer the program starts with, which points at argc; None if they do
-// not fit ARGS_ROOM.
-private[proc] lay_out_args(space: *mm.Space, args: []const string, env: []const u8) -> Option[u64]
+// The auxiliary vector's keys (Linux's include/uapi/linux/auxvec.h, arm64's AT_HWCAP bits): what a static
+// musl program reads before main — AT_PHDR/AT_PHNUM to find its own PT_DYNAMIC (a static PIE relocates
+// itself from them) and its PT_TLS, AT_PAGESZ, AT_RANDOM for the stack protector's canary and malloc's
+// secret, the ids and AT_SECURE to decide it is not set-user-ID.
+private const AT_NULL: u64 = 0
+private const AT_PHDR: u64 = 3
+private const AT_PHENT: u64 = 4
+private const AT_PHNUM: u64 = 5
+private const AT_PAGESZ: u64 = 6
+private const AT_BASE: u64 = 7
+private const AT_FLAGS: u64 = 8
+private const AT_ENTRY: u64 = 9
+private const AT_UID: u64 = 11
+private const AT_EUID: u64 = 12
+private const AT_GID: u64 = 13
+private const AT_EGID: u64 = 14
+private const AT_HWCAP: u64 = 16
+private const AT_CLKTCK: u64 = 17
+private const AT_SECURE: u64 = 23
+private const AT_RANDOM: u64 = 25
+private const AT_HWCAP2: u64 = 26
+private const AT_EXECFN: u64 = 31
+private const AUX_PAIRS: usize = 18             // the entries below, AT_NULL's included
+
+// HWCAP_FP | HWCAP_ASIMD: the FP/SIMD unit every aarch64 core keel runs on has, and nothing it might
+// not (an atomics-capable program asks for HWCAP_ATOMICS before using LSE, and falls back without it).
+private const HWCAP: u64 = 0x3
+
+// Off only to show what the auxiliary vector is for: without AT_PHDR a static PIE cannot find its
+// PT_DYNAMIC, relocates nothing, and faults on its first pointer.
+private const AUX_PHDR: bool = true
+
+// Who the program is and where it came from, for its auxiliary vector.
+struct Aux
+    phdr: u64
+    phnum: u64
+    entry: u64
+    uid: u32
+    gid: u32
+
+// Write `args` and `env` at the top of the new process's stack, Linux's way (fs/binfmt_elf.c's
+// create_elf_tables): at the very top `execfn` with its NUL (AT_EXECFN points at it), the argument
+// strings each with a NUL after it, then the environment's entries as they are (each already ends in a
+// NUL), then 16 random bytes (AT_RANDOM); below them, 16-aligned, argc, the argc pointers and a zero, a
+// pointer to each entry and a zero, and the auxiliary vector's (key, value) pairs ending in AT_NULL.
+// Answers the stack pointer the program starts with, which points at argc; None if they do not fit
+// ARGS_ROOM.
+private[proc] lay_out_args(space: *mm.Space, args: []const string, env: []const u8, execfn: []const u8,
+        aux: Aux) -> Option[u64]
     var strings: u64 = u64(env.len)
     for a in args
         strings += u64(a.bytes.len) + 1
     var entries: u64 = 0
     for b in env
         if b == 0 then entries += 1
-    val vector = (u64(args.len) + entries + 3) * 8
-    if strings + vector + 16 > ARGS_ROOM then return None
+    val vector = (u64(args.len) + entries + 3 + 2 * u64(AUX_PAIRS)) * 8
+    if strings + u64(execfn.len) + 1 + 16 + vector + 32 > ARGS_ROOM then return None
 
-    val text_at = mm.USER_STACK_TOP - strings
-    val sp = (text_at - vector) & ~u64(15)
+    val execfn_at = mm.USER_STACK_TOP - u64(execfn.len) - 1
+    if !mm.copy_to_user(space, execfn_at, execfn) then return None
+    if !mm.copy_to_user(space, execfn_at + u64(execfn.len), [u8(0)]) then return None
+    val text_at = execfn_at - strings
+    val random_at = (text_at - 16) & ~u64(15)
+    var random: [16]u8 = [0; 16]
+    fill_random(random[..])
+    if !mm.copy_to_user(space, random_at, random[..]) then return None
+    val sp = (random_at - vector) & ~u64(15)
     var at = text_at
     var slot = sp
     if !put_word(space, slot, u64(args.len)) then return None
@@ -166,7 +220,18 @@ private[proc] lay_out_args(space: *mm.Space, args: []const string, env: []const 
         slot += 8
         if !put_word(space, slot, start) then return None
         start = at + u64(i) + 1
-    if !put_word(space, slot + 8, 0) then return None
+    slot += 8
+    if !put_word(space, slot, 0) then return None
+    // AT_BASE is 0, as Linux has it with no interpreter: musl then finds where it was loaded from
+    // AT_PHDR. One user id per process, so the real and effective ids agree and AT_SECURE is 0.
+    val pairs: [AUX_PAIRS](u64, u64) = [(AT_PHDR, if AUX_PHDR then aux.phdr else 0), (AT_PHENT, 56),
+        (AT_PHNUM, aux.phnum), (AT_PAGESZ, mm.PAGE_SIZE), (AT_BASE, 0), (AT_FLAGS, 0), (AT_ENTRY, aux.entry),
+        (AT_UID, u64(aux.uid)), (AT_EUID, u64(aux.uid)), (AT_GID, u64(aux.gid)), (AT_EGID, u64(aux.gid)),
+        (AT_HWCAP, HWCAP), (AT_HWCAP2, 0), (AT_CLKTCK, 100), (AT_SECURE, 0), (AT_RANDOM, random_at),
+        (AT_EXECFN, execfn_at), (AT_NULL, 0)]
+    for (key, value) in pairs
+        if !put_word(space, slot + 8, key) || !put_word(space, slot + 16, value) then return None
+        slot += 16
     Some(sp)
 
 private put_word(space: *mm.Space, va: u64, w: u64) -> bool
@@ -268,12 +333,18 @@ user_sync(regs: *u64, ec: u64, iss: u64)
         // A write to a copy-on-write page (mm's cow.sysl): the page is writable now, and the store runs
         // again.
         returning_to_user(regs)
+    else if ec == 0x24 && is_translation_fault(iss) && mm.grow_stack(&current_process().space, cpu.far())
+        // The stack's next page, touched for the first time (mm's uspace.sysl): it is there now.
+        returning_to_user(regs)
     else
         val fault = (ec << 8) | (iss & 0x3f)
         end(current_process(), fault_signal(ec), fault)
 
 // A data abort's ISS: a permission fault at any level (DFSC 0b0011xx) on a write (WnR, bit 6).
 private is_write_permission_fault(iss: u64) -> bool = ((iss & 0x3f) >> 2) == 3 && ((iss >> 6) & 1) == 1
+
+// A data abort's ISS: a translation fault at any level (DFSC 0b0001xx), nothing mapped there.
+private is_translation_fault(iss: u64) -> bool = ((iss & 0x3f) >> 2) == 1
 
 // The signal a POSIX kernel raises for an exception class: an instruction or data abort is SIGSEGV, a
 // PC or SP alignment fault SIGBUS, a trapped floating-point exception SIGFPE, `brk` SIGTRAP, and

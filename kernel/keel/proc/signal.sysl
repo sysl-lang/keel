@@ -7,7 +7,8 @@ module keel.proc
 // **Delivery** (`deliver`) runs on every return to EL0 — after a system call, after an interrupt, after
 // a copy-on-write fault — with the registers the process resumes with. It takes the lowest deliverable
 // signal: ignored, it is dropped; default, it ends the process (or is dropped, for the ones whose
-// default is to ignore); handled, a `SigFrame` holding every register and the blocked set is pushed on
+// default is to ignore); handled, a `SigFrame` holding every register (the FP/SIMD ones, FPSR and FPCR
+// too) and the blocked set is pushed on
 // the process's own stack, and the registers are changed so that the process resumes in the handler
 // with x0 = the signal, x30 = the restorer its `rt_sigaction` named, and SP at the frame. The restorer
 // is the user runtime's `keel_sigreturn_trampoline` (Linux's `sa_restorer`), which makes `rt_sigreturn`;
@@ -18,7 +19,7 @@ module keel.proc
 import abi.keel.abi.{EFAULT, EINVAL, ENOTTY, EPERM, ESRCH, Errno, INIT_PID, MAX_FDS, NSIG, ProcInfo,
     SA_RESTART, SA_RESTORER, SIGINT, SIGKILL, SIGQUIT, SIGSEGV, SIGSET_SIZE, SIGSTOP, SIG_BLOCK, SIG_DFL, SIG_IGN,
     SIG_SETMASK, SIG_UNBLOCK, SigAction, SigFrame, TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGPGRP, TIOCGWINSZ, TIOCSPGRP,
-    Termios, Winsize, console_termios}
+    Termios, Winsize, console_termios, no_fp}
 import keel.console
 import keel.mm
 import keel.sched
@@ -44,6 +45,11 @@ private const NZCV: u64 = 0xf000_0000
 // the PC and the flags but leaves x0-x18 as the handler left them, and `sigtest`'s values computed
 // across a signal come out wrong.
 private const RESTORE_CALLER_SAVED: bool = true
+
+// Off only to show what the frame's FP/SIMD registers are for: with it off the frame holds zeros, so
+// `rt_sigreturn` hands the interrupted code zeroed q registers and FPCR, and /bin/linuxfp's values
+// computed across a handler that uses the unit come out wrong.
+private const SAVE_FP_IN_FRAME: bool = true
 
 // Off only to show what SA_RESTART is for: with it off an interrupted call answers EINTR whatever its
 // handler asked, and `stdsig`'s read of a pipe fails where it should have been made again.
@@ -119,10 +125,13 @@ private mask_back(p: *Process)
 // below its stack pointer. False if that is not memory it may write.
 private push_frame(p: *Process, regs: *u64, sig: u64, a: Action) -> bool
     val s = p.sig
-    var f = SigFrame([0; 31], 0, 0, 0, 0, sig)
+    var f = SigFrame([0; 31], 0, 0, 0, 0, sig, no_fp())
     val w: *u64 = ptr_cast(&f)
     for i in 0..<REGS_WORDS
         w[i] = regs[i]
+    // The FP/SIMD registers are still the interrupted code's: this thread is on its core, and the kernel
+    // never touches them. The handler starts with them as they are.
+    if SAVE_FP_IN_FRAME then sched.save_fp(&f.fp)
     val at = (regs[SP] - u64(sizeof(SigFrame))) & ~u64(15)
     val flags = s.lock.lock()
     val t = sched.current()
@@ -141,7 +150,7 @@ private push_frame(p: *Process, regs: *u64, sig: u64, a: Action) -> bool
 // rt_sigreturn() -> the interrupted x0: every register back from the SigFrame at SP, and the blocked
 // set.
 private[proc] sys_rt_sigreturn(p: *Process, regs: *u64) -> Result[i64, Errno]
-    var f = SigFrame([0; 31], 0, 0, 0, 0, 0)
+    var f = SigFrame([0; 31], 0, 0, 0, 0, 0, no_fp())
     val bytes: *u8 = ptr_cast(&f)
     if !mm.copy_from_user(&p.space, regs[SP], bytes[0..<sizeof(SigFrame)]) then end(p, SIGSEGV, 0)
     val w: *u64 = ptr_cast(&f)
@@ -149,6 +158,10 @@ private[proc] sys_rt_sigreturn(p: *Process, regs: *u64) -> Result[i64, Errno]
     for i in first..<REGS_WORDS
         regs[i] = w[i]
     regs[PSTATE] = f.pstate & NZCV
+    // Straight into this core's registers, which are this thread's until it leaves the core (and then
+    // `switch_locked` saves what was loaded here). FPCR's reserved bits are the frame's to get wrong:
+    // they read as zero and writes to them are ignored.
+    sched.load_fp(&f.fp)
     val s = p.sig
     val flags = s.lock.lock()
     sched.current().user.blocked = f.blocked & ~sched.UNBLOCKABLE
@@ -252,6 +265,29 @@ private[proc] sys_kill(p: *Process, regs: *u64) -> Result[i64, Errno]
     if !found then return Err(ESRCH)
     if !allowed then return Err(EPERM)
     Ok(0)
+
+// tkill(tid, sig), tgkill(tgid, tid, sig) -> 0: musl's `raise` and `abort`. A thread of the caller's
+// own (its pid, or any of its threads' ids) means the caller's process, whichever thread then takes it;
+// any other id is taken as a process's pid, as kill's — which it is for every process with one thread.
+private[proc] sys_tkill(p: *Process, regs: *u64) -> Result[i64, Errno] = thread_kill(p, regs[0], regs[1])
+
+private[proc] sys_tgkill(p: *Process, regs: *u64) -> Result[i64, Errno]
+    if i64(regs[0]) <= 0 then return Err(EINVAL)
+    thread_kill(p, regs[1], regs[2])
+
+private thread_kill(p: *Process, tid: u64, sig: u64) -> Result[i64, Errno]
+    if i64(tid) <= 0 then return Err(EINVAL)
+    val own = tid == p.pid || tid == sched.current().user.tid
+    var args: [2]u64 = [if own then p.pid else tid, sig]
+    sys_kill(p, &args[0])
+
+// rt_sigsuspend(*sigset, sigsetsize) -> EINTR: sleep with the blocked set replaced by `sigset` until a
+// signal not in it arrives; its handler runs under that set, and the old one is back after it. This is
+// ppoll with no descriptors and no timeout, which is what it is on Linux too, near enough.
+private[proc] sys_rt_sigsuspend(p: *Process, regs: *u64) -> Result[i64, Errno]
+    var args: [5]u64 = [0, 0, 0, regs[0], regs[1]]
+    if regs[0] == 0 then return Err(EFAULT)
+    sys_ppoll(p, &args[0])
 
 // Send `sig` to every process in group `pgid`, for the kernel: no permission applies.
 private signal_group(pgid: u64, sig: u64)
