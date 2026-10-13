@@ -2787,6 +2787,17 @@ array already is; a warning where a by-value `self` method is called from a `*se
 counted fields; or a record-level form of `@guards` — a table type whose records the compiler knows are
 reached only under their own lock, so the check could cover the shape instead of being bypassed.
 
+**Fixed in sysl 0.1.0-alpha.12.** A subscript on a type implementing `IndexPlace` is a place, as `Buf`'s
+now is, and a read-only by-value `self` is passed by address. `Table` implements `IndexPlace`, so
+`fs.buffers[i].block` is a field load and `.at` is gone. `Table` itself stays, for its records' fixed
+addresses while it grows, not for copying. Three forms stay because they are the language working as
+designed: a struct parameter taken by value is a copy (hence `*Txn`); `view()` retains the storage
+(hence the raw `*u8` bytes); and a local is released at the end of its scope (hence `data.release()`
+under the cache lock). alpha.12's `Guarded[L, T]` was not adopted, because no KFS record is owned by a
+single lock: an in-memory inode's fields are split between `icache.lock`, `orphans.lock` and its
+`inode.lock`, and most of section 19's locks guard data that lives in buffers. kfs/SPEC.md section 19,
+"Locks are named, not wrapped around records".
+
 ## What worked in milestone 17
 
 - **No sysl gap in the kernel half.** A poller waits on one module `WaitQueue` with an event count under
