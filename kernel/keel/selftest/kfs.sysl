@@ -270,10 +270,23 @@ private power_cut_after_commits(m: *Mounted)
     var why: u64 = 0
     if op(p, () -> pkg.mkdir(p, ROOT_INO, "replay".bytes, 0o755, root())).is_err() then why = 1
     val dir = op(p, () -> pkg.lookup_name(p, ROOT_INO, "replay".bytes)).map((e) -> e.ino).unwrap_or(0)
-    val target = op(p, () -> pkg.create(p, dir, "target".bytes, 0o644, root())).unwrap_or(0)
+    // The target in an inode-table block the directory's inode is not in: every file the commits make
+    // changes the directory's inode, so each of them logs that block, and replaying their copies would
+    // hide whatever happened to the target. Files are made until one lands past the directory's block,
+    // and that one becomes the target.
+    val dir_block = p.inode_location(dir).block
+    var n: u64 = 0
+    var target: u64 = 0
+    loop
+        val name = s"fill$n"
+        val f = op(p, () -> pkg.create(p, dir, name.bytes, 0o644, root())).unwrap_or(0)
+        n += 1
+        if f == 0 || n > 64 then break
+        if p.inode_location(f).block != dir_block
+            if op(p, () -> pkg.rename(p, dir, name.bytes, dir, "target".bytes, 0, root())).is_ok() then target = f
+            break
     if why == 0 && target == 0 then why = 2
     val target_block = p.inode_location(target).block
-    var n: u64 = 0
     loop
         val name = s"fill$n"
         val f = op(p, () -> pkg.create(p, dir, name.bytes, 0o644, root())).unwrap_or(0)
@@ -293,6 +306,7 @@ private power_cut_after_commits(m: *Mounted)
     // replay of their copies would hide whatever happened to it.
     for b in file_blocks
         if why == 0 && b == target_block then why = 6
+    if why == 0 && dir_block == target_block then why = 6
     var change = no_change()
     change.mode = Some(0o600)
     if why == 0 && op(p, () -> pkg.setattr(p, target, change, 0)).is_err() then why = 7
