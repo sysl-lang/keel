@@ -148,7 +148,7 @@ static void check_files(void) {
     struct stat st;
     if (fstat(fd, &st) != 0 || st.st_size != n || !S_ISREG(st.st_mode))
         fail("fstat");
-    if (lseek(fd, 8, SEEK_SET) != 8 || read(fd, back, 3) != 3 || memcmp(back, "cst", 3) != 0)
+    if (lseek(fd, 11, SEEK_SET) != 11 || read(fd, back, 3) != 3 || memcmp(back, "cst", 3) != 0)
         fail("lseek");
     close(fd);
     if (unlink("/m9/cstd.txt") != 0)

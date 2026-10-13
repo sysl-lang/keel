@@ -419,7 +419,7 @@ transcript2=(
     $'# busybox echo hello from busybox\nhello from busybox\n'
     $'# busybox uname -a\nkeel keel 0.18 milestone 18 aarch64 Linux\n'
     $'# busybox ls -l /\ntotal 68\n'
-    $'drwxr-xr-x    2 0        root          1536 Jan  1  1970 \e[1;34mbin\e[m\n'
+    $'drwxr-xr-x    2 0        root          1568 Jan  1  1970 \e[1;34mbin\e[m\n'
     $'drwxr-xr-x    2 0        root            96 Jan  1  1970 \e[1;34mdir\e[m\n'
     $'drwxr-xr-x    2 0        root           160 Jan  1  1970 \e[1;34metc\e[m\n'
     $'-rw-r--r--    1 0        root            19 Jan  1  1970 \e[0;0mhello.txt\e[m\n'
