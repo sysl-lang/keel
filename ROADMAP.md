@@ -26,6 +26,22 @@ the language rather than worked around here.
   so nothing is ruled out for running static Linux binaries later; keel's own calls are numbered from
   1024.
 
+## Beyond QEMU (decided 2026-10-13)
+
+- **keel will not always run under QEMU**: the longer picture is a desktop and embedded boards. Every
+  real aarch64 machine's firmware reads its boot files from **FAT** — UEFI's EFI System Partition on a
+  desktop, the Raspberry Pi's boot partition, U-Boot on a board — so keel reads and writes FAT to manage
+  its own `/boot`, and disks arrive **partitioned** (GPT).
+- **KFS is the root filesystem**; FAT is `/boot` and removable media; an **initramfs** (cpio, read-only)
+  brings a board up before its storage driver exists and is the recovery path when the root will not
+  mount. No second "simple" on-disk filesystem beyond those.
+- **All of it in sysl.** FAT32 is an org package (`sysl-lang/fat`, `sh.sysl.fat`, freestanding, over a
+  block-device trait) because a microcontroller with an SD card needs it as much as keel does; GPT and
+  cpio stay in keel until something else wants them. Each is compiled into the kernel and a host tool,
+  as KFS is.
+- Raw NAND (no controller doing wear-levelling) would need a flash-aware filesystem; not planned until
+  a target needs it. eMMC and SD do their own wear-levelling, so KFS serves them.
+
 ## Milestones
 
 | # | Milestone | Done when |
@@ -49,3 +65,10 @@ the language rather than worked around here.
 | 16 | Threads in a process: `clone`-style thread creation, futex waits, TLS; pthreads in the libc | a ported threaded C program runs on all four cores (kernel ✅ — `/bin/linuxthreads`, a raw-svc aarch64 Linux C program, makes 4 threads with musl's `clone` flags, adds under a futex lock, checks its own TPIDR_EL0, joins by CLONE_CHILD_CLEARTID, takes a signal on the one thread not blocking it, and `procs` shows ≥ 2 of its threads running at once; `exit`/`exit_group`, and `execve` from a thread; the standard library has no thread hook layer, FINDINGS 73. pthreads pending in cstd) |
 | 17 | The rest of a basic POSIX surface: `poll`/`select`, `termios` basics, `clock_gettime`/`nanosleep`, `getcwd`/`opendir` in the libc | a small POSIX-only C program ports unchanged (kernel ✅ — `/bin/linuxpoll`, a raw-svc aarch64 Linux C program: `ppoll`/`pselect6` woken by a thread's write, a close and a child's write, timing out, POLLNVAL/POLLERR/EBADF, their signal masks; `clock_gettime`/`clock_getres`/`clock_nanosleep` TIMER_ABSTIME/`gettimeofday`/`nanosleep` on the generic counter, the wall clock from the PL031; termios by `ioctl` round-tripped, raw mode read with no newline and no echo, ISIG off, VTIME; `login`/`su` read passwords with echo off; the library has no sleep seam nor a terminal-mode surface for a freestanding program, FINDINGS 74, 75. libc wrappers pending in cstd) |
 | 18 | Linux binaries: static musl programs (busybox) run unchanged | a static busybox runs at the shell ✅ (Alpine's `busybox-static` 1.37.0-r31, unmodified, sha256-checked: a static PIE loaded at 0x400000 that relocates itself from the auxiliary vector; from keel's shell `echo`, `uname`, `ls -l`, `cat \| wc`, `sort \| uniq -c`, `find`, `md5sum`/`sha256sum`, `seq \| tr`, `expr`, `stat`, `du`, `date`, `sleep`, its own `sh -c` with loops, `\|\|`, `$?` and a fork+exec pipeline, Ctrl-C of its `sleep`, and an interactive `busybox sh` with line editing; mmap/mprotect with PROT_NONE, a stack that grows to 8 MiB, close-on-exec) |
+| 19 | KFS, the journaled filesystem (`kfs/SPEC.md`, its 13 stages): in the kernel, then the root, then device nodes | stages 1–10 ✅; 11 in the kernel beside the old filesystem; 12 the root, the old filesystem removed; 13 `/dev` |
+| 20 | GPT partitions: the block layer hands each filesystem a partition, not a whole disk | the boot test's disk is partitioned (a FAT `/boot`, the KFS root) and both mount |
+| 21 | FAT32 read and write, as the org package `sh.sysl.fat` | keel mounts the boot partition at `/boot`, writes a file there, and the host's `fsck.fat` finds it clean; the package also builds for a bare Cortex-M |
+| 22 | An initramfs: a cpio archive the firmware or bootloader loads beside the kernel, unpacked read-only | keel boots to a shell from the initramfs with no disk attached, and mounts the KFS root from it |
+| 23 | Booting as real hardware expects: the arm64 `Image` header (U-Boot, the Pi's firmware) and an EFI application (UEFI) | QEMU boots keel through EDK2 firmware from a FAT EFI System Partition |
+| 24 | ACPI beside the device tree, since desktops describe their hardware in ACPI | keel under EDK2 with `-machine acpi=on` finds its UART, GIC and timer from the tables |
+| 25 | A first real board (the Pi Zero 2 W or a Pi 5 — not chosen) | keel prints `keel: hello` on its serial port and reaches a shell from the initramfs |
