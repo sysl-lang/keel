@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -159,6 +160,29 @@ static void check_files(void) {
            (long)st.st_size, strerror(errno));
 }
 
+/* sigsetjmp with savemask: the mask at sigsetjmp comes back at siglongjmp. Linux's kernel set is one
+   64-bit word (SIGUSR1 = 10 is bit 9); how is SIG_BLOCK 0 or SIG_SETMASK 2. cstd's <signal.h> has no
+   sigset_t yet, so the prototype is spelled with a word. */
+int sigprocmask(int how, const void *set, void *old);
+static sigjmp_buf env;
+
+static void check_sigsetjmp(void) {
+    unsigned long usr1 = 1UL << 9, none = 0, now = 0;
+    volatile int jumped = 0;
+    if (sigprocmask(0, &usr1, 0) != 0)
+        fail("sigprocmask");
+    if (sigsetjmp(env, 1) == 0) {
+        sigprocmask(2, &none, 0);
+        jumped = 1;
+        siglongjmp(env, 5);
+    }
+    sigprocmask(0, 0, &now);
+    if (!jumped || (now & usr1) == 0)
+        fail("siglongjmp did not restore the mask");
+    sigprocmask(2, &none, 0);
+    printf("cstdhello: sigsetjmp saved a blocked SIGUSR1 and siglongjmp put it back\n");
+}
+
 int main(int argc, char **argv) {
     if (atexit(handler_a) != 0 || atexit(handler_b) != 0 || atexit(handler_c) != 0)
         fail("atexit");
@@ -166,6 +190,7 @@ int main(int argc, char **argv) {
     check_args(argc, argv);
     check_malloc();
     check_files();
+    check_sigsetjmp();
     if (getpid() <= 1 || getppid() <= 0 || getppid() == getpid())
         fail("getpid");
     printf("cstdhello: getpid and getppid answered a child of the shell\n");

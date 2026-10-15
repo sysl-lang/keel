@@ -11,6 +11,8 @@
 #   KEEL_ACCEL=tcg scripts/boot-test.sh   run under TCG (-cpu cortex-a72) instead of HVF
 #   KEEL_SYSL=<path>/bin/sysl scripts/boot-test.sh   build with that compiler instead of `sysl`
 #   KEEL_CSTD=<checkout> scripts/boot-test.sh   link /bin/cstdhello against that cstd (default ~/dev/sysl-lang/cstd)
+#   KEEL_KFS=<checkout> scripts/boot-test.sh    build the kernel (`--lib`) and KFS's host tools from that
+#                                               kfs checkout instead of the tag kernel/package.hocon names
 #
 # QEMU installs its own SIGALRM handler, so an alarm cannot bound it; the watchdog below kills it by
 # PID instead.
@@ -32,6 +34,27 @@ opt=${KEEL_OPT:-}
 accel=${KEEL_ACCEL:-hvf}
 compiler=${KEEL_SYSL:-sysl}
 cstd=${KEEL_CSTD:-$HOME/dev/sysl-lang/cstd}
+
+# KFS is the package github.com/sysl-lang/kfs. The kernel gets it as a coordinate; its host tools
+# (mkfs.kfs, kfsdump, fsck.kfs) are programs in that repository, built here from a checkout of the very
+# tag the kernel's manifest names (cloned once into scratch/), or from KEEL_KFS, which then also stands
+# in for the coordinate in every build of the workspace.
+kfs_line=${(M)${(f)"$(<$root/kernel/package.hocon)"}:#*github.com/sysl-lang/kfs*}
+kfs_version=${${kfs_line#*version = \"}%%\"*}
+kfs_lib=()
+if [[ -n ${KEEL_KFS:-} ]]; then
+    kfs_src=${KEEL_KFS:A}
+    kfs_lib=(--lib $kfs_src)
+else
+    kfs_src=$out/kfs-$kfs_version
+    if [[ ! -f $kfs_src/package.hocon ]]; then
+        rm -rf $kfs_src
+        if ! git clone -q --depth 1 --branch v$kfs_version https://github.com/sysl-lang/kfs $kfs_src; then
+            print -r -- "FAIL: kfs v$kfs_version is not in $kfs_src and could not be cloned"
+            return 1
+        fi
+    fi
+fi
 
 # Every boot prints these, in order. `user_line` is where each boot's own line goes: what the `files`
 # program says about the previous boot's /out.txt.
@@ -426,6 +449,7 @@ transcript2=(
     $'cstdhello: argv: 3 cstdhello one two; GREETING=hi among '
     $' environment strings\ncstdhello: malloc: 3000 blocks checked, 1000 grown by realloc, a '
     $'-byte block reused the freed run\ncstdhello: files: wrote, read back, sought and unlinked /m9/cstd.txt (16 bytes); then No such file or directory\n'
+    $'cstdhello: sigsetjmp saved a blocked SIGUSR1 and siglongjmp put it back\n'
     $'cstdhello: getpid and getppid answered a child of the shell\ncstdhello: atexit: 3 handlers ran last-registered first\n# echo $?\n0\n'
     # Milestone 17: a third raw-svc Linux program. ppoll and pselect6 woken by a thread's write, a close and a
     # child's write, timing out, POLLNVAL/POLLERR/EBADF, their signal masks; the clocks; termios, and raw
@@ -523,7 +547,7 @@ shutdown=(
 not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login ended by signal"
     "keel: processes left unreaped" "keel: processes still running before init" "linuxpoll: FAILED"
     "linuxfp: FAILED" "threads: FAILED" "cstdhello: FAILED" "linuxtcp: FAILED" "host: curl FAILED"
-    "keel: kfs smp wrong" "keel: kfs replay wrong" "keel: kfs power cut wrong" "keel: kfs heap wrong" "keel.kfs:"
+    "keel: kfs smp wrong" "keel: kfs replay wrong" "keel: kfs power cut wrong" "keel: kfs heap wrong" "keel.kfs:" "sh.sysl.kfs:"
     "keelroot" "wonderland" "nope")
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
@@ -550,12 +574,14 @@ sector 13 90 > $out/sector2.expected
 
 # The host's mkfs, the user programs and the kernel. The programs are not in the kernel's image: they
 # go into the filesystem's /bin, and the kernel reads each from there when it starts one.
-$compiler build -o $mkfs $root/tools/mkfs
+# Every member resolves with the workspace, kfs's coordinate included, so KEEL_KFS's `--lib` goes on
+# every build of one.
+$compiler build $kfs_lib -o $mkfs $root/tools/mkfs
 mkdir -p $out/user
 for prog in $user_programs; do
-    $compiler build --target aarch64-freestanding ${opt:+$opt} -o $out/user/$prog.elf $root/user/$prog
+    $compiler build --target aarch64-freestanding ${opt:+$opt} $kfs_lib -o $out/user/$prog.elf $root/user/$prog
 done
-$compiler build --target aarch64-freestanding ${opt:+$opt} -o $elf $root/kernel
+$compiler build --target aarch64-freestanding ${opt:+$opt} $kfs_lib -o $elf $root/kernel
 
 # A static aarch64 Linux program, built with a Linux target's toolchain and no keel header: it proves
 # that keel's system-call numbers are Linux's. LLVM's clang and ld.lld from Homebrew unless told otherwise.
@@ -647,9 +673,9 @@ $mkfs build $disk 4096 $fsroot $owners
 # The same tree and owners go into a 32 MiB KFS image through mkfs.kfs (the kernel does not mount it yet):
 # it has to be fsck-clean, and big files must read back byte for byte through kfsdump.
 kfs_disk=$out/kfs-disk.img
-$compiler build -o $out/mkfs.kfs $root/tools/mkfs-kfs
-$compiler build -o $out/kfsdump $root/tools/kfsdump
-$compiler build -o $out/fsck.kfs $root/tools/fsck-kfs
+$compiler build -o $out/mkfs.kfs $kfs_src/tools/mkfs-kfs
+$compiler build -o $out/kfsdump $kfs_src/tools/kfsdump
+$compiler build -o $out/fsck.kfs $kfs_src/tools/fsck-kfs
 if ! $out/mkfs.kfs $kfs_disk 8192 -d $fsroot -o $owners; then
     echo "host: mkfs.kfs could not build the fsroot into 32 MiB"
     exit 1

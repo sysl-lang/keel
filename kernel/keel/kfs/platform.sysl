@@ -39,7 +39,7 @@ module keel.kfs
 // record stamped before the start of the oldest operation still running is held by none of them
 // (`oldest_op`), and only such a record is dropped.
 
-import kfs.keel.kfs.{Fatal, LockId, Platform, Time, rank}
+import sh.sysl.kfs.{Fatal, LockId, Platform, Time, rank}
 import keel.sched
 import keel.sched.{IrqLock, Thread, WaitQueue}
 import keel.timer
