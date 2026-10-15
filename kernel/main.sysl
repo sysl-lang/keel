@@ -124,7 +124,7 @@ kmain(dtb_pa: u64) -> never
     selftest.files()
 
     // Milestone 11: the network, from the kernel and then from a user program. It stays up for the
-    // session, whose programs use TCP (milestone 19), and comes down after it.
+    // session, whose programs use TCP (milestone 11b), and comes down after it.
     val network = selftest.network()
 
     // Milestone 10: init and the shell, on the console, until the shell exits.

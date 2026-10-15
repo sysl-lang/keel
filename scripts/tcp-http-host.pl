@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-# The host's half of keel's HTTP test (milestone 19). keel's session starts a background `busybox nc -l`
+# The host's half of keel's HTTP test (milestone 11b). keel's session starts a background `busybox nc -l`
 # on a port QEMU forwards from 127.0.0.1:<http port>, its input an HTTP/1.0 response whose body is
 # /bin/busybox, then waits in a second `busybox nc -l` on another forwarded port. This fetches the
 # response with curl — retrying while keel is not listening yet — compares the body byte for byte with

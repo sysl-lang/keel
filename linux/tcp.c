@@ -1,5 +1,5 @@
 /* A static aarch64 Linux program, like poll.c: no C library, no keel header, only raw system calls by
-   Linux's numbers. It is milestone 19's proof of keel's TCP through Linux's socket ABI.
+   Linux's numbers. It is milestone 11b's proof of keel's TCP through Linux's socket ABI.
 
    linuxtcp echo <port> [<n>]
        Listens on <port> (any address), accepts one connection with accept4(SOCK_CLOEXEC), sends the
@@ -784,8 +784,8 @@ static void zero_window(void) {
     }
     struct conn_stats sender = conn_stats(c);
     struct conn_stats receiver = conn_stats(a);
-    check(sender.probes > 0, "no zero-window probe was sent; probes", (long)sender.probes);
     check(receiver.beyond_window == 0, "segments arrived past the advertised window:", (long)receiver.beyond_window);
+    check(sender.probes > 0, "no zero-window probe was sent; probes", (long)sender.probes);
     sc(SYS_close, a, 0, 0, 0, 0, 0);
     sc(SYS_close, c, 0, 0, 0, 0, 0);
     sc(SYS_close, l, 0, 0, 0, 0, 0);

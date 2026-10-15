@@ -25,7 +25,7 @@ out=$root/scratch
 mkdir -p $out
 
 limit=${KEEL_TIMEOUT:-60}
-# Milestone 19's host ports, forwarded by QEMU to keel's TCP ports 8100 and 8101 (linuxtcp's echo, plain
+# Milestone 11b's host ports, forwarded by QEMU to keel's TCP ports 8100 and 8101 (linuxtcp's echo, plain
 # and with drops), 8080 and 8081 (two busybox nc listeners); the fifth is a web server on the host
 # that keel's wget reaches through slirp's gateway, 10.0.2.2.
 tcp_port=${KEEL_TCP_PORT:-15100}
@@ -496,7 +496,7 @@ transcript2=(
     $'# busybox md5sum /hello.txt\n'"$(print -n 'hello from the disk' | md5 -q)"$'  /hello.txt\n'
     $'# busybox sha256sum /m9/big.bin\n'"$(perl -e 'srand(9); print map { chr(int(rand(256))) } 1..204800' | shasum -a 256 | cut -d' ' -f1)"$'  /m9/big.bin\n'
     $'# busybox seq 3 | busybox tr \'\\n\' \' \'\n1 2 3 # busybox expr 6 * 7\n42\n'
-    # Milestone 19: TCP. linuxtcp's edge cases run client and server on keel itself, over 127.0.0.1.
+    # Milestone 11b: TCP. linuxtcp's edge cases run client and server on keel itself, over 127.0.0.1.
     $'# linuxtcp edges\nlinuxtcp: connect to a closed port: ECONNREFUSED; nonblocking, EINPROGRESS then POLLERR|POLLHUP and SO_ERROR\n'
     $'linuxtcp: half-close: ping, end of stream, pong, end of stream; a write after SHUT_WR is EPIPE\n'
     $'linuxtcp: peer closed: its bytes, the end, then EPIPE with SIGPIPE, without it for MSG_NOSIGNAL; closed unread: ECONNRESET, then the end\n'
@@ -534,7 +534,7 @@ transcript2=(
     "keel: every process reaped"
 )
 shutdown=(
-    # Milestone 19: the network stays up for the session (its programs use TCP) and comes down after it.
+    # Milestone 11b: the network stays up for the session (its programs use TCP) and comes down after it.
     "keel: network down, sockets closed"   # the stack's thread joined; no descriptor stands for any socket
     "keel: tcp table empty, every ring's frames back"   # what TIME_WAIT still held was dropped, its frames freed
     "keel: fs synced at shutdown"   # the dirty blocks went to the disk before the power did
@@ -732,7 +732,7 @@ tcp_forwards=$tcp_forwards,hostfwd=tcp:127.0.0.1:$((tcp_port + 2))-:8080,hostfwd
 nic=(-netdev user,id=n0,hostfwd=udp:127.0.0.1:$udp_port-:7,hostfwd=udp:127.0.0.1:$user_udp_port-:8007,$tcp_forwards
      -device virtio-net-device,netdev=n0)
 
-# Milestone 19: the file keel's wget fetches from the host, 2 MiB of perl's srand(23) (transcript2 has
+# Milestone 11b: the file keel's wget fetches from the host, 2 MiB of perl's srand(23) (transcript2 has
 # its sha256), served by http-file-server.pl on 127.0.0.1:$wget_port during boot 2.
 www=$out/www
 rm -rf $www
@@ -802,7 +802,7 @@ boot() {
     local kclient=$!
     perl $root/scripts/udp-echo-client.pl $user_udp_port $limit user > $udp_log.user 2>&1 &
     local uclient=$!
-    # Boot 2's session runs milestone 19's TCP tests, with their host halves started here.
+    # Boot 2's session runs milestone 11b's TCP tests, with their host halves started here.
     local tcp_log=$out/tcp$name.log tcp_pids=()
     if [[ $name == 2 ]]; then
         perl $root/scripts/tcp-echo-client.pl $tcp_port 4194304 $limit plain > $tcp_log.plain 2>&1 &

@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-# The host's half of keel's TCP echo test (milestone 19): connect to 127.0.0.1:<port>, which QEMU's
+# The host's half of keel's TCP echo test (milestone 11b): connect to 127.0.0.1:<port>, which QEMU's
 # user-mode network forwards to keel, wait for keel's `linuxtcp echo` to say "keel ready", then send
 # <bytes> bytes of a deterministic stream while reading the echo back, half-close, and check every byte
 # that comes back, in order, until keel's half-close. Writing and reading share one select loop, so

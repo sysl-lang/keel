@@ -229,10 +229,13 @@ private random32() -> u32
     z = (z ^ (z >> 27)) * MIX2
     u32((z ^ (z >> 31)) & 0xffff_ffff)
 
-// Something a caller or a poller may be waiting for has changed.
-private changed()
+// Something a caller or a poller may be waiting for has changed on connection `i`. The pollers are told
+// only when a descriptor stands for it or a listener's queue holds it: keel's poll count is one for the
+// whole system (keel.sched's poll.sysl), so an orphan finishing its close in the stack's own time would
+// otherwise wake every poller for nothing — and hide a missing notification from the boot test.
+private changed(i: usize)
     events.wake_all()
-    poll_notify()
+    if tcbs[i].refs > 0 || tcbs[i].parent != 0 then poll_notify()
 
 private synchronized(s: u8) -> bool = s >= ESTABLISHED
 
@@ -526,7 +529,7 @@ private become_closed(i: usize)
     t.shut_wr = true
     t.snd_len = 0
     if t.refs == 0 then free_slot(i)
-    changed()
+    changed(i)
 
 private enter_time_wait(i: usize)
     val t = &tcbs[i]
@@ -535,7 +538,7 @@ private enter_time_wait(i: usize)
     t.persist_at = 0
     t.tw_at = now_ms() + 2 * MSL_MS
     if t.refs == 0 then drop_buffers(i)
-    changed()
+    changed(i)
 
 // An acceptable RST (RFC 9293 § 3.10.7.4, second check).
 private reset_received(i: usize)
@@ -565,7 +568,7 @@ private queue_fin(i: usize)
     else if t.state == CLOSE_WAIT
         t.state = LAST_ACK
     output(i)
-    changed()
+    changed(i)
 
 // -- Receiving -----------------------------------------------------------------------------------------
 
@@ -730,7 +733,7 @@ private syn_sent_input(i: usize, s: Seg)
         t.was_connected = true
         t.ack_now = true
         output(i)
-        changed()
+        changed(i)
     else
         // A simultaneous open: both sides sent a SYN.
         t.state = SYN_RECEIVED
@@ -798,7 +801,7 @@ private segment_input(i: usize, s: Seg)
         if t.parent != 0
             t.born = tcp.born
             tcp.born += 1
-        changed()
+        changed(i)
     else
         if before(t.snd_una, s.ack) && not_after(s.ack, t.snd_max)
             acked(i, s.ack)
@@ -820,7 +823,7 @@ private segment_input(i: usize, s: Seg)
             if t.state == FIN_WAIT_1
                 t.state = FIN_WAIT_2
                 if t.refs == 0 then t.tw_at = now_ms() + ORPHAN_FIN_WAIT_2_MS
-                changed()
+                changed(i)
             else if t.state == CLOSING
                 enter_time_wait(i)
             else if t.state == LAST_ACK
@@ -873,12 +876,13 @@ private segment_input(i: usize, s: Seg)
             enter_time_wait(i)
         else if t.state == TIME_WAIT
             t.tw_at = now_ms() + 2 * MSL_MS
-        changed()
+        changed(i)
     output(i)
 
 // The peer acknowledged up to `ack`, past SND.UNA. Holding `lock`.
 private acked(i: usize, ack: u32)
     val t = &tcbs[i]
+    val was_full = t.snd_len == TCP_BUF
     val data = min_size(usize(ack - t.snd_una), t.snd_len)
     t.snd_start = (t.snd_start + data) % TCP_BUF
     t.snd_len -= data
@@ -904,7 +908,9 @@ private acked(i: usize, ack: u32)
         t.dupacks = 0
     if t.cwnd > MAX_CWND then t.cwnd = MAX_CWND
     t.rtx_at = if t.snd_una == t.snd_max then 0 else now_ms() + t.rto
-    if data > 0 then changed()
+    // Room in the send ring matters only to a writer that found it full (asleep on `events`) and to a
+    // poller waiting for POLLOUT, which a ring with room already answers; so only then is it an event.
+    if data > 0 && was_full then changed(i)
 
 // An ACK at SND.UNA again: the third such in a row with data in flight retransmits and starts fast
 // recovery (RFC 5681 § 3.2, RFC 6582); each further one inflates the window by a segment. Unlike RFC
@@ -977,7 +983,7 @@ tcp_release(i: usize)
         t.tw_at = now_ms() + ORPHAN_FIN_WAIT_2_MS
     else if s == TIME_WAIT
         drop_buffers(i)
-    changed()
+    changed(i)
 
 // Whether `port` may be bound by `i` (SO_REUSEADDR lets it share a port with anything but a listener).
 private port_free(i: usize, port: u16) -> bool
@@ -1183,7 +1189,7 @@ tcp_shutdown(i: usize, how: u64) -> Result[unit, NetError]
     if !synchronized(t.state) then return Err(NetError.NotConnected)
     if how == 0 || how == 2
         t.shut_rd = true
-        changed()
+        changed(i)
     if how == 1 || how == 2
         if t.state == ESTABLISHED || t.state == CLOSE_WAIT
             queue_fin(i)

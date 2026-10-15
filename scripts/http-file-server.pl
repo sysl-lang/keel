@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-# A web server on the host for keel's wget test (milestone 19): on 127.0.0.1:<port>, which keel reaches
+# A web server on the host for keel's wget test (milestone 11b): on 127.0.0.1:<port>, which keel reaches
 # as 10.0.2.2:<port> through slirp, every GET of /<name> is answered with the file <file> (HTTP/1.0, its
 # length given), anything else with 404. One connection at a time; it runs until killed. (Python's
 # http.server would do, but it asks the resolver for the address's name first, which can hang.)
