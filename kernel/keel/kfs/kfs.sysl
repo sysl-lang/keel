@@ -31,8 +31,8 @@ module keel.kfs
 // a record is forgotten only when it is idle (`idle_core`: nothing holds the inode open, it is off the
 // orphan list, everything that changed it has committed, no operation can hold it).
 
-import kfs.keel.kfs as pkg
-import kfs.keel.kfs.{BlockDevice, Fs, FsError, LockId, Platform, TABLE_MAX}
+import sh.sysl.kfs as pkg
+import sh.sysl.kfs.{BlockDevice, Fs, FsError, LockId, Platform, TABLE_MAX}
 import keel.sched
 import keel.sched.Thread
 import keel.timer
@@ -40,9 +40,11 @@ import sysl.sync.{Atomic, Ordering}
 
 type KFs = Fs[KfsDisk, KernelPlatform]
 
-// The cache targets; the tables' room is BUFFER_SLOTS and INODE_SLOTS (platform.sysl).
+// The cache targets; the tables' room is BUFFER_SLOTS and INODE_SLOTS (platform.sysl). The slack is
+// small enough that the boot test's four threads always push the cache past it: their working set
+// peaks at 24-27 buffers, and with a slack of 8 a build whose timing kept it at 24 never trimmed at all.
 const CACHE_TARGET: usize = 16
-private const CACHE_SLACK: usize = 8
+private const CACHE_SLACK: usize = 4
 const ICACHE_TARGET: usize = 16
 
 // How long the commit thread naps between passes when nobody asks for one.

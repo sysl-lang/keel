@@ -18,7 +18,7 @@ module keel.kfs
 // and each block it holds in a frame, so it holds no count and needs no allocation but frames; it has
 // room for every block of the disk at once, so it is never full.
 
-import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice, DeviceError}
+import sh.sysl.kfs.{BLOCK_SIZE, BlockDevice, DeviceError}
 import keel.mm
 import keel.sched.{Mutex, mutex}
 import keel.virtio

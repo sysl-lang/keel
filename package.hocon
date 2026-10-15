@@ -1,12 +1,12 @@
 // keel's workspace: the kernel, and the user programs it carries inside its image.
 //
-//   kernel        the kernel (an image QEMU boots)
+//   kernel        the kernel (an image QEMU boots); it depends on KFS (github.com/sysl-lang/kfs)
 //   user/abi      the system call numbers and error codes, shared by both sides
 //   user/rt       a user program's runtime: its entry, the system call wrappers, `putchar`, a heap
 //   user/<prog>   one user program each, linked low (user/user.ld) and embedded in the kernel
 //   ondisk        the filesystem's on-disk structs, compiled into both the kernel and mkfs
-//   kfs           KFS, the new filesystem (kfs/SPEC.md): its format and algorithms, for both sides
-//   kfshost       KFS on the host: the image-file block device, entropy and clock
 //   tools/mkfs    a host program: builds, checks and reads filesystem images
-//   tools/mkfs-kfs, tools/kfsdump   host programs for KFS images (mkfs.kfs, kfsdump)
-workspace = ["kernel", "user/*", "ondisk", "kfs", "kfshost", "tools/*"]
+//
+// KFS's host tools (mkfs.kfs, kfsdump, fsck.kfs) live in the kfs repository; scripts/boot-test.sh
+// builds them from a checkout of the tag the kernel depends on.
+workspace = ["kernel", "user/*", "ondisk", "tools/*"]

@@ -22,8 +22,8 @@ import keel.kfs.{CACHE_TARGET, ICACHE_TARGET, KFs, Mounted, cache_stats, keep_ca
     op, pause_committer, power_cut, unmount}
 import keel.sched.{Thread, join, spawn}
 import keel.virtio
-import kfs.keel.kfs as pkg
-import kfs.keel.kfs.{BLOCK_SIZE, Caller, DIR_POS_END, FsError, ROOT_INO, SetAttr, no_change}
+import sh.sysl.kfs as pkg
+import sh.sysl.kfs.{BLOCK_SIZE, Caller, DIR_POS_END, FsError, ROOT_INO, SetAttr, no_change}
 import sysl.buf.{Buf, buf}
 import sysl.sync.{Atomic, Ordering}
 
