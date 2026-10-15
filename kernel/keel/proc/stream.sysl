@@ -260,7 +260,8 @@ private[proc] sys_getsockopt(p: *Process, regs: *u64) -> Result[i64, Errno]
         return Ok(0)
     if level == SOL_KEEL && f.holds == Holds.Stream && opt == KEEL_CONN_STATS
         val s = net.tcp_conn_stats(usize(f.ino))
-        var k = KeelConnStats(s.retransmits, s.timeouts, s.fast_retransmits, s.probes, s.dropped, s.beyond_window)
+        var k = KeelConnStats(s.retransmits, s.timeouts, s.fast_retransmits, s.probes, s.dropped, s.beyond_window,
+            s.unacked, s.acks_ahead)
         put_option(p, out, len_va, ptr_cast(&k), sizeof(KeelConnStats))?
         return Ok(0)
     if level == SOL_KEEL && opt == KEEL_TCP_TABLE

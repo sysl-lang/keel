@@ -42,6 +42,13 @@ network() -> bool
             else
                 print("keel: udpecho", proc.why(p))
         Err(_) -> print("keel: udpecho did not load")
+
+    // TCP's fast retransmit resends no more than was sent (keel.net's `tcp_resend_check`).
+    val (carried, sent) = net.tcp_resend_check()
+    if carried == sent && sent > 0
+        print("keel: tcp fast retransmit resent", carried, "bytes, only what was sent")
+    else
+        print("keel: tcp fast retransmit resent", carried, "bytes where", sent, "were sent")
     true
 
 private const USER_ECHO_PORT: string = "8007"

@@ -57,6 +57,14 @@ private var loop_frames: [LOOP_SLOTS][ETH_MAX]u8
 private var loop_lens: [LOOP_SLOTS]usize
 private var loop_head: usize = 0
 private var loop_count: usize = 0
+
+// Take the newest frame back out of the loopback ring before the stack's thread sees it, answering its
+// length: tcp.sysl's `tcp_resend_check` measures a segment this way. Holding `lock`.
+private[net] loop_take_newest() -> Option[usize]
+    if loop_count == 0 then return None
+    loop_count -= 1
+    Some(loop_lens[(loop_head + loop_count) % LOOP_SLOTS])
+
 const ECHO_PORT: u16 = 7
 
 // Off only to show the receiving side checks: with it on, every IPv4 header keel sends carries a

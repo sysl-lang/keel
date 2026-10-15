@@ -488,7 +488,9 @@ const KEEL_CONN_STATS: u64 = 2
 const KEEL_TCP_TABLE: u64 = 3
 
 // One connection: retransmissions, those after a timeout, those on a third duplicate ACK, zero-window
-// probes, segments dropped by KEEL_DROP_EVERY, segments received with data past the advertised window.
+// probes, segments dropped by KEEL_DROP_EVERY, segments received with data past the advertised window;
+// then what is sent and not yet acknowledged (bytes, and 1 for a FIN), and ACKs received for what was
+// never sent.
 struct KeelConnStats
     retransmits: u64
     timeouts: u64
@@ -496,6 +498,8 @@ struct KeelConnStats
     probes: u64
     dropped: u64
     beyond_window: u64
+    unacked: u64
+    acks_ahead: u64
 
 // The whole table: connections other than TIME_WAIT, those in TIME_WAIT, frames held by their rings, and
 // since the network came up retransmissions, bad checksums received, and SYNs dropped by a full backlog.

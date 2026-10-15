@@ -77,6 +77,7 @@ private const RESPECT_WINDOW: bool = true       // send past the peer's window: 
 private const HONOUR_FIN: bool = true           // a peer's FIN ignored: a reader never sees the end
 private const HONOUR_RST: bool = true           // an RST ignored: a refused connect waits out its SYN retries
 private const DATA_WAKES_POLLERS: bool = true   // arriving data does not notify the pollers
+private const RESEND_ONLY_SENT: bool = true     // a fast retransmit sends a whole MSS, past what was ever sent
 
 // The states (RFC 9293 § 3.3.2), as numbers: the table is module storage that starts zeroed, and an enum
 // has no zero (a zeroed tag names no variant), so a slot's state is a byte and CLOSED is 0. Every state
@@ -170,10 +171,12 @@ private struct Tcb
     probes: u64
     dropped: u64
     beyond_window: u64
+    acks_ahead: u64
 
 // What happened to one connection: retransmissions in all, those on a timeout and those on a third
 // duplicate ACK, zero-window probes sent, segments the drop control dropped, and segments received with
-// data past the window this side advertised.
+// data past the window this side advertised; then what is sent and not yet acknowledged (bytes, and 1 for
+// a FIN), and ACKs received for what was never sent (each refused).
 struct TcpConnStats
     retransmits: u64
     timeouts: u64
@@ -181,6 +184,8 @@ struct TcpConnStats
     probes: u64
     dropped: u64
     beyond_window: u64
+    unacked: u64
+    acks_ahead: u64
 
 // The whole table: slots in use other than TIME_WAIT, slots in TIME_WAIT, frames held by rings, and
 // since `up` retransmissions, segments with a bad checksum, and SYNs dropped for a full backlog.
@@ -424,10 +429,14 @@ private send_data(i: usize)
         if t.rtx_at == 0 then t.rtx_at = now_ms() + t.rto
         if (flags & TCP_FIN) != 0 then break
 
-// One segment again from SND.UNA, leaving SND.NXT where it is: the fast retransmit. Holding `lock`.
+// One segment again from SND.UNA, leaving SND.NXT where it is: the fast retransmit. Only what was sent
+// before is sent again, never past SND.MAX: bytes the ring holds beyond it may be ones the window has not
+// let out yet, and a receiver that took them would acknowledge past SND.MAX — an ACK this side must refuse
+// (RFC 9293 § 3.10.7.4), so SND.UNA would stop there. Holding `lock`.
 private resend_first(i: usize)
     val t = &tcbs[i]
-    val n = min_size(t.snd_len, usize(t.mss))
+    val sent = if RESEND_ONLY_SENT then min_size(usize(t.snd_max - t.snd_una), t.snd_len) else t.snd_len
+    val n = min_size(sent, usize(t.mss))
     var flags = TCP_ACK
     if n == t.snd_len && t.fin_queued && before(t.fin_seq, t.snd_max) then flags = flags | TCP_FIN
     if n == 0 && (flags & TCP_FIN) == 0 then return
@@ -808,6 +817,7 @@ private segment_input(i: usize, s: Seg)
         else if s.ack == t.snd_una
             duplicate_ack(i, s)
         else if before(t.snd_max, s.ack)
+            t.acks_ahead += 1
             t.ack_now = true
             output(i)
             return
@@ -1279,7 +1289,9 @@ tcp_conn_stats(i: usize) -> TcpConnStats
     val flags = lock.lock()
     defer lock.unlock(flags)
     val t = &tcbs[i]
-    TcpConnStats(t.retransmits, t.timeouts, t.fast_retransmits, t.probes, t.dropped, t.beyond_window)
+    val fin = if t.fin_queued && !before(t.fin_seq, t.snd_una) then 1u64 else 0u64
+    TcpConnStats(t.retransmits, t.timeouts, t.fast_retransmits, t.probes, t.dropped, t.beyond_window,
+        u64(t.snd_len) + fin, t.acks_ahead)
 
 tcp_table() -> TcpTable
     val flags = lock.lock()
@@ -1299,6 +1311,45 @@ tcp_sockets_held() -> usize
     for i in 0..<TCP_SOCKETS
         if tcbs[i].used && tcbs[i].refs > 0 then n += 1
     n
+
+// The fast retransmit's bound, checked from the inside (keel.selftest's `network`, before any program
+// runs): a connection over the loopback with 300 bytes in flight of 5000 in its send ring, each window
+// open, has `resend_first` called on it, and the segment it put on the loopback ring is measured and taken
+// back before the stack's thread sees it. Answers the bytes that segment carried and the bytes that were
+// in flight, which must be the same; (0, 0) if no slot or rings could be had. A test through the socket
+// calls cannot catch a resend that runs past SND.MAX: the sender's next `send_data` follows it at once
+// and covers the overrun before the receiver's ACK comes back, unless the window is all but shut — the
+// case that, once in a while, set two loopback ends acknowledging each other for ever in `netd`.
+tcp_resend_check() -> (usize, usize)
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    val i = take_slot() match
+        Some(i) -> i
+        None -> return (0, 0)
+    if !give_buffers(i)
+        free_slot(i)
+        return (0, 0)
+    val in_flight: u32 = 300
+    val t = &tcbs[i]
+    t.state = ESTABLISHED
+    t.local_ip = 0x7f00_0001
+    t.remote_ip = 0x7f00_0001
+    t.local_port = 9
+    t.remote_port = 9
+    t.iss = random32()
+    t.snd_una = t.iss + 1
+    t.snd_nxt = t.snd_una + in_flight
+    t.snd_max = t.snd_nxt
+    t.snd_len = 5000
+    t.snd_wnd = u32(TCP_BUF)
+    t.mss = u32(TCP_MSS)
+    t.cwnd = 4 * t.mss
+    resend_first(i)
+    val carried = loop_take_newest() match
+        Some(n) -> n - PAYLOAD_AT - TCP_HEADER
+        None -> 0
+    free_slot(i)
+    (carried, usize(in_flight))
 
 // The stack is down: every connection is dropped where it stands and its rings given back.
 private[net] tcp_down()

@@ -3,9 +3,10 @@
 
    linuxtcp echo <port> [<n>]
        Listens on <port> (any address), accepts one connection with accept4(SOCK_CLOEXEC), sends the
-       line "keel ready", then echoes every byte until the peer half-closes, half-closes in turn and
-       reports how many bytes it echoed. With <n>, the connection drops every <n>th segment it would
-       send (keel's own KEEL_DROP_EVERY option), and the run must show retransmissions, some after a
+       line "keel ready", then echoes every byte until the peer half-closes, half-closes in turn, waits
+       until every byte is acknowledged (no ACK may ever have come for a byte not yet sent), and reports
+       how many bytes it echoed. With <n>, the connection drops every <n>th segment it would send
+       (keel's own KEEL_DROP_EVERY option), and the run must show retransmissions, some after a
        timeout. scripts/tcp-echo-client.pl is the other end, on the host, through slirp.
 
    linuxtcp edges
@@ -331,7 +332,7 @@ static int poll_one(long fd, short events, long ms) {
 }
 
 struct conn_stats {
-    u64 retransmits, timeouts, fast_retransmits, probes, dropped, beyond_window;
+    u64 retransmits, timeouts, fast_retransmits, probes, dropped, beyond_window, unacked, acks_ahead;
 };
 
 struct tcp_table {
@@ -407,10 +408,17 @@ static void echo(long port, long drop) {
         total += n;
     }
     check(sc(SYS_shutdown, c, SHUT_WR, 0, 0, 0, 0) == 0, "shutdown(SHUT_WR) refused on", c);
-    /* The peer closes once it has every byte; wait for that, so every retransmission is counted. */
+    /* The peer half-closed first, so this read ends at once. */
     long r = sc(SYS_read, c, (long)big, sizeof(big), 0, 0, 0);
     check(r == 0, "the read after the echo answered", r);
+    /* Wait until every byte and the FIN are acknowledged, so every retransmission is counted and a
+       connection that stopped making progress is caught here rather than as a short echo on the host. */
+    long began = now();
     struct conn_stats s = conn_stats(c);
+    while (s.unacked != 0 && now() - began < 30 * SEC) {
+        nap(10);
+        s = conn_stats(c);
+    }
     sc(SYS_close, c, 0, 0, 0, 0, 0);
     sc(SYS_close, l, 0, 0, 0, 0, 0);
     put("linuxtcp: echoed ");
@@ -431,6 +439,8 @@ static void echo(long port, long drop) {
     }
     put("\n");
     flush();
+    check(s.unacked == 0, "bytes still unacknowledged 30 s after the echo:", (long)s.unacked);
+    check(s.acks_ahead == 0, "ACKs came for bytes never sent:", (long)s.acks_ahead);
     if (drop > 0) {
         check(s.dropped > 0, "nothing was dropped:", (long)s.dropped);
         check(s.retransmits > 0, "nothing was retransmitted:", (long)s.retransmits);

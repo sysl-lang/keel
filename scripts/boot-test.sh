@@ -13,6 +13,11 @@
 #   KEEL_CSTD=<checkout> scripts/boot-test.sh   link /bin/cstdhello against that cstd (default ~/dev/sysl-lang/cstd)
 #   KEEL_KFS=<checkout> scripts/boot-test.sh    build the kernel (`--lib`) and KFS's host tools from that
 #                                               kfs checkout instead of the tag kernel/package.hocon names
+#   KEEL_TCP_ONLY=<n> scripts/boot-test.sh      milestone 11b's TCP tests alone, <n> times over in one boot
+#                                               (`linuxtcp edges` and both host echoes each round), instead of
+#                                               the two boots: the way to measure a rare TCP failure
+#   KEEL_OUT=<dir> scripts/boot-test.sh         build and run in <dir> instead of scratch/, so two runs can
+#                                               go at once (each with its own KEEL_UDP_PORT and KEEL_TCP_PORT)
 #
 # QEMU installs its own SIGALRM handler, so an alarm cannot bound it; the watchdog below kills it by
 # PID instead.
@@ -21,10 +26,12 @@ emulate -L zsh
 setopt err_return no_unset pipe_fail
 
 root=${0:A:h:h}
-out=$root/scratch
+out=${KEEL_OUT:-$root/scratch}
 mkdir -p $out
+out=${out:A}
 
-limit=${KEEL_TIMEOUT:-60}
+tcp_only=${KEEL_TCP_ONLY:-0}
+limit=${KEEL_TIMEOUT:-$(( tcp_only > 0 ? 30 + 15 * tcp_only : 60 ))}
 # Milestone 11b's host ports, forwarded by QEMU to keel's TCP ports 8100 and 8101 (linuxtcp's echo, plain
 # and with drops), 8080 and 8081 (two busybox nc listeners); the fifth is a web server on the host
 # that keel's wget reaches through slirp's gateway, 10.0.2.2.
@@ -135,6 +142,7 @@ after_user_line=(
     "udpecho: listening on port 8007"   # a sysl program at EL0 bound a socket...
     "udpecho: bye after "   # ...and echoed the second client's datagrams through recvfrom/sendto
     "keel: udpecho exited 0"
+    "keel: tcp fast retransmit resent 300 bytes, only what was sent"   # 300 in flight, 5000 queued (tcp_resend_check)
 )
 
 # Milestone 10: then init starts the shell, and the script is at the console. Each boot's session is
@@ -365,6 +373,27 @@ session2=(
     'exit'
     $'\x04'
 )
+# Milestone 11b: TCP, one round of it — boot 2 runs one, KEEL_TCP_ONLY as many as it is asked for.
+# linuxtcp's edge cases run client and server on keel itself, over 127.0.0.1. The last element stops
+# short of the drop count's end (` fast)`), which follows.
+tcp_round=(
+    $'# linuxtcp edges\nlinuxtcp: connect to a closed port: ECONNREFUSED; nonblocking, EINPROGRESS then POLLERR|POLLHUP and SO_ERROR\n'
+    $'linuxtcp: half-close: ping, end of stream, pong, end of stream; a write after SHUT_WR is EPIPE\n'
+    $'linuxtcp: peer closed: its bytes, the end, then EPIPE with SIGPIPE, without it for MSG_NOSIGNAL; closed unread: ECONNRESET, then the end\n'
+    $'linuxtcp: ppoll: POLLOUT alone while quiet, POLLIN for a byte another process sent, POLLIN at the end, POLLHUP once both directions are shut\n'
+    $'linuxtcp: listen backlog 1: a second SYN dropped while one waits, the connection made once it was accepted\n'
+    $'linuxtcp: SO_RCVTIMEO: accept and read give up with EAGAIN after 0.2 s; O_NONBLOCK: EAGAIN at once\n'
+    $'linuxtcp: 40 connections in a row: the same descriptor each time, the table and its frames back where they were ('
+    $' in TIME_WAIT)\nlinuxtcp: two connections at once through one server: 256 KiB each way on each, every byte back in order\n'
+    $'linuxtcp: zero window: the writer stopped with both rings full, the persist timer probed while the reader slept, every byte read back in order and none sent past the window\n'
+    $'linuxtcp: names: getsockname, getpeername and accept4\'s address agree; SO_TYPE, TCP_NODELAY, SO_KEEPALIVE; writev and readv; ENOTCONN unconnected\n'
+    $'linuxtcp: a signal ends a blocked read with EINTR, its handler run\n'
+    # The host's client (tcp-echo-client.pl) sends 4 MiB through slirp and checks the echo byte for byte;
+    # then 256 KiB with keel dropping every 7th segment it sends, so only retransmission gets it through
+    # (at that loss the congestion window stays near three segments, so most losses wait for a timeout).
+    $'# linuxtcp echo 8100\nlinuxtcp: listening on port 8100\nlinuxtcp: echoed 4194304 bytes\n'
+    $'# linuxtcp echo 8101 7\nlinuxtcp: listening on port 8101\nlinuxtcp: echoed 262144 bytes with every 7th segment dropped: dropped '
+)
 transcript2=(
     $'login: root\npassword: \n'
     $'# cat /m9/kept\ndata\n'                   # the file the first boot's shell wrote, read back
@@ -496,23 +525,7 @@ transcript2=(
     $'# busybox md5sum /hello.txt\n'"$(print -n 'hello from the disk' | md5 -q)"$'  /hello.txt\n'
     $'# busybox sha256sum /m9/big.bin\n'"$(perl -e 'srand(9); print map { chr(int(rand(256))) } 1..204800' | shasum -a 256 | cut -d' ' -f1)"$'  /m9/big.bin\n'
     $'# busybox seq 3 | busybox tr \'\\n\' \' \'\n1 2 3 # busybox expr 6 * 7\n42\n'
-    # Milestone 11b: TCP. linuxtcp's edge cases run client and server on keel itself, over 127.0.0.1.
-    $'# linuxtcp edges\nlinuxtcp: connect to a closed port: ECONNREFUSED; nonblocking, EINPROGRESS then POLLERR|POLLHUP and SO_ERROR\n'
-    $'linuxtcp: half-close: ping, end of stream, pong, end of stream; a write after SHUT_WR is EPIPE\n'
-    $'linuxtcp: peer closed: its bytes, the end, then EPIPE with SIGPIPE, without it for MSG_NOSIGNAL; closed unread: ECONNRESET, then the end\n'
-    $'linuxtcp: ppoll: POLLOUT alone while quiet, POLLIN for a byte another process sent, POLLIN at the end, POLLHUP once both directions are shut\n'
-    $'linuxtcp: listen backlog 1: a second SYN dropped while one waits, the connection made once it was accepted\n'
-    $'linuxtcp: SO_RCVTIMEO: accept and read give up with EAGAIN after 0.2 s; O_NONBLOCK: EAGAIN at once\n'
-    $'linuxtcp: 40 connections in a row: the same descriptor each time, the table and its frames back where they were ('
-    $' in TIME_WAIT)\nlinuxtcp: two connections at once through one server: 256 KiB each way on each, every byte back in order\n'
-    $'linuxtcp: zero window: the writer stopped with both rings full, the persist timer probed while the reader slept, every byte read back in order and none sent past the window\n'
-    $'linuxtcp: names: getsockname, getpeername and accept4\'s address agree; SO_TYPE, TCP_NODELAY, SO_KEEPALIVE; writev and readv; ENOTCONN unconnected\n'
-    $'linuxtcp: a signal ends a blocked read with EINTR, its handler run\n'
-    # The host's client (tcp-echo-client.pl) sends 4 MiB through slirp and checks the echo byte for byte;
-    # then 256 KiB with keel dropping every 7th segment it sends, so only retransmission gets it through
-    # (at that loss the congestion window stays near three segments, so most losses wait for a timeout).
-    $'# linuxtcp echo 8100\nlinuxtcp: listening on port 8100\nlinuxtcp: echoed 4194304 bytes\n'
-    $'# linuxtcp echo 8101 7\nlinuxtcp: listening on port 8101\nlinuxtcp: echoed 262144 bytes with every 7th segment dropped: dropped '
+    "${tcp_round[@]}"
     # A background busybox nc serves an HTTP response, a header and /bin/busybox, to the host's curl
     # (tcp-http-host.pl), which tells a second busybox nc the outcome; then busybox wget fetches a file
     # from a web server on the host. (Alpine's busybox-static has no httpd: that applet is in its
@@ -813,6 +826,11 @@ boot() {
         tcp_pids+=($!)
         perl $root/scripts/http-file-server.pl $wget_port blob $www/blob > $tcp_log.www 2>&1 &
         tcp_pids+=($!)
+    elif [[ $name == tcp ]]; then
+        perl $root/scripts/tcp-echo-client.pl $tcp_port 4194304 $limit plain $tcp_only > $tcp_log.plain 2>&1 &
+        tcp_pids+=($!)
+        perl $root/scripts/tcp-echo-client.pl $((tcp_port + 1)) 262144 $limit dropping $tcp_only > $tcp_log.dropping 2>&1 &
+        tcp_pids+=($!)
     fi
 
     waited=0
@@ -846,6 +864,8 @@ boot() {
     cat $udp_log.kernel $udp_log.user
     if [[ $name == 2 ]]; then
         cat $tcp_log.plain $tcp_log.dropping $tcp_log.http $tcp_log.www
+    elif [[ $name == tcp ]]; then
+        cat $tcp_log.plain $tcp_log.dropping
     fi
 
     if [[ $exited == no ]]; then
@@ -890,6 +910,14 @@ boot() {
             return 1
         fi
     done
+    if [[ $name == tcp ]]; then
+        for client in plain dropping; do
+            if [[ $(<$tcp_log.$client) == *FAILED* ]]; then
+                print -r -- "FAIL: boot $name: the host's TCP client ($client) did not get its bytes back: $(<$tcp_log.$client)"
+                return 1
+            fi
+        done
+    fi
     if [[ $name == 2 ]]; then
         for client in plain dropping; do
             if [[ $(<$tcp_log.$client) != *"host: tcp echo ok ($client)"* ]]; then
@@ -969,6 +997,24 @@ kfs_after() {
         print -r -- "host: kfs after boot 1: fsck.kfs clean once the log's 3 transactions are replayed"
     fi
 }
+
+# KEEL_TCP_ONLY=<n>: one boot on the fresh disk (so its files line is the first boot's) whose session is
+# milestone 11b's TCP round <n> times over, the host's two echo clients making <n> exchanges each. Nothing
+# else is checked: it is for measuring a TCP failure that shows once in many runs.
+if (( tcp_only > 0 )); then
+    tcp_session=(root keelroot)
+    tcp_transcript=($'login: root\npassword: \n')
+    for (( round = 1; round <= tcp_only; round++ )); do
+        tcp_session+=('linuxtcp edges' 'linuxtcp echo 8100' 'linuxtcp echo 8101 7')
+        tcp_transcript+=("${tcp_round[@]}" $' fast)\n')
+    done
+    tcp_session+=(exit $'\x04')
+    tcp_transcript+=($'# exit\nlogin: \n' "init: the console closed after 1 sessions; orphans reaped: 0"
+        "keel: init exited 0" "keel: every process reaped")
+    boot tcp "user: first boot, no /out.txt yet" tcp_session tcp_transcript
+    print -r -- "PASS: $tcp_only TCP rounds in one boot, every line in order, both host clients answered each time, after $((waited / 10)).$((waited % 10))s"
+    return 0
+fi
 
 boot 1 "user: first boot, no /out.txt yet" session1 transcript1
 first=$waited
