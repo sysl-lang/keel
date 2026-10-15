@@ -47,13 +47,20 @@ network() -> bool
 private const USER_ECHO_PORT: string = "8007"
 private const USER_ECHO_SECONDS: string = "10"
 
-// After the user-mode half: stop the stack's thread, and report what it saw.
+// After the session: stop the stack's thread, drop what TCP still holds (connections in TIME_WAIT, say),
+// and report what it saw. Every process has ended by now, so no descriptor stands for any socket.
 network_down()
     val s = net.stats()
+    val streams = net.tcp_sockets_held()
     net.down()
-    if net.sockets_open() == 0
+    if net.sockets_open() == 0 && streams == 0
         print("keel: network down, sockets closed")
     else
-        print("keel: network down,", net.sockets_open(), "sockets left open")
+        print("keel: network down,", net.sockets_open(), "datagram and", streams, "stream sockets left open")
+    val t = net.tcp_table()
+    if t.live == 0 && t.time_wait == 0 && t.frames == 0
+        print("keel: tcp table empty, every ring's frames back")
+    else
+        print("keel: tcp table not empty:", t.live, "live", t.time_wait, "in TIME_WAIT", t.frames, "frames")
     if s.bad_ip_checksums != 0 || s.bad_udp_checksums != 0
         print("keel: bad checksums received: ip", s.bad_ip_checksums, "udp", s.bad_udp_checksums)

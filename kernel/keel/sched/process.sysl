@@ -80,6 +80,7 @@ enum Holds
     PipeRead        // `ino` is the pipe's slot (keel.proc's pipe table)
     PipeWrite
     Socket          // `ino` is the socket's slot in keel.net's table, `offset` its receive timeout in ms
+    Stream          // `ino` is the TCP connection's slot in keel.net's table (its options live there)
 
 // A descriptor: what it holds, and for a file the flags it was opened with and where the next read or
 // write starts. Plain numbers, so a process can name its files and pipes without this module importing

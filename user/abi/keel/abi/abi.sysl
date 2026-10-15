@@ -62,11 +62,19 @@ const SYS_GETEUID: u64 = 175        // geteuid() -> the same: keel has one user 
 const SYS_GETGID: u64 = 176         // getgid() -> the caller's group id
 const SYS_GETEGID: u64 = 177        // getegid() -> the same
 const SYS_GETTID: u64 = 178         // gettid() -> the calling thread's id; the first thread's is the pid
-const SYS_SOCKET: u64 = 198         // socket(AF_INET, SOCK_DGRAM, 0 | IPPROTO_UDP) -> fd
+const SYS_SOCKET: u64 = 198         // socket(AF_INET, SOCK_DGRAM | SOCK_STREAM [| SOCK_CLOEXEC | SOCK_NONBLOCK], 0 | protocol) -> fd
 const SYS_BIND: u64 = 200           // bind(fd, *SockAddrIn, len) -> 0
-const SYS_SENDTO: u64 = 206         // sendto(fd, buf, len, 0, *SockAddrIn, len) -> bytes sent
-const SYS_RECVFROM: u64 = 207       // recvfrom(fd, buf, len, 0, *SockAddrIn | 0, *u32 len | 0) -> bytes of the datagram
-const SYS_SETSOCKOPT: u64 = 208     // setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, *Timeval, 16) -> 0
+const SYS_LISTEN: u64 = 201         // listen(fd, backlog) -> 0: a stream socket
+const SYS_ACCEPT: u64 = 202         // accept(fd, *SockAddrIn | 0, *u32 len | 0) -> the connection's fd
+const SYS_CONNECT: u64 = 203        // connect(fd, *SockAddrIn, len) -> 0: a stream socket
+const SYS_GETSOCKNAME: u64 = 204    // getsockname(fd, *SockAddrIn, *u32 len) -> 0
+const SYS_GETPEERNAME: u64 = 205    // getpeername(fd, *SockAddrIn, *u32 len) -> 0
+const SYS_SENDTO: u64 = 206         // sendto(fd, buf, len, flags, *SockAddrIn | 0, len) -> bytes sent
+const SYS_RECVFROM: u64 = 207       // recvfrom(fd, buf, len, flags, *SockAddrIn | 0, *u32 len | 0) -> bytes received
+const SYS_SETSOCKOPT: u64 = 208     // setsockopt(fd, level, option, *value, len) -> 0
+const SYS_GETSOCKOPT: u64 = 209     // getsockopt(fd, level, option, *value, *u32 len) -> 0
+const SYS_SHUTDOWN: u64 = 210       // shutdown(fd, SHUT_RD | SHUT_WR | SHUT_RDWR) -> 0
+const SYS_ACCEPT4: u64 = 242        // accept4(fd, *SockAddrIn | 0, *u32 len | 0, SOCK_CLOEXEC | SOCK_NONBLOCK) -> fd
 const SYS_BRK: u64 = 214            // brk(addr) -> the break: moved to addr if it could be, else unchanged
 const SYS_CLONE: u64 = 220          // clone(flags, stack, *ptid, tls, *ctid) -> the child's pid or tid; 0 in the child
 const SYS_EXECVE: u64 = 221         // execve(path, argv, envp) -> never on success
@@ -440,15 +448,64 @@ const UMASK: u32 = 0o022
 // a datagram as long as SO_RCVTIMEO says (0: for ever) and answers EAGAIN after; its `*SockAddrIn` (or
 // 0) is filled with the sender. Port 7 is the kernel's own echo service and cannot be bound, and
 // neither can port 0. `send` and `recv` flags are 0.
+//
+// A stream socket is a TCP connection (or a listener), on keel's own address or the loopback network
+// 127.0.0.0/8. read, write, readv and writev work on it as recv and send with no flags.
 const AF_INET: u64 = 2
+const SOCK_STREAM: u64 = 1
 const SOCK_DGRAM: u64 = 2
 const SOCK_TYPE_MASK: u64 = 0xf
+const SOCK_NONBLOCK: u64 = 0x800
 const SOCK_CLOEXEC: u64 = 0x8_0000
+const IPPROTO_TCP: u64 = 6
 const IPPROTO_UDP: u64 = 17
 const SOL_SOCKET: u64 = 1
 const SO_REUSEADDR: u64 = 2
+const SO_TYPE: u64 = 3
+const SO_ERROR: u64 = 4
+const SO_SNDBUF: u64 = 7
+const SO_RCVBUF: u64 = 8
+const SO_KEEPALIVE: u64 = 9
 const SO_RCVTIMEO: u64 = 20
 const SO_SNDTIMEO: u64 = 21
+const SO_ACCEPTCONN: u64 = 30
+const TCP_NODELAY: u64 = 1          // level IPPROTO_TCP
+const TCP_MAXSEG: u64 = 2
+const MSG_PEEK: u64 = 0x2
+const MSG_DONTWAIT: u64 = 0x40
+const MSG_WAITALL: u64 = 0x100
+const MSG_NOSIGNAL: u64 = 0x4000
+const MSG_MORE: u64 = 0x8000
+const SHUT_RD: u64 = 0
+const SHUT_WR: u64 = 1
+const SHUT_RDWR: u64 = 2
+// keel's own option level, for tests: no Linux level has this number. KEEL_DROP_EVERY (set, an i32 N)
+// makes a stream socket drop every Nth segment it would send; KEEL_CONN_STATS (get) answers a
+// `KeelConnStats`; KEEL_TCP_TABLE (get) a `KeelTcpTable`.
+const SOL_KEEL: u64 = 0x6b65
+const KEEL_DROP_EVERY: u64 = 1
+const KEEL_CONN_STATS: u64 = 2
+const KEEL_TCP_TABLE: u64 = 3
+
+// One connection: retransmissions, those after a timeout, those on a third duplicate ACK, zero-window
+// probes, segments dropped by KEEL_DROP_EVERY, segments received with data past the advertised window.
+struct KeelConnStats
+    retransmits: u64
+    timeouts: u64
+    fast_retransmits: u64
+    probes: u64
+    dropped: u64
+    beyond_window: u64
+
+// The whole table: connections other than TIME_WAIT, those in TIME_WAIT, frames held by their rings, and
+// since the network came up retransmissions, bad checksums received, and SYNs dropped by a full backlog.
+struct KeelTcpTable
+    live: u64
+    time_wait: u64
+    frames: u64
+    retransmits: u64
+    bad_checksums: u64
+    syns_dropped: u64
 
 // Linux's `sockaddr_in`: the port and the address in network byte order (big-endian).
 struct SockAddrIn
@@ -657,5 +714,13 @@ enum Errno: i64
     EADDRINUSE = 98             // bind: the port is taken
     EADDRNOTAVAIL = 99          // bind: an address other than keel's own or any
     ENETDOWN = 100              // no network card, or the stack is down
-    ETIMEDOUT = 110
+    ECONNABORTED = 103
+    ECONNRESET = 104            // the peer reset the connection
+    ENOBUFS = 105               // no memory for a connection's buffers
+    EISCONN = 106               // connect on a connected socket
+    ENOTCONN = 107              // a stream socket that is not connected
+    ETIMEDOUT = 110             // a connection's retransmissions gave up
+    ECONNREFUSED = 111          // connect: an RST answered the SYN
     EHOSTUNREACH = 113          // sendto: ARP found no address for the next hop
+    EALREADY = 114              // connect while one is under way
+    EINPROGRESS = 115           // a nonblocking connect is under way

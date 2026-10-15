@@ -105,9 +105,11 @@ private held_read(p: *Process, f: OpenFile, regs: *u64) -> Result[i64, Errno] = 
             None -> Err(EINTR)
     PipeRead -> pipe_read(p, usize(f.ino), regs[1], regs[2])
     Socket -> socket_read(p, f, regs[1], regs[2])
+    Stream -> stream_read(p, f, regs[1], regs[2], 0)
     else Err(EBADF)
 
-// write(fd, buf, len) -> bytes written. A socket is never connected, so `write` has nowhere to send.
+// write(fd, buf, len) -> bytes written. A datagram socket is never connected, so `write` has nowhere to
+// send; a stream socket sends.
 private[proc] sys_write(p: *Process, regs: *u64) -> Result[i64, Errno]
     val u = taken(p, regs[0])?
     val r = u match
@@ -120,6 +122,7 @@ private held_write(p: *Process, f: OpenFile, regs: *u64) -> Result[i64, Errno] =
     Console -> console_write(p, UserAddr(regs[1]), regs[2])
     PipeWrite -> pipe_write(p, usize(f.ino), regs[1], regs[2])
     Socket -> Err(EDESTADDRREQ)
+    Stream -> stream_write(p, f, regs[1], regs[2], 0)
     else Err(EBADF)
 
 // lseek(fd, offset, whence), fstat(fd, *stat), getdents64(fd, buf, len), ftruncate(fd, length): a
@@ -300,6 +303,7 @@ private[proc] duplicate(f: OpenFile)
     f.holds match
         File -> fs.opened_again(f.ino)
         Socket -> net.socket_hold(usize(f.ino))
+        Stream -> net.tcp_hold(usize(f.ino))
         PipeRead | PipeWrite ->
             val flags = pipe_lock.lock()
             val pp = &pipes[usize(f.ino)]
@@ -314,6 +318,7 @@ private[proc] release(f: OpenFile)
     f.holds match
         File -> fs.closed(f.ino)
         Socket -> net.socket_release(usize(f.ino))
+        Stream -> net.tcp_release(usize(f.ino))
         PipeRead | PipeWrite ->
             val flags = pipe_lock.lock()
             val pp = &pipes[usize(f.ino)]

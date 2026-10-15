@@ -1,0 +1,299 @@
+module keel.proc
+
+// The stream (TCP) socket calls, in Linux's shapes, over keel.net's TCP table (tcp.sysl): listen,
+// accept and accept4, connect, getsockname and getpeername, getsockopt, shutdown, and the stream half of
+// read, write, sendto, recvfrom and setsockopt. A stream socket is `Holds.Stream`, its `ino` the
+// connection's slot; its options are kept in keel.net, so every descriptor on it shares them, as on
+// Linux. The descriptor's own O_NONBLOCK (SOCK_NONBLOCK, accept4's flag, fcntl's F_SETFL) makes a call
+// that would wait answer EAGAIN, or EINPROGRESS for connect.
+//
+// Every call that may wait — accept, connect, a read, a write — works on a counted copy of the
+// descriptor (`held_socket`, `duplicate`/`release`), so the table is not held while it waits; the wait
+// is keel.net's and ends with EINTR for a signal. Bytes cross the user boundary through a chunk on this
+// thread's stack, copied by keel.net under its lock and to or from the program outside it.
+//
+// What is left out: sendmsg and recvmsg (ENOSYS), MSG_OOB, SO_LINGER, and every option not listed at
+// `stream_setsockopt` (ENOPROTOOPT).
+
+import abi.keel.abi.{EFAULT, EINVAL, ENOPROTOOPT, ENOTCONN, EOPNOTSUPP, Errno, IPPROTO_TCP, KEEL_CONN_STATS,
+    KEEL_DROP_EVERY, KEEL_TCP_TABLE, KeelConnStats, KeelTcpTable, MSG_DONTWAIT, MSG_MORE, MSG_NOSIGNAL, MSG_PEEK,
+    MSG_WAITALL, O_CLOEXEC, O_NONBLOCK, SIGPIPE, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, SOL_KEEL,
+    SOL_SOCKET, SO_ACCEPTCONN, SO_ERROR, SO_KEEPALIVE, SO_RCVBUF, SO_RCVTIMEO, SO_REUSEADDR, SO_SNDBUF, SO_SNDTIMEO,
+    SO_TYPE, SockAddrIn, TCP_MAXSEG, TCP_NODELAY, Timeval, sock_addr_in}
+import keel.mm
+import keel.net
+import keel.net.{NetError, TcpOption}
+import keel.sched
+import keel.sched.{Holds, OPEN_FILES, OpenFile, Process}
+
+private const STREAM_CHUNK: usize = 2048
+
+private nonblocking(f: OpenFile, flags: u64) -> bool = (u64(f.flags) & O_NONBLOCK) != 0 || (flags & MSG_DONTWAIT) != 0
+
+// read(fd, buf, len), recv: what has arrived, up to `want` bytes, waiting only until something has
+// (MSG_WAITALL: until all of it has, or the stream ends); 0 at the end of the stream. MSG_PEEK leaves it
+// queued. `f` is held by the caller.
+private[proc] stream_read(p: *Process, f: OpenFile, buf: u64, want: u64, flags: u64) -> Result[i64, Errno]
+    if (flags & ~(MSG_PEEK | MSG_DONTWAIT | MSG_WAITALL | MSG_NOSIGNAL)) != 0 then return Err(EOPNOTSUPP)
+    if !mm.user_range(&p.space, buf, want, true) then return Err(EFAULT)
+    val peek = (flags & MSG_PEEK) != 0
+    val all = (flags & MSG_WAITALL) != 0 && !peek
+    var chunk: [STREAM_CHUNK]u8 = [0; STREAM_CHUNK]
+    var done: u64 = 0
+    loop
+        val ask = if want - done < u64(STREAM_CHUNK) then usize(want - done) else STREAM_CHUNK
+        // Once something has been read, only MSG_WAITALL waits for more.
+        val nonblock = nonblocking(f, flags) || (done > 0 && !all)
+        val n = net.tcp_recv(p, usize(f.ino), chunk[0..<ask], nonblock, peek) match
+            Ok(n) -> n
+            Err(e) -> return if done > 0 then Ok(i64(done)) else Err(errno(e))
+        if n == 0 then break
+        if !mm.copy_to_user(&p.space, buf + done, chunk[0..<n]) then return Err(EFAULT)
+        done += u64(n)
+        if done == want || peek then break
+    Ok(i64(done))
+
+// write(fd, buf, len), send: every byte, waiting for room as it goes, unless the descriptor or the
+// flags say not to wait (then what fitted, or EAGAIN). EPIPE once nothing more can be sent, with
+// SIGPIPE unless MSG_NOSIGNAL; a short count if that happens part way.
+private[proc] stream_write(p: *Process, f: OpenFile, buf: u64, len: u64, flags: u64) -> Result[i64, Errno]
+    if (flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE)) != 0 then return Err(EOPNOTSUPP)
+    if !mm.user_range(&p.space, buf, len, false) then return Err(EFAULT)
+    val nonblock = nonblocking(f, flags)
+    var chunk: [STREAM_CHUNK]u8 = [0; STREAM_CHUNK]
+    var done: u64 = 0
+    while done < len
+        val ask = if len - done < u64(STREAM_CHUNK) then usize(len - done) else STREAM_CHUNK
+        if !mm.copy_from_user(&p.space, buf + done, chunk[0..<ask]) then return Err(EFAULT)
+        var put: usize = 0
+        while put < ask
+            net.tcp_send(p, usize(f.ino), chunk[put..<ask], nonblock) match
+                Ok(n) -> put += n
+                Err(e) ->
+                    done += u64(put)
+                    if done > 0 then return Ok(i64(done))
+                    if e == NetError.Broken && (flags & MSG_NOSIGNAL) == 0
+                        // The writer is running, so there is no sleep to end: the signal is delivered on
+                        // the way back to user mode.
+                        val _ = sched.post(p, SIGPIPE)
+                    return Err(errno(e))
+        done += u64(put)
+    Ok(i64(done))
+
+// recvfrom on a stream socket: the stream's bytes; a TCP socket names no sender, so an address asked for
+// gets length 0, as Linux's.
+private[proc] stream_recvfrom(p: *Process, f: OpenFile, regs: *u64) -> Result[i64, Errno]
+    val n = stream_read(p, f, regs[1], regs[2], regs[3])?
+    if regs[4] != 0 && regs[5] != 0
+        var zero: u32 = 0
+        val raw: *u8 = ptr_cast(&zero)
+        if !mm.copy_to_user(&p.space, regs[5], raw[0..<4]) then return Err(EFAULT)
+    Ok(n)
+
+// listen(fd, backlog) -> 0: a stream socket, bound to a port or given one; the backlog is cut to
+// keel.net's TCP_BACKLOG_MAX (a negative one, as Linux reads it, means the most).
+private[proc] sys_listen(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
+    val f = socket_in(t, regs[0])?
+    if f.holds != Holds.Stream then return Err(EOPNOTSUPP)
+    val asked = i32(regs[1] & 0xffff_ffff)
+    val backlog = if asked < 0 || asked > i32(net.TCP_BACKLOG_MAX) then net.TCP_BACKLOG_MAX else u32(asked)
+    net.tcp_listen(usize(f.ino), backlog) match
+        Ok(_) -> Ok(0)
+        Err(e) -> Err(errno(e))
+
+// accept(fd, *SockAddrIn | 0, *u32 len | 0), accept4(…, flags) -> the connection's descriptor, the
+// lowest free one; its peer written to the address if one is given. accept4 takes SOCK_CLOEXEC and
+// SOCK_NONBLOCK for the new descriptor.
+private[proc] sys_accept(p: *Process, regs: *u64) -> Result[i64, Errno] = accepted(p, regs[0], regs[1], regs[2], 0)
+private[proc] sys_accept4(p: *Process, regs: *u64) -> Result[i64, Errno] = accepted(p, regs[0], regs[1], regs[2], regs[3])
+
+private accepted(p: *Process, fd: u64, addr: u64, addr_len: u64, flags: u64) -> Result[i64, Errno]
+    if (flags & ~(SOCK_CLOEXEC | SOCK_NONBLOCK)) != 0 then return Err(EINVAL)
+    val f = held_socket(p, fd)?
+    defer release(f)
+    if f.holds != Holds.Stream then return Err(EOPNOTSUPP)
+    if addr != 0 then val _ = addr_room(p, addr_len)?
+    val c = net.tcp_accept(p, usize(f.ino), nonblocking(f, 0)) match
+        Ok(c) -> c
+        Err(e) -> return Err(errno(e))
+    val t = sched.lock_files(p)
+    val to = lowest_free(t, OPEN_FILES) match
+        Ok(to) -> to
+        Err(e) ->
+            sched.unlock_files(p)
+            net.tcp_release(c)
+            return Err(e)
+    t.slots[to] = OpenFile(Holds.Stream, u32(c), u32(flags & (O_CLOEXEC | O_NONBLOCK)), 0)
+    sched.unlock_files(p)
+    if addr != 0
+        val (_, _, rip, rport, _) = net.tcp_names(c)
+        put_addr(p, addr, addr_len, rip, rport)?
+    Ok(i64(to))
+
+// connect(fd, *SockAddrIn, len) -> 0 once connected; EINPROGRESS at once for a nonblocking descriptor.
+private[proc] sys_connect(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val f = held_socket(p, regs[0])?
+    defer release(f)
+    if f.holds != Holds.Stream then return Err(EOPNOTSUPP)
+    val a = addr_in(p, regs[1], regs[2])?
+    net.tcp_connect(p, usize(f.ino), a.ip(), a.port(), nonblocking(f, 0)) match
+        Ok(_) -> Ok(0)
+        Err(e) -> Err(errno(e))
+
+// getsockname(fd, *SockAddrIn, *u32 len), getpeername(…) -> 0. A datagram socket's name is any address
+// and its port; it has no peer (ENOTCONN), and neither has a stream socket that is not connected.
+private[proc] sys_getsockname(p: *Process, regs: *u64) -> Result[i64, Errno] = named(p, regs, false)
+private[proc] sys_getpeername(p: *Process, regs: *u64) -> Result[i64, Errno] = named(p, regs, true)
+
+private named(p: *Process, regs: *u64, peer: bool) -> Result[i64, Errno]
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
+    val f = socket_in(t, regs[0])?
+    if f.holds == Holds.Socket
+        if peer then return Err(ENOTCONN)
+        put_addr(p, regs[1], regs[2], 0, net.socket_port(usize(f.ino)))?
+        return Ok(0)
+    val (lip, lport, rip, rport, connected) = net.tcp_names(usize(f.ino))
+    if peer
+        if !connected then return Err(ENOTCONN)
+        put_addr(p, regs[1], regs[2], rip, rport)?
+    else
+        put_addr(p, regs[1], regs[2], lip, lport)?
+    Ok(0)
+
+// The room a `*u32 len` argument offers, read from the program: EINVAL if negative.
+private addr_room(p: *Process, len_va: u64) -> Result[usize, Errno]
+    var room: u32 = 0
+    val raw: *u8 = ptr_cast(&room)
+    if len_va == 0 || !mm.copy_from_user(&p.space, len_va, raw[0..<4]) then return Err(EFAULT)
+    if i32(room) < 0 then return Err(EINVAL)
+    Ok(usize(room))
+
+// A `sockaddr_in` of `ip`:`port` written to `va`, cut to the room `*len_va` offers, and its whole length
+// written back to `*len_va`.
+private put_addr(p: *Process, va: u64, len_va: u64, ip: u32, port: u16) -> Result[unit, Errno]
+    var a = sock_addr_in(ip, port)
+    put_option(p, va, len_va, ptr_cast(&a), sizeof(SockAddrIn))
+
+// `size` bytes at `value` written to `va`, cut to the room `*len_va` offers, and `size` written back to
+// `*len_va`: how getsockopt and the address calls answer.
+private put_option(p: *Process, va: u64, len_va: u64, value: *u8, size: usize) -> Result[unit, Errno]
+    val room = addr_room(p, len_va)?
+    val n = if room < size then room else size
+    if n > 0 && !mm.copy_to_user(&p.space, va, value[0..<n]) then return Err(EFAULT)
+    var full = u32(size)
+    val l: *u8 = ptr_cast(&full)
+    if !mm.copy_to_user(&p.space, len_va, l[0..<4]) then return Err(EFAULT)
+    Ok(())
+
+// shutdown(fd, how) -> 0: SHUT_RD, SHUT_WR or SHUT_RDWR on a connected stream socket.
+private[proc] sys_shutdown(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
+    val f = socket_in(t, regs[0])?
+    if regs[1] > 2 then return Err(EINVAL)
+    if f.holds != Holds.Stream then return Err(ENOTCONN)
+    net.tcp_shutdown(usize(f.ino), regs[1]) match
+        Ok(_) -> Ok(0)
+        Err(e) -> Err(errno(e))
+
+// An `int` option value, `len` bytes at `va`.
+private int_value(p: *Process, va: u64, len: u64) -> Result[u64, Errno]
+    if len < 4 then return Err(EINVAL)
+    var v: u32 = 0
+    val raw: *u8 = ptr_cast(&v)
+    if !mm.copy_from_user(&p.space, va, raw[0..<4]) then return Err(EFAULT)
+    Ok(u64(v))
+
+// setsockopt on a stream socket: SOL_SOCKET's SO_RCVTIMEO and SO_SNDTIMEO (a `Timeval`; zero for ever),
+// SO_REUSEADDR (a port may be shared with anything but a listener), SO_KEEPALIVE (kept and reported; no
+// probes are sent), SO_RCVBUF and SO_SNDBUF (accepted; the rings are TCP_BUF); IPPROTO_TCP's TCP_NODELAY
+// (kept and reported; every write is sent at once anyway) and TCP_MAXSEG (accepted); keel's own
+// KEEL_DROP_EVERY. The table is locked by the caller.
+private[proc] stream_setsockopt(p: *Process, f: OpenFile, regs: *u64) -> Result[i64, Errno]
+    val i = usize(f.ino)
+    val level = regs[1]
+    val opt = regs[2]
+    if level == SOL_SOCKET
+        if opt == SO_RCVTIMEO || opt == SO_SNDTIMEO
+            val ms = timeval_ms(p, regs[3], regs[4])?
+            net.tcp_set(i, if opt == SO_RCVTIMEO then TcpOption.RcvTimeo else TcpOption.SndTimeo, ms)
+        else if opt == SO_REUSEADDR
+            net.tcp_set(i, TcpOption.ReuseAddr, int_value(p, regs[3], regs[4])?)
+        else if opt == SO_KEEPALIVE
+            net.tcp_set(i, TcpOption.KeepAlive, int_value(p, regs[3], regs[4])?)
+        else if opt == SO_RCVBUF || opt == SO_SNDBUF
+            val _ = int_value(p, regs[3], regs[4])?
+        else
+            return Err(ENOPROTOOPT)
+    else if level == IPPROTO_TCP
+        if opt == TCP_NODELAY
+            net.tcp_set(i, TcpOption.NoDelay, int_value(p, regs[3], regs[4])?)
+        else if opt == TCP_MAXSEG
+            val _ = int_value(p, regs[3], regs[4])?
+        else
+            return Err(ENOPROTOOPT)
+    else if level == SOL_KEEL && opt == KEEL_DROP_EVERY
+        net.tcp_set(i, TcpOption.DropEvery, int_value(p, regs[3], regs[4])?)
+    else
+        return Err(ENOPROTOOPT)
+    Ok(0)
+
+// getsockopt(fd, level, option, *value, *u32 len) -> 0: the options setsockopt takes, read back, and
+// SO_TYPE, SO_ERROR (the connection's error, now cleared), SO_ACCEPTCONN; keel's KEEL_CONN_STATS and
+// KEEL_TCP_TABLE. A datagram socket answers SO_TYPE, SO_ERROR (0) and SO_RCVTIMEO.
+private[proc] sys_getsockopt(p: *Process, regs: *u64) -> Result[i64, Errno]
+    val t = sched.lock_files(p)
+    defer sched.unlock_files(p)
+    val f = socket_in(t, regs[0])?
+    val level = regs[1]
+    val opt = regs[2]
+    val out = regs[3]
+    val len_va = regs[4]
+    if level == SOL_SOCKET && (opt == SO_RCVTIMEO || opt == SO_SNDTIMEO)
+        val ms = if f.holds == Holds.Socket then (if opt == SO_RCVTIMEO then f.offset else 0) else
+            net.tcp_get(usize(f.ino), if opt == SO_RCVTIMEO then TcpOption.RcvTimeo else TcpOption.SndTimeo)
+        var tv = Timeval(i64(ms / 1000), i64((ms % 1000) * 1000))
+        put_option(p, out, len_va, ptr_cast(&tv), sizeof(Timeval))?
+        return Ok(0)
+    if level == SOL_KEEL && f.holds == Holds.Stream && opt == KEEL_CONN_STATS
+        val s = net.tcp_conn_stats(usize(f.ino))
+        var k = KeelConnStats(s.retransmits, s.timeouts, s.fast_retransmits, s.probes, s.dropped, s.beyond_window)
+        put_option(p, out, len_va, ptr_cast(&k), sizeof(KeelConnStats))?
+        return Ok(0)
+    if level == SOL_KEEL && opt == KEEL_TCP_TABLE
+        val s = net.tcp_table()
+        var k = KeelTcpTable(s.live, s.time_wait, s.frames, s.retransmits, s.bad_checksums, s.syns_dropped)
+        put_option(p, out, len_va, ptr_cast(&k), sizeof(KeelTcpTable))?
+        return Ok(0)
+    val v = int_option(*f, level, opt)?
+    var word = u32(v & 0xffff_ffff)
+    put_option(p, out, len_va, ptr_cast(&word), 4)?
+    Ok(0)
+
+private int_option(f: OpenFile, level: u64, opt: u64) -> Result[u64, Errno]
+    if f.holds == Holds.Socket
+        if level != SOL_SOCKET then return Err(ENOPROTOOPT)
+        if opt == SO_TYPE then return Ok(SOCK_DGRAM)
+        if opt == SO_ERROR then return Ok(0)
+        return Err(ENOPROTOOPT)
+    val i = usize(f.ino)
+    if level == SOL_SOCKET
+        if opt == SO_TYPE then return Ok(SOCK_STREAM)
+        if opt == SO_ERROR
+            return net.tcp_take_error(i) match
+                Some(e) -> Ok(u64(i64(errno(e))))
+                None -> Ok(0)
+        if opt == SO_REUSEADDR then return Ok(net.tcp_get(i, TcpOption.ReuseAddr))
+        if opt == SO_KEEPALIVE then return Ok(net.tcp_get(i, TcpOption.KeepAlive))
+        if opt == SO_ACCEPTCONN then return Ok(net.tcp_get(i, TcpOption.AcceptConn))
+        if opt == SO_RCVBUF || opt == SO_SNDBUF then return Ok(u64(net.TCP_BUF))
+        return Err(ENOPROTOOPT)
+    if level == IPPROTO_TCP
+        if opt == TCP_NODELAY then return Ok(net.tcp_get(i, TcpOption.NoDelay))
+        if opt == TCP_MAXSEG then return Ok(net.tcp_get(i, TcpOption.MaxSegment))
+        return Err(ENOPROTOOPT)
+    if level == SOL_KEEL && opt == KEEL_DROP_EVERY then return Ok(net.tcp_get(i, TcpOption.DropEvery))
+    Err(ENOPROTOOPT)

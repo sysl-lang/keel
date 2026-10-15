@@ -1,0 +1,1302 @@
+module keel.net
+
+// TCP (RFC 9293), for keel.proc's stream sockets.
+//
+// A connection is a `Tcb` in one table of TCP_SOCKETS, numbered by its place, guarded by the stack's one
+// `lock` like everything else in keel.net. The stack's thread (`netd`) hands each segment to
+// `tcp_receive` and runs the timers (`tcp_timers`) whenever it wakes; the timer interrupt wakes it every
+// tick while any connection exists (`tcp_tick_due`). A process's call (keel.proc's socket.sysl) takes the
+// lock, works on its connection, and sleeps on the stack's `events` when it has to wait — interruptibly,
+// so a signal ends the wait with EINTR. Every change a caller or a poller may be waiting for wakes
+// `events` and notifies the pollers (`changed`).
+//
+// What is built:
+//   - the whole state machine: active and passive open, simultaneous open and close, TIME_WAIT for
+//     2·MSL with MSL shortened to MSL_MS (a TIME_WAIT slot nobody holds is also reclaimed when the table
+//     is full), RST in every state with RFC 5961's exact-sequence check and challenge ACK, a SYN in a
+//     synchronized state answered with a challenge ACK;
+//   - 32-bit sequence numbers compared modulo 2^32 (`before`), an initial sequence number from a
+//     splitmix64 generator stirred with the counter (`random32`);
+//   - the MSS option, sent in every SYN (TCP_MSS) and read from the peer's (536 without one); the
+//     receive window is the free room in the connection's receive ring (TCP_BUF, so no window scaling
+//     is needed), and its right edge never moves left;
+//   - a sliding send window, the smaller of the peer's window and a congestion window (slow start and
+//     congestion avoidance, RFC 5681); sender-side silly window avoidance; a zero window is probed by
+//     the persist timer with a segment one below SND.UNA, which any TCP answers with an ACK;
+//   - retransmission on a timeout estimated per RFC 6298 (10 ms clock, MIN_RTO 200 ms as Linux's rather
+//     than the RFC's 1 s, exponential backoff, Karn's rule), go-back-N from SND.UNA after a timeout, fast
+//     retransmit on the third duplicate ACK with NewReno's recovery (RFC 6582: every partial ACK resends
+//     the next hole at once); a connection is given up after SYN_RETRIES timeouts
+//     for a SYN and DATA_RETRIES for data (ETIMEDOUT);
+//   - FIN both ways, half-close, an orphan (closed by its program) finishing its close on its own, and an
+//     RST for data that reaches a connection its program has closed, or a close with unread data, as
+//     Linux does.
+// What is deliberately absent: delayed ACK (every segment carrying data is acknowledged at once); Nagle
+// (every write is sent at once, as with TCP_NODELAY, which is accepted and reported); a reassembly
+// queue (a segment out of order is dropped and answered with a duplicate ACK, which drives the
+// sender's fast retransmit); window scaling, timestamps, SACK, urgent data; keep-alive probes
+// (SO_KEEPALIVE is accepted and reported, and nothing is sent).
+//
+// The connection's two rings, TCP_BUF bytes each, live in BUF_FRAMES contiguous frames taken when a
+// connection is opened or accepted and given back when its slot is freed (or, for an orphan, when it
+// reaches TIME_WAIT); a listening socket has none. `tcp_table` reports how many frames are held.
+//
+// Test-only: a connection may drop every Nth segment it would send (`TcpOption.DropEvery`, keel's own
+// socket option, 0 by default), which is how the boot test makes retransmission happen over slirp,
+// which never loses a packet.
+
+import abi.keel.abi.{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM}
+import keel.mm
+import keel.sched.{Process, poll_notify}
+import keel.timer
+import sysl.sync.{Atomic, Ordering}
+
+const TCP_SOCKETS: usize = 32
+const TCP_BUF: usize = 32768                    // each ring, send and receive
+const TCP_MSS: usize = ETH_MAX - ETH_HEADER - IPV4_HEADER - TCP_HEADER   // 1460
+const TCP_BACKLOG_MAX: u32 = 16
+
+private const BUF_FRAMES: u64 = 16              // both rings
+private const DEFAULT_MSS: u32 = 536
+private const INITIAL_RTO: u64 = 1000
+private const MIN_RTO: u64 = 200
+private const MAX_RTO: u64 = 60000
+private const SYN_RETRIES: u32 = 5
+private const DATA_RETRIES: u32 = 10
+private const MSL_MS: u64 = 500
+private const ORPHAN_FIN_WAIT_2_MS: u64 = 10000
+private const EPHEMERAL_FIRST: u32 = 49152
+private const EPHEMERAL_COUNT: u32 = 16384
+private const INITIAL_WINDOW: u32 = 4           // segments in the first congestion window
+private const MAX_CWND: u32 = 0x10_0000
+
+// Each off only to show what it is for; scripts/boot-test.sh's TCP controls.
+private const SPOIL_TCP_CHECKSUM: bool = false  // every segment's checksum one too high: slirp drops them all
+private const RETRANSMIT: bool = true           // no retransmission at all: a dropped segment stalls its transfer
+private const RESPECT_WINDOW: bool = true       // send past the peer's window: the receiver counts it
+private const HONOUR_FIN: bool = true           // a peer's FIN ignored: a reader never sees the end
+private const HONOUR_RST: bool = true           // an RST ignored: a refused connect waits out its SYN retries
+private const DATA_WAKES_POLLERS: bool = true   // arriving data does not notify the pollers
+
+// The states (RFC 9293 § 3.3.2), as numbers: the table is module storage that starts zeroed, and an enum
+// has no zero (a zeroed tag names no variant), so a slot's state is a byte and CLOSED is 0. Every state
+// from ESTABLISHED on is synchronized.
+private const CLOSED: u8 = 0
+private const LISTEN: u8 = 1
+private const SYN_SENT: u8 = 2
+private const SYN_RECEIVED: u8 = 3
+private const ESTABLISHED: u8 = 4
+private const FIN_WAIT_1: u8 = 5
+private const FIN_WAIT_2: u8 = 6
+private const CLOSE_WAIT: u8 = 7
+private const CLOSING: u8 = 8
+private const LAST_ACK: u8 = 9
+private const TIME_WAIT: u8 = 10
+
+// A connection's error, kept until the program is told (a call, or SO_ERROR).
+private const ERR_NONE: u8 = 0
+private const ERR_REFUSED: u8 = 1
+private const ERR_RESET: u8 = 2
+private const ERR_TIMED_OUT: u8 = 3
+private const ERR_PIPE: u8 = 4
+
+private struct Tcb
+    used: bool
+    refs: u32                                   // descriptors standing for it; 0 for an orphan or a queued child
+    state: u8
+    was_connected: bool                         // reached ESTABLISHED once
+    local_ip: u32                               // 0: any (a listener bound to no address)
+    local_port: u16
+    remote_ip: u32
+    remote_port: u16
+    peer_mac: Mac
+    parent: usize                               // the listener's slot + 1 while waiting to be accepted
+    born: u64                                   // the order children became acceptable in
+    backlog: u32
+    frame: u64                                  // the first of BUF_FRAMES, when `buf` is not null
+    buf: *u8                                    // the send ring, then the receive ring
+    // Sending.
+    iss: u32
+    snd_una: u32
+    snd_nxt: u32
+    snd_max: u32                                // one past the highest sequence number sent
+    snd_wnd: u32
+    snd_wl1: u32
+    snd_wl2: u32
+    snd_start: usize                            // where SND.UNA's byte is in the send ring
+    snd_len: usize                              // bytes in the send ring, sent or not
+    fin_queued: bool                            // a FIN follows the data, at `fin_seq`
+    fin_seq: u32
+    mss: u32
+    cwnd: u32
+    ssthresh: u32
+    dupacks: u32
+    recovering: bool                            // in fast recovery until `recover` is acknowledged
+    recover: u32
+    // Receiving.
+    irs: u32
+    rcv_nxt: u32
+    rcv_adv: u32                                // the right edge of the window last advertised
+    rcv_start: usize
+    rcv_len: usize
+    fin_received: bool
+    shut_rd: bool
+    shut_wr: bool
+    ack_now: bool
+    error: u8
+    // Timers, in now_ms terms; 0 is off.
+    rtx_at: u64
+    persist_at: u64
+    persist_wait: u64
+    tw_at: u64
+    rto: u64
+    backoff: u32
+    srtt: u64                                   // eighths of a millisecond
+    rttvar: u64
+    rtt_seq: u32                                // the segment being timed is acknowledged by this
+    rtt_at: u64                                 // when it was sent; 0 when none is timed
+    // Options.
+    rcvtimeo: u64
+    sndtimeo: u64
+    reuseaddr: bool
+    keepalive: bool
+    nodelay: bool
+    drop_every: u32
+    segments_out: u64
+    // What happened to it.
+    retransmits: u64
+    timeouts: u64
+    fast_retransmits: u64
+    probes: u64
+    dropped: u64
+    beyond_window: u64
+
+// What happened to one connection: retransmissions in all, those on a timeout and those on a third
+// duplicate ACK, zero-window probes sent, segments the drop control dropped, and segments received with
+// data past the window this side advertised.
+struct TcpConnStats
+    retransmits: u64
+    timeouts: u64
+    fast_retransmits: u64
+    probes: u64
+    dropped: u64
+    beyond_window: u64
+
+// The whole table: slots in use other than TIME_WAIT, slots in TIME_WAIT, frames held by rings, and
+// since `up` retransmissions, segments with a bad checksum, and SYNs dropped for a full backlog.
+struct TcpTable
+    live: u64
+    time_wait: u64
+    frames: u64
+    retransmits: u64
+    bad_checksums: u64
+    syns_dropped: u64
+
+private struct TcpGlobal
+    next_port: u32
+    born: u64
+    frames: u64
+    rng: u64
+    retransmits: u64
+    bad_checksums: u64
+    syns_dropped: u64
+
+private var tcbs: [TCP_SOCKETS]Tcb
+private var tcp: TcpGlobal
+
+// Slots in use, and when the timers want looking at next: read by the timer interrupt without the lock.
+private var tcp_in_use: Atomic[u64] = Atomic(0)
+private var tcp_next_tick: Atomic[u64] = Atomic(0)
+
+private const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15
+private const MIX1: u64 = 0xbf58_476d_1ce4_e5b9
+private const MIX2: u64 = 0x94d0_49bb_1331_11eb
+
+// -- Sequence numbers and small helpers ----------------------------------------------------------------
+
+// `a` comes before `b` in sequence space (RFC 9293 § 3.4: modulo 2^32).
+private before(a: u32, b: u32) -> bool = ((a - b) & 0x8000_0000) != 0
+private not_after(a: u32, b: u32) -> bool = a == b || before(a, b)
+
+private min_size(a: usize, b: usize) -> usize = if a < b then a else b
+
+// 32 bits of splitmix64 (Steele, Lea and Flood), its state stirred with the counter each time: an
+// initial sequence number nobody off the machine can guess from the last one. Holding `lock`.
+private random32() -> u32
+    tcp.rng += GOLDEN + timer.now_ns()
+    var z = tcp.rng
+    z = (z ^ (z >> 30)) * MIX1
+    z = (z ^ (z >> 27)) * MIX2
+    u32((z ^ (z >> 31)) & 0xffff_ffff)
+
+// Something a caller or a poller may be waiting for has changed.
+private changed()
+    events.wake_all()
+    poll_notify()
+
+private synchronized(s: u8) -> bool = s >= ESTABLISHED
+
+private take_error(t: *Tcb) -> Option[NetError]
+    val e = t.error
+    t.error = ERR_NONE
+    if e == ERR_REFUSED then return Some(NetError.Refused)
+    if e == ERR_RESET then return Some(NetError.Reset)
+    if e == ERR_TIMED_OUT then return Some(NetError.ConnTimedOut)
+    if e == ERR_PIPE then return Some(NetError.Broken)
+    None
+
+// -- Slots and rings -----------------------------------------------------------------------------------
+
+// A zeroed slot, marked in use; a TIME_WAIT slot nobody holds is reclaimed when none is free. Holding
+// `lock`.
+private take_slot() -> Option[usize]
+    var slot = TCP_SOCKETS
+    for i in 0..<TCP_SOCKETS
+        if !tcbs[i].used
+            slot = i
+            break
+    if slot == TCP_SOCKETS
+        for i in 0..<TCP_SOCKETS
+            if tcbs[i].state == TIME_WAIT && tcbs[i].refs == 0
+                if slot == TCP_SOCKETS || tcbs[i].tw_at < tcbs[slot].tw_at then slot = i
+        if slot == TCP_SOCKETS then return None
+        free_slot(slot)
+    val raw: *u8 = ptr_cast(&tcbs[slot])
+    for k in 0..<sizeof(Tcb)
+        raw[k] = 0
+    tcbs[slot].used = true
+    tcbs[slot].rto = INITIAL_RTO
+    tcbs[slot].mss = DEFAULT_MSS
+    tcp_in_use.add(1, Ordering.Relaxed)
+    Some(slot)
+
+// Give the slot back, with its rings. Holding `lock`.
+private free_slot(i: usize)
+    drop_buffers(i)
+    tcbs[i].used = false
+    tcbs[i].state = CLOSED
+    tcbs[i].rtx_at = 0
+    tcbs[i].persist_at = 0
+    tcbs[i].tw_at = 0
+    tcp_in_use.sub(1, Ordering.Relaxed)
+
+private give_buffers(i: usize) -> bool
+    val t = &tcbs[i]
+    if t.buf != null then return true
+    val f = mm.alloc_frames(BUF_FRAMES) match
+        Some(f) -> f
+        None -> return false
+    t.frame = u64(f)
+    t.buf = ptr_cast(usize(u64(mm.to_virt(mm.frame_addr(f)))))
+    tcp.frames += BUF_FRAMES
+    true
+
+private drop_buffers(i: usize)
+    val t = &tcbs[i]
+    if t.buf == null then return
+    mm.free_frames(mm.Frame(u36(t.frame)), BUF_FRAMES)
+    t.buf = null
+    t.frame = 0
+    t.snd_len = 0
+    t.rcv_len = 0
+    tcp.frames -= BUF_FRAMES
+
+private snd_at(t: *Tcb, k: usize) -> *u8 = &t.buf[(t.snd_start + k) % TCP_BUF]
+private rcv_at(t: *Tcb, k: usize) -> *u8 = &t.buf[TCP_BUF + (t.rcv_start + k) % TCP_BUF]
+
+// The receive window this side advertises: the free room in the receive ring.
+private receive_window(t: *Tcb) -> usize = if t.buf == null then 0 else TCP_BUF - t.rcv_len
+
+// A free port from the ephemeral range. Holding `lock`.
+private ephemeral() -> Option[u16]
+    for _ in 0..<EPHEMERAL_COUNT
+        val port = u16(EPHEMERAL_FIRST + tcp.next_port % EPHEMERAL_COUNT)
+        tcp.next_port += 1
+        var taken = false
+        for j in 0..<TCP_SOCKETS
+            if tcbs[j].used && tcbs[j].local_port == port
+                taken = true
+                break
+        if !taken then return Some(port)
+    None
+
+// -- Sending -------------------------------------------------------------------------------------------
+
+// One segment of connection `i`: `flags`, sequence number `seq`, and `len` bytes of the send ring from
+// `seq` on (`seq` at or after SND.UNA when `len` is not 0). A SYN carries the MSS option. Answers false
+// if the frame could not be sent. Holding `lock`.
+private segment(i: usize, seq: u32, flags: u8, len: usize) -> bool
+    val t = &tcbs[i]
+    var out: [ETH_MAX]u8 = [0; ETH_MAX]
+    val header = if (flags & TCP_SYN) != 0 then TCP_HEADER + 4 else TCP_HEADER
+    val h: *TcpHeader = at(out[..], PAYLOAD_AT)
+    h.src_port = be16(t.local_port)
+    h.dst_port = be16(t.remote_port)
+    h.seq = be32(seq)
+    h.ack = be32(if (flags & TCP_ACK) != 0 then t.rcv_nxt else 0)
+    h.offset = u8(header / 4) << 4
+    h.flags = flags
+    val wnd = receive_window(t)
+    h.window = be16(u16(wnd))
+    if (flags & TCP_ACK) != 0 then t.rcv_adv = t.rcv_nxt + u32(wnd)
+    if (flags & TCP_SYN) != 0
+        out[PAYLOAD_AT + TCP_HEADER] = TCP_OPT_MSS
+        out[PAYLOAD_AT + TCP_HEADER + 1] = 4
+        out[PAYLOAD_AT + TCP_HEADER + 2] = u8(TCP_MSS >> 8)
+        out[PAYLOAD_AT + TCP_HEADER + 3] = u8(TCP_MSS & 0xff)
+    if len > 0
+        val off = usize(seq - t.snd_una)
+        for k in 0..<len
+            out[PAYLOAD_AT + header + k] = *snd_at(t, off + k)
+    val total = header + len
+    val dst = Ip(t.remote_ip)
+    val sum = checksum(out[PAYLOAD_AT..<PAYLOAD_AT + total], pseudo_sum(Ip(t.local_ip), dst, PROTO_TCP, total))
+    h.checksum = be16(if SPOIL_TCP_CHECKSUM then sum + 1 else sum)
+    t.segments_out += 1
+    if t.drop_every != 0 && t.segments_out % u64(t.drop_every) == 0
+        t.dropped += 1
+        return true
+    send_ipv4(out[..], t.peer_mac, dst, PROTO_TCP, total)
+
+// A segment that belongs to no connection: an RST answering one, from `src`:`sport` to `dst`:`dport`
+// through `mac`. Holding `lock`.
+private bare(mac: Mac, src: Ip, dst: Ip, sport: u16, dport: u16, seq: u32, ack: u32, flags: u8)
+    var out: [PAYLOAD_AT + TCP_HEADER]u8 = [0; PAYLOAD_AT + TCP_HEADER]
+    val h: *TcpHeader = at(out[..], PAYLOAD_AT)
+    h.src_port = be16(sport)
+    h.dst_port = be16(dport)
+    h.seq = be32(seq)
+    h.ack = be32(ack)
+    h.offset = u8(TCP_HEADER / 4) << 4
+    h.flags = flags
+    val sum = checksum(out[PAYLOAD_AT..<PAYLOAD_AT + TCP_HEADER], pseudo_sum(src, dst, PROTO_TCP, TCP_HEADER))
+    h.checksum = be16(if SPOIL_TCP_CHECKSUM then sum + 1 else sum)
+    val _ = send_ipv4(out[..], mac, dst, PROTO_TCP, TCP_HEADER)
+
+// Send what the windows allow of what is waiting, the FIN after the data, and an ACK if one is owed and
+// nothing else carried it. Holding `lock`.
+private output(i: usize)
+    val t = &tcbs[i]
+    val s = t.state
+    if s == ESTABLISHED || s == CLOSE_WAIT || s == FIN_WAIT_1 || s == CLOSING ||
+            s == LAST_ACK
+        send_data(i)
+    if t.ack_now && synchronized(s)
+        val _ = segment(i, t.snd_nxt, TCP_ACK, 0)
+        t.ack_now = false
+
+private send_data(i: usize)
+    val t = &tcbs[i]
+    if t.buf == null then return
+    loop
+        val flight = t.snd_nxt - t.snd_una
+        val sent = min_size(usize(flight), t.snd_len)
+        val unsent = t.snd_len - sent
+        val fin_due = t.fin_queued && t.snd_nxt == t.fin_seq
+        if unsent == 0 && !fin_due then break
+        var wnd = if t.cwnd < t.snd_wnd then t.cwnd else t.snd_wnd
+        if !RESPECT_WINDOW then wnd = 0x7fff_ffff
+        val usable = if wnd > flight then usize(wnd - flight) else 0
+        var n = min_size(min_size(unsent, usable), usize(t.mss))
+        if unsent > 0 && n == 0
+            if t.snd_wnd == 0 && flight == 0 && t.persist_at == 0
+                if t.persist_wait == 0 then t.persist_wait = t.rto
+                t.persist_at = now_ms() + t.persist_wait
+            break
+        // Silly window avoidance: while something is in flight, a window that allows less than a whole
+        // segment of what is waiting waits for the acknowledgement that opens it.
+        if n < unsent && n < usize(t.mss) && flight > 0 then break
+        var flags = TCP_ACK
+        if n == unsent
+            flags = flags | TCP_PSH
+            if t.fin_queued then flags = flags | TCP_FIN
+        val seq = t.snd_nxt
+        val _ = segment(i, seq, flags, n)
+        if t.rtt_at == 0 && n > 0 && seq == t.snd_max
+            t.rtt_seq = seq + u32(n)
+            t.rtt_at = now_ms()
+        t.snd_nxt = seq + u32(n) + (if (flags & TCP_FIN) != 0 then 1 else 0)
+        if before(t.snd_max, t.snd_nxt) then t.snd_max = t.snd_nxt
+        t.ack_now = false
+        if t.rtx_at == 0 then t.rtx_at = now_ms() + t.rto
+        if (flags & TCP_FIN) != 0 then break
+
+// One segment again from SND.UNA, leaving SND.NXT where it is: the fast retransmit. Holding `lock`.
+private resend_first(i: usize)
+    val t = &tcbs[i]
+    val n = min_size(t.snd_len, usize(t.mss))
+    var flags = TCP_ACK
+    if n == t.snd_len && t.fin_queued && before(t.fin_seq, t.snd_max) then flags = flags | TCP_FIN
+    if n == 0 && (flags & TCP_FIN) == 0 then return
+    val _ = segment(i, t.snd_una, flags, n)
+    t.retransmits += 1
+    tcp.retransmits += 1
+    t.rtt_at = 0
+
+// -- Timers --------------------------------------------------------------------------------------------
+
+// Whether the timer interrupt should wake the stack's thread: a connection exists and a tick has passed
+// since its timers were last looked at. Without the lock, from IRQ context.
+private[net] tcp_tick_due() -> bool =
+    tcp_in_use.load(Ordering.Relaxed) != 0 && timer.now_ms() >= tcp_next_tick.load(Ordering.Relaxed)
+
+// Every timer that is due. From the stack's thread, holding `lock`.
+private[net] tcp_timers(now: u64)
+    tcp_next_tick.store(now + 10, Ordering.Relaxed)
+    for i in 0..<TCP_SOCKETS
+        if !tcbs[i].used then continue
+        if tcbs[i].rtx_at != 0 && now >= tcbs[i].rtx_at then retransmit_timeout(i, now)
+        if !tcbs[i].used then continue
+        if tcbs[i].persist_at != 0 && now >= tcbs[i].persist_at then probe(i, now)
+        if tcbs[i].tw_at != 0 && now >= tcbs[i].tw_at
+            tcbs[i].tw_at = 0
+            if tcbs[i].state == TIME_WAIT || tcbs[i].state == FIN_WAIT_2 then become_closed(i)
+
+private retransmit_timeout(i: usize, now: u64)
+    val t = &tcbs[i]
+    if !RETRANSMIT
+        t.rtx_at = 0
+        return
+    t.backoff += 1
+    val opening = t.state == SYN_SENT || t.state == SYN_RECEIVED
+    if t.backoff > (if opening then SYN_RETRIES else DATA_RETRIES)
+        if synchronized(t.state) then val _ = segment(i, t.snd_nxt, TCP_RST | TCP_ACK, 0)
+        if t.state == SYN_RECEIVED && t.parent != 0
+            free_slot(i)
+            return
+        t.error = ERR_TIMED_OUT
+        become_closed(i)
+        return
+    t.rto = if t.rto * 2 > MAX_RTO then MAX_RTO else t.rto * 2
+    t.timeouts += 1
+    t.retransmits += 1
+    tcp.retransmits += 1
+    t.rtt_at = 0
+    if t.state == SYN_SENT
+        val _ = segment(i, t.iss, TCP_SYN, 0)
+    else if t.state == SYN_RECEIVED
+        val _ = segment(i, t.iss, TCP_SYN | TCP_ACK, 0)
+    else
+        val flight = t.snd_max - t.snd_una
+        t.ssthresh = if flight / 2 > 2 * t.mss then flight / 2 else 2 * t.mss
+        t.cwnd = t.mss
+        t.dupacks = 0
+        t.recovering = false
+        t.snd_nxt = t.snd_una
+        t.rtx_at = 0
+        send_data(i)
+    t.rtx_at = now + t.rto
+
+// The persist timer: the peer's window is still 0 and data is waiting, so ask for its window again.
+private probe(i: usize, now: u64)
+    val t = &tcbs[i]
+    t.persist_at = 0
+    if !synchronized(t.state) || t.snd_wnd != 0 then return
+    if t.snd_len <= usize(t.snd_nxt - t.snd_una) then return
+    val _ = segment(i, t.snd_una - 1, TCP_ACK, 0)
+    t.probes += 1
+    t.persist_wait = if t.persist_wait * 2 > MAX_RTO then MAX_RTO else t.persist_wait * 2
+    t.persist_at = now + t.persist_wait
+
+// An RTT sample of `r` ms into SRTT, RTTVAR and RTO (RFC 6298 § 2; the clock's granularity G is 10 ms).
+private sample(t: *Tcb, r: u64)
+    val r8 = r * 8 + 1
+    if t.srtt == 0
+        t.srtt = r8
+        t.rttvar = r8 / 2
+    else
+        val diff = if t.srtt > r8 then t.srtt - r8 else r8 - t.srtt
+        t.rttvar = (3 * t.rttvar + diff) / 4
+        t.srtt = (7 * t.srtt + r8) / 8
+    val spread = if 4 * t.rttvar < 80 then 80 else 4 * t.rttvar
+    var rto = (t.srtt + spread) / 8
+    if rto < MIN_RTO then rto = MIN_RTO
+    if rto > MAX_RTO then rto = MAX_RTO
+    t.rto = rto
+
+// -- State changes -------------------------------------------------------------------------------------
+
+// The connection is over: CLOSED for its program to see, or freed if nobody holds it. Holding `lock`.
+private become_closed(i: usize)
+    val t = &tcbs[i]
+    t.state = CLOSED
+    t.rtx_at = 0
+    t.persist_at = 0
+    t.tw_at = 0
+    t.shut_wr = true
+    t.snd_len = 0
+    if t.refs == 0 then free_slot(i)
+    changed()
+
+private enter_time_wait(i: usize)
+    val t = &tcbs[i]
+    t.state = TIME_WAIT
+    t.rtx_at = 0
+    t.persist_at = 0
+    t.tw_at = now_ms() + 2 * MSL_MS
+    if t.refs == 0 then drop_buffers(i)
+    changed()
+
+// An acceptable RST (RFC 9293 § 3.10.7.4, second check).
+private reset_received(i: usize)
+    val t = &tcbs[i]
+    val s = t.state
+    if s == SYN_RECEIVED && t.parent != 0
+        free_slot(i)
+        return
+    if s == SYN_RECEIVED
+        t.error = ERR_REFUSED
+    else if s == ESTABLISHED || s == FIN_WAIT_1 || s == FIN_WAIT_2
+        t.error = ERR_RESET
+    else if s == CLOSE_WAIT
+        // Linux: the peer has closed both ways, so what this side writes next has nowhere to go.
+        t.error = ERR_PIPE
+    become_closed(i)
+
+// Queue the FIN after what is in the send ring: shutdown(SHUT_WR) or the last close.
+private queue_fin(i: usize)
+    val t = &tcbs[i]
+    if t.fin_queued then return
+    t.fin_queued = true
+    t.fin_seq = t.snd_una + u32(t.snd_len)
+    t.shut_wr = true
+    if t.state == ESTABLISHED
+        t.state = FIN_WAIT_1
+    else if t.state == CLOSE_WAIT
+        t.state = LAST_ACK
+    output(i)
+    changed()
+
+// -- Receiving -----------------------------------------------------------------------------------------
+
+private struct Seg
+    seq: u32
+    ack: u32
+    flags: u8
+    wnd: u32
+    mss: u32
+    data: []u8
+
+private has(s: Seg, flag: u8) -> bool = (s.flags & flag) != 0
+
+// The MSS option among a SYN's options, or the default.
+private mss_option(opts: []u8) -> u32
+    var k: usize = 0
+    while k < opts.len
+        val kind = opts[k]
+        if kind == TCP_OPT_END then break
+        if kind == TCP_OPT_NOP
+            k += 1
+            continue
+        if k + 1 >= opts.len then break
+        val l = usize(opts[k + 1])
+        if l < 2 || k + l > opts.len then break
+        if kind == TCP_OPT_MSS && l == 4 then return u32(opts[k + 2]) << 8 | u32(opts[k + 3])
+        k += l
+    DEFAULT_MSS
+
+// The connection a segment from `from`:`sport` to `to`:`dport` is for, or a listener on `dport`;
+// TCP_SOCKETS when neither. Holding `lock`.
+private find(from: Ip, to: Ip, sport: u16, dport: u16) -> usize
+    var listener = TCP_SOCKETS
+    for i in 0..<TCP_SOCKETS
+        val t = &tcbs[i]
+        if !t.used || t.local_port != dport then continue
+        if t.state == LISTEN
+            if t.local_ip == 0 || t.local_ip == u32(to) then listener = i
+            continue
+        if t.state == CLOSED then continue
+        if t.remote_ip == u32(from) && t.remote_port == sport && t.local_ip == u32(to) then return i
+    listener
+
+// A segment from `from` to our `to`, its sender's hardware address `mac`. From the stack's thread,
+// holding `lock`.
+private[net] tcp_receive(mac: Mac, from: Ip, to: Ip, bytes: []u8)
+    if bytes.len < TCP_HEADER then return
+    val h: *TcpHeader = at(bytes, 0)
+    val hl = usize(h.offset >> 4) * 4
+    if hl < TCP_HEADER || hl > bytes.len then return
+    if checksum(bytes, pseudo_sum(from, to, PROTO_TCP, bytes.len)) != 0
+        tcp.bad_checksums += 1
+        return
+    val s = Seg(h.seq.get(), h.ack.get(), h.flags, u32(h.window.get()),
+        if (h.flags & TCP_SYN) != 0 then mss_option(bytes[TCP_HEADER..<hl]) else DEFAULT_MSS, bytes[hl..<bytes.len])
+    val sport = h.src_port.get()
+    val dport = h.dst_port.get()
+    val i = find(from, to, sport, dport)
+    if i == TCP_SOCKETS
+        refuse(mac, from, to, sport, dport, s)
+        return
+    val st = tcbs[i].state
+    if st == LISTEN
+        listen_input(i, mac, from, to, sport, s)
+    else if st == SYN_SENT
+        syn_sent_input(i, s)
+    else
+        segment_input(i, s)
+
+// RFC 9293 § 3.10.7.1: a segment for no connection is answered with an RST, unless it is one.
+private refuse(mac: Mac, from: Ip, to: Ip, sport: u16, dport: u16, s: Seg)
+    if has(s, TCP_RST) then return
+    if has(s, TCP_ACK)
+        bare(mac, to, from, dport, sport, s.ack, 0, TCP_RST)
+    else
+        val len = u32(s.data.len) + (if has(s, TCP_SYN) then 1 else 0) + (if has(s, TCP_FIN) then 1 else 0)
+        bare(mac, to, from, dport, sport, 0, s.seq + len, TCP_RST | TCP_ACK)
+
+// How many children of listener `l` are queued, half-open or waiting to be accepted.
+private queued(l: usize) -> u32
+    var n: u32 = 0
+    for c in 0..<TCP_SOCKETS
+        if tcbs[c].used && tcbs[c].parent == l + 1 then n += 1
+    n
+
+// § 3.10.7.2: a SYN to a listener makes a child in SYN-RECEIVED, unless the backlog is full (then it is
+// dropped, and the peer's retransmission tries again later, as Linux does).
+private listen_input(l: usize, mac: Mac, from: Ip, to: Ip, sport: u16, s: Seg)
+    if has(s, TCP_RST) then return
+    if has(s, TCP_ACK)
+        bare(mac, to, from, tcbs[l].local_port, sport, s.ack, 0, TCP_RST)
+        return
+    if !has(s, TCP_SYN) then return
+    if queued(l) >= tcbs[l].backlog
+        tcp.syns_dropped += 1
+        return
+    val c = take_slot() match
+        Some(c) -> c
+        None -> return
+    if !give_buffers(c)
+        free_slot(c)
+        return
+    val parent = &tcbs[l]
+    val t = &tcbs[c]
+    t.state = SYN_RECEIVED
+    t.local_ip = u32(to)
+    t.local_port = parent.local_port
+    t.remote_ip = u32(from)
+    t.remote_port = sport
+    t.peer_mac = mac
+    t.parent = l + 1
+    t.rcvtimeo = parent.rcvtimeo
+    t.sndtimeo = parent.sndtimeo
+    t.nodelay = parent.nodelay
+    t.keepalive = parent.keepalive
+    t.reuseaddr = parent.reuseaddr
+    t.drop_every = parent.drop_every
+    t.irs = s.seq
+    t.rcv_nxt = s.seq + 1
+    t.mss = if s.mss < u32(TCP_MSS) then s.mss else u32(TCP_MSS)
+    t.snd_wnd = s.wnd
+    t.snd_wl1 = s.seq
+    t.iss = random32()
+    t.snd_una = t.iss
+    t.snd_nxt = t.iss + 1
+    t.snd_max = t.snd_nxt
+    t.cwnd = INITIAL_WINDOW * t.mss
+    t.ssthresh = 0xffff
+    val _ = segment(c, t.iss, TCP_SYN | TCP_ACK, 0)
+    t.rtt_seq = t.snd_nxt
+    t.rtt_at = now_ms()
+    t.rtx_at = now_ms() + t.rto
+
+// § 3.10.7.3: our SYN is out.
+private syn_sent_input(i: usize, s: Seg)
+    val t = &tcbs[i]
+    val ack_ok = has(s, TCP_ACK) && before(t.iss, s.ack) && not_after(s.ack, t.snd_max)
+    if has(s, TCP_ACK) && !ack_ok
+        if !has(s, TCP_RST)
+            bare(t.peer_mac, Ip(t.local_ip), Ip(t.remote_ip), t.local_port, t.remote_port, s.ack, 0, TCP_RST)
+        return
+    if has(s, TCP_RST)
+        if ack_ok && HONOUR_RST
+            t.error = ERR_REFUSED
+            become_closed(i)
+        return
+    if !has(s, TCP_SYN) then return
+    t.irs = s.seq
+    t.rcv_nxt = s.seq + 1
+    t.mss = if s.mss < u32(TCP_MSS) then s.mss else u32(TCP_MSS)
+    t.cwnd = INITIAL_WINDOW * t.mss
+    t.snd_wnd = s.wnd
+    t.snd_wl1 = s.seq
+    t.snd_wl2 = s.ack
+    if ack_ok
+        t.snd_una = s.ack
+        if t.rtt_at != 0 then sample(t, now_ms() - t.rtt_at)
+        t.rtt_at = 0
+        t.rtx_at = 0
+        t.backoff = 0
+        t.state = ESTABLISHED
+        t.was_connected = true
+        t.ack_now = true
+        output(i)
+        changed()
+    else
+        // A simultaneous open: both sides sent a SYN.
+        t.state = SYN_RECEIVED
+        val _ = segment(i, t.iss, TCP_SYN | TCP_ACK, 0)
+
+// § 3.10.7.4: every other state.
+private segment_input(i: usize, s: Seg)
+    val t = &tcbs[i]
+    // A retransmission of the SYN that made this child: its SYN-ACK was lost.
+    if t.state == SYN_RECEIVED && has(s, TCP_SYN) && !has(s, TCP_ACK) && s.seq == t.irs
+        val _ = segment(i, t.iss, TCP_SYN | TCP_ACK, 0)
+        return
+
+    // First: is it in the window?
+    val rwnd = u32(receive_window(t))
+    val seg_len = u32(s.data.len) + (if has(s, TCP_SYN) then 1 else 0) + (if has(s, TCP_FIN) then 1 else 0)
+    if s.data.len > 0 && not_after(t.rcv_nxt, s.seq) && before(t.rcv_nxt + rwnd, s.seq + u32(s.data.len))
+        t.beyond_window += 1
+    var acceptable = false
+    if seg_len == 0
+        acceptable = if rwnd == 0 then s.seq == t.rcv_nxt else
+            not_after(t.rcv_nxt, s.seq) && before(s.seq, t.rcv_nxt + rwnd)
+    else if rwnd > 0
+        val last = s.seq + seg_len - 1
+        acceptable = (not_after(t.rcv_nxt, s.seq) && before(s.seq, t.rcv_nxt + rwnd)) ||
+            (not_after(t.rcv_nxt, last) && before(last, t.rcv_nxt + rwnd))
+    if !acceptable
+        if !has(s, TCP_RST)
+            t.ack_now = true
+            output(i)
+        return
+
+    // Second: RST, only at exactly RCV.NXT; one elsewhere in the window gets a challenge ACK (RFC 5961).
+    if has(s, TCP_RST)
+        if !HONOUR_RST then return
+        if s.seq != t.rcv_nxt
+            t.ack_now = true
+            output(i)
+            return
+        reset_received(i)
+        return
+
+    // Fourth: a SYN here is answered with a challenge ACK and dropped (RFC 5961 § 4).
+    if has(s, TCP_SYN)
+        t.ack_now = true
+        output(i)
+        return
+
+    // Fifth: the ACK.
+    if !has(s, TCP_ACK) then return
+    if t.state == SYN_RECEIVED
+        if !(before(t.snd_una, s.ack) && not_after(s.ack, t.snd_max))
+            bare(t.peer_mac, Ip(t.local_ip), Ip(t.remote_ip), t.local_port, t.remote_port, s.ack, 0, TCP_RST)
+            return
+        t.snd_una = s.ack
+        if t.rtt_at != 0 then sample(t, now_ms() - t.rtt_at)
+        t.rtt_at = 0
+        t.rtx_at = 0
+        t.backoff = 0
+        t.snd_wnd = s.wnd
+        t.snd_wl1 = s.seq
+        t.snd_wl2 = s.ack
+        t.state = ESTABLISHED
+        t.was_connected = true
+        if t.parent != 0
+            t.born = tcp.born
+            tcp.born += 1
+        changed()
+    else
+        if before(t.snd_una, s.ack) && not_after(s.ack, t.snd_max)
+            acked(i, s.ack)
+        else if s.ack == t.snd_una
+            duplicate_ack(i, s)
+        else if before(t.snd_max, s.ack)
+            t.ack_now = true
+            output(i)
+            return
+        if before(t.snd_wl1, s.seq) || (t.snd_wl1 == s.seq && not_after(t.snd_wl2, s.ack))
+            t.snd_wnd = s.wnd
+            t.snd_wl1 = s.seq
+            t.snd_wl2 = s.ack
+            if s.wnd > 0
+                t.persist_at = 0
+                t.persist_wait = 0
+        val fin_acked = t.fin_queued && before(t.fin_seq, t.snd_una)
+        if fin_acked
+            if t.state == FIN_WAIT_1
+                t.state = FIN_WAIT_2
+                if t.refs == 0 then t.tw_at = now_ms() + ORPHAN_FIN_WAIT_2_MS
+                changed()
+            else if t.state == CLOSING
+                enter_time_wait(i)
+            else if t.state == LAST_ACK
+                become_closed(i)
+                return
+
+    // Seventh: the data, in order only.
+    var data = s.data
+    var seq = s.seq
+    var fin = has(s, TCP_FIN)
+    if before(seq, t.rcv_nxt)
+        val skip = min_size(usize(t.rcv_nxt - seq), data.len)
+        data = data[skip..<data.len]
+        seq = seq + u32(skip)
+    val receiving = t.state == ESTABLISHED || t.state == FIN_WAIT_1 || t.state == FIN_WAIT_2
+    if data.len > 0 && receiving
+        if seq != t.rcv_nxt
+            // Out of order: dropped, and the duplicate ACK tells the sender where the hole is.
+            t.ack_now = true
+            fin = false
+        else if t.refs == 0 && t.parent == 0
+            // Its program has closed it: nobody will read this (Linux answers with an RST too).
+            val _ = segment(i, t.snd_nxt, TCP_RST | TCP_ACK, 0)
+            become_closed(i)
+            return
+        else
+            val n = min_size(data.len, TCP_BUF - t.rcv_len)
+            for k in 0..<n
+                *rcv_at(t, t.rcv_len + k) = data[k]
+            t.rcv_len += n
+            t.rcv_nxt += u32(n)
+            if n < data.len then fin = false
+            t.ack_now = true
+            if n > 0
+                events.wake_all()
+                if DATA_WAKES_POLLERS then poll_notify()
+    else if data.len > 0 || seq != t.rcv_nxt
+        fin = false
+
+    // Eighth: the FIN, once everything before it is in.
+    if fin && HONOUR_FIN && synchronized(t.state)
+        t.rcv_nxt += 1
+        t.fin_received = true
+        t.ack_now = true
+        if t.state == ESTABLISHED
+            t.state = CLOSE_WAIT
+        else if t.state == FIN_WAIT_1
+            t.state = CLOSING
+        else if t.state == FIN_WAIT_2
+            enter_time_wait(i)
+        else if t.state == TIME_WAIT
+            t.tw_at = now_ms() + 2 * MSL_MS
+        changed()
+    output(i)
+
+// The peer acknowledged up to `ack`, past SND.UNA. Holding `lock`.
+private acked(i: usize, ack: u32)
+    val t = &tcbs[i]
+    val data = min_size(usize(ack - t.snd_una), t.snd_len)
+    t.snd_start = (t.snd_start + data) % TCP_BUF
+    t.snd_len -= data
+    t.snd_una = ack
+    if before(t.snd_nxt, t.snd_una) then t.snd_nxt = t.snd_una
+    if t.rtt_at != 0 && not_after(t.rtt_seq, ack)
+        sample(t, now_ms() - t.rtt_at)
+        t.rtt_at = 0
+    t.backoff = 0
+    if t.recovering && before(ack, t.recover)
+        // NewReno (RFC 6582 § 3.2): a partial acknowledgement shows the next hole; resend it at once and
+        // stay in recovery, the window deflated by what was acknowledged.
+        resend_first(i)
+        t.cwnd = if t.cwnd > u32(data) + t.mss then t.cwnd - u32(data) + t.mss else t.mss
+    else
+        if t.recovering
+            t.recovering = false
+            t.cwnd = t.ssthresh
+        else if t.cwnd < t.ssthresh
+            t.cwnd += t.mss
+        else
+            t.cwnd += if t.mss * t.mss / t.cwnd > 0 then t.mss * t.mss / t.cwnd else 1
+        t.dupacks = 0
+    if t.cwnd > MAX_CWND then t.cwnd = MAX_CWND
+    t.rtx_at = if t.snd_una == t.snd_max then 0 else now_ms() + t.rto
+    if data > 0 then changed()
+
+// An ACK at SND.UNA again: the third such in a row with data in flight retransmits and starts fast
+// recovery (RFC 5681 § 3.2, RFC 6582); each further one inflates the window by a segment. Unlike RFC
+// 5681's definition, an ACK whose window moved still counts: slirp's window moves with nearly every
+// ACK it sends, as its host socket drains, which would leave fast retransmit almost never taken.
+private duplicate_ack(i: usize, s: Seg)
+    val t = &tcbs[i]
+    if s.data.len != 0 || t.snd_max == t.snd_una || has(s, TCP_FIN) then return
+    if t.recovering
+        t.cwnd += t.mss
+        return
+    t.dupacks += 1
+    if t.dupacks == 3 && RETRANSMIT
+        val flight = t.snd_max - t.snd_una
+        t.ssthresh = if flight / 2 > 2 * t.mss then flight / 2 else 2 * t.mss
+        t.recovering = true
+        t.recover = t.snd_max
+        resend_first(i)
+        t.fast_retransmits += 1
+        t.cwnd = t.ssthresh + 3 * t.mss
+
+// -- The calls keel.proc makes -------------------------------------------------------------------------
+//
+// Each takes `lock` itself. A slot number the caller holds a reference to (a descriptor, counted) is
+// never freed or reused under it.
+
+// A new socket: CLOSED, bound to nothing, holding no rings yet.
+tcp_open() -> Result[usize, NetError]
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    if !running() then return Err(NetError.NoNet)
+    take_slot() match
+        Some(i) ->
+            tcbs[i].refs = 1
+            Ok(i)
+        None -> Err(NetError.TableFull)
+
+// One more descriptor stands for connection `i`.
+tcp_hold(i: usize)
+    val flags = lock.lock()
+    if tcbs[i].used then tcbs[i].refs += 1
+    lock.unlock(flags)
+
+// A descriptor standing for `i` is gone. The last one closes it: a listener with every child it had not
+// handed out, a connection with a FIN after its data (or an RST if data it received was never read),
+// and anything not connected at once.
+tcp_release(i: usize)
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    val t = &tcbs[i]
+    if !t.used || t.refs == 0 then return
+    t.refs -= 1
+    if t.refs > 0 then return
+    val s = t.state
+    if s == LISTEN
+        for c in 0..<TCP_SOCKETS
+            if tcbs[c].used && tcbs[c].parent == i + 1
+                if synchronized(tcbs[c].state) then val _ = segment(c, tcbs[c].snd_nxt, TCP_RST | TCP_ACK, 0)
+                free_slot(c)
+        free_slot(i)
+    else if s == CLOSED || s == SYN_SENT || s == SYN_RECEIVED
+        free_slot(i)
+    else if s == ESTABLISHED || s == CLOSE_WAIT
+        if t.rcv_len > 0
+            val _ = segment(i, t.snd_nxt, TCP_RST | TCP_ACK, 0)
+            free_slot(i)
+        else
+            queue_fin(i)
+    else if s == FIN_WAIT_2
+        t.tw_at = now_ms() + ORPHAN_FIN_WAIT_2_MS
+    else if s == TIME_WAIT
+        drop_buffers(i)
+    changed()
+
+// Whether `port` may be bound by `i` (SO_REUSEADDR lets it share a port with anything but a listener).
+private port_free(i: usize, port: u16) -> bool
+    for j in 0..<TCP_SOCKETS
+        if j == i || !tcbs[j].used || tcbs[j].local_port != port then continue
+        if tcbs[j].state == LISTEN || !tcbs[i].reuseaddr then return false
+    true
+
+// bind: `ip` 0 (any) or one of keel's own; port 0 picks one.
+tcp_bind(i: usize, ip: u32, port: u16) -> Result[unit, NetError]
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    val t = &tcbs[i]
+    if t.state != CLOSED || t.local_port != 0 || t.was_connected then return Err(NetError.Invalid)
+    var p = port
+    if p == 0
+        p = ephemeral() match
+            Some(e) -> e
+            None -> return Err(NetError.PortInUse)
+    else if !port_free(i, p)
+        return Err(NetError.PortInUse)
+    t.local_ip = ip
+    t.local_port = p
+    Ok(())
+
+// listen: at most `backlog` children queued (1 to TCP_BACKLOG_MAX), half-open or waiting for accept.
+tcp_listen(i: usize, backlog: u32) -> Result[unit, NetError]
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    val t = &tcbs[i]
+    if t.state != CLOSED && t.state != LISTEN then return Err(NetError.Invalid)
+    if t.was_connected then return Err(NetError.Invalid)
+    if t.local_port == 0
+        t.local_port = ephemeral() match
+            Some(e) -> e
+            None -> return Err(NetError.PortInUse)
+    t.backlog = if backlog < 1 then 1 else if backlog > TCP_BACKLOG_MAX then TCP_BACKLOG_MAX else backlog
+    t.state = LISTEN
+    Ok(())
+
+private deadline_after(ms: u64) -> u64 = if ms == 0 then NEVER else now_ms() + ms
+
+// accept: the oldest child that is established, its slot now held by the caller; waits (SO_RCVTIMEO,
+// then EAGAIN) unless `nonblock`.
+tcp_accept(p: *Process, i: usize, nonblock: bool) -> Result[usize, NetError]
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    val deadline = deadline_after(tcbs[i].rcvtimeo)
+    loop
+        if tcbs[i].state != LISTEN then return Err(NetError.Invalid)
+        var best = TCP_SOCKETS
+        for c in 0..<TCP_SOCKETS
+            val t = &tcbs[c]
+            if !t.used || t.parent != i + 1 || t.state == SYN_RECEIVED then continue
+            if best == TCP_SOCKETS || t.born < tcbs[best].born then best = c
+        if best != TCP_SOCKETS
+            tcbs[best].parent = 0
+            tcbs[best].refs = 1
+            return Ok(best)
+        if nonblock then return Err(NetError.WouldBlock)
+        wait_for(p, deadline) match
+            Expired -> return Err(NetError.TimedOut)
+            Interrupted -> return Err(NetError.Interrupted)
+            Woken -> ()
+
+// connect to `ip`:`port`: the SYN is sent, and the caller waits until the connection is established or
+// refused, or a signal comes (the connection goes on: a second connect is EALREADY); `nonblock` answers
+// EINPROGRESS at once, and poll's POLLOUT and SO_ERROR tell how it went.
+tcp_connect(p: *Process, i: usize, ip: u32, port: u16, nonblock: bool) -> Result[unit, NetError]
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    val t = &tcbs[i]
+    if t.state == SYN_SENT || t.state == SYN_RECEIVED
+        // Linux: a blocking connect made again (after a signal, or SA_RESTART) waits for the first.
+        if nonblock then return Err(NetError.Already)
+        return connected(p, i)
+    if t.state == LISTEN then return Err(NetError.Invalid)
+    if t.state != CLOSED || t.was_connected then return Err(NetError.Connected)
+    if !running() then return Err(NetError.NoNet)
+    if port == 0 then return Err(NetError.Refused)
+    if !give_buffers(i) then return Err(NetError.NoBuffers)
+    if t.local_port == 0
+        t.local_port = ephemeral() match
+            Some(e) -> e
+            None -> return Err(NetError.PortInUse)
+    val dst = Ip(ip)
+    t.local_ip = u32(source_for(dst))
+    t.remote_ip = ip
+    t.remote_port = port
+    t.error = ERR_NONE
+    t.state = SYN_SENT
+    t.peer_mac = resolve(dst, now_ms() + 3000) match
+        Some(m) -> m
+        None ->
+            t.state = CLOSED
+            return Err(NetError.NoRoute)
+    t.iss = random32()
+    t.snd_una = t.iss
+    t.snd_nxt = t.iss + 1
+    t.snd_max = t.snd_nxt
+    t.snd_start = 0
+    t.snd_len = 0
+    t.rcv_start = 0
+    t.rcv_len = 0
+    t.ssthresh = 0xffff
+    val _ = segment(i, t.iss, TCP_SYN, 0)
+    t.rtt_seq = t.snd_nxt
+    t.rtt_at = now_ms()
+    t.rtx_at = now_ms() + t.rto
+    if nonblock then return Err(NetError.InProgress)
+    connected(p, i)
+
+// Wait until connection `i`'s opening ends: established, refused, timed out, or a signal. Holding `lock`.
+private connected(p: *Process, i: usize) -> Result[unit, NetError]
+    loop
+        val s = tcbs[i].state
+        if s == SYN_SENT || s == SYN_RECEIVED
+            wait_for(p, NEVER) match
+                Interrupted -> return Err(NetError.Interrupted)
+                else ()
+            continue
+        if s == CLOSED
+            return take_error(&tcbs[i]) match
+                Some(e) -> Err(e)
+                None -> Err(NetError.Refused)
+        return Ok(())
+
+// Up to `into.len` bytes received on `i`: 0 at the end of the stream; waits for data (SO_RCVTIMEO,
+// then EAGAIN) unless `nonblock`. `peek` leaves the bytes where they are.
+tcp_recv(p: *Process, i: usize, into: []u8, nonblock: bool, peek: bool) -> Result[usize, NetError]
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    val deadline = deadline_after(tcbs[i].rcvtimeo)
+    loop
+        val t = &tcbs[i]
+        if t.state == LISTEN then return Err(NetError.NotConnected)
+        if t.rcv_len > 0 && into.len > 0
+            val n = min_size(into.len, t.rcv_len)
+            for k in 0..<n
+                into[k] = *rcv_at(t, k)
+            if !peek
+                t.rcv_start = (t.rcv_start + n) % TCP_BUF
+                t.rcv_len -= n
+                // A window update once the window has opened by two segments or half the ring.
+                val edge = t.rcv_nxt + u32(receive_window(t))
+                val opened = edge - t.rcv_adv
+                if synchronized(t.state) && t.state != TIME_WAIT &&
+                        (usize(opened) >= 2 * TCP_MSS || usize(opened) >= TCP_BUF / 2)
+                    t.ack_now = true
+                    output(i)
+            return Ok(n)
+        if into.len == 0 then return Ok(0)
+        val e = take_error(t)
+        if e.is_some() then return Err(e.unwrap())
+        if t.fin_received || t.shut_rd then return Ok(0)
+        if t.state == CLOSED
+            return if t.was_connected then Ok(0) else Err(NetError.NotConnected)
+        if nonblock then return Err(NetError.WouldBlock)
+        wait_for(p, deadline) match
+            Expired -> return Err(NetError.TimedOut)
+            Interrupted -> return Err(NetError.Interrupted)
+            Woken -> ()
+
+// Up to `data.len` bytes into `i`'s send ring, sent as the windows allow; waits for room (SO_SNDTIMEO,
+// then EAGAIN) unless `nonblock`, and for the connection while it is being made. `Broken` (EPIPE) once
+// this side has shut down writing or the connection is gone.
+tcp_send(p: *Process, i: usize, data: []const u8, nonblock: bool) -> Result[usize, NetError]
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    val deadline = deadline_after(tcbs[i].sndtimeo)
+    loop
+        val t = &tcbs[i]
+        val e = take_error(t)
+        if e.is_some() then return Err(e.unwrap())
+        if t.shut_wr then return Err(NetError.Broken)
+        val s = t.state
+        if s == LISTEN then return Err(NetError.NotConnected)
+        if s == CLOSED
+            return Err(if t.was_connected then NetError.Broken else NetError.NotConnected)
+        if s == ESTABLISHED || s == CLOSE_WAIT
+            val room = TCP_BUF - t.snd_len
+            if room > 0
+                val n = min_size(room, data.len)
+                for k in 0..<n
+                    *snd_at(t, t.snd_len + k) = data[k]
+                t.snd_len += n
+                output(i)
+                return Ok(n)
+        else if s != SYN_SENT && s != SYN_RECEIVED
+            return Err(NetError.Broken)
+        if nonblock then return Err(NetError.WouldBlock)
+        wait_for(p, deadline) match
+            Expired -> return Err(NetError.TimedOut)
+            Interrupted -> return Err(NetError.Interrupted)
+            Woken -> ()
+
+// shutdown(how): 0 SHUT_RD (reads answer what is queued, then 0), 1 SHUT_WR (a FIN after the data;
+// writes are EPIPE), 2 both.
+tcp_shutdown(i: usize, how: u64) -> Result[unit, NetError]
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    val t = &tcbs[i]
+    if !synchronized(t.state) then return Err(NetError.NotConnected)
+    if how == 0 || how == 2
+        t.shut_rd = true
+        changed()
+    if how == 1 || how == 2
+        if t.state == ESTABLISHED || t.state == CLOSE_WAIT
+            queue_fin(i)
+        else
+            t.shut_wr = true
+    Ok(())
+
+// What ppoll sees on `i`, as Linux's tcp_poll: a listener is readable while a child waits to be
+// accepted; a connection readable with data queued or its reading side shut, writable while
+// connected with room in the send ring; POLLHUP once both directions are done or it is closed,
+// POLLERR while an error waits to be reported. Nothing while a connection is being made.
+tcp_poll(i: usize) -> u16
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    val t = &tcbs[i]
+    if !t.used then return POLLERR | POLLHUP
+    if t.state == LISTEN
+        for c in 0..<TCP_SOCKETS
+            if tcbs[c].used && tcbs[c].parent == i + 1 && tcbs[c].state != SYN_RECEIVED
+                return POLLIN | POLLRDNORM
+        return 0
+    var m: u16 = 0
+    if t.error != ERR_NONE then m = m | POLLERR
+    if t.state == CLOSED || (t.shut_wr && t.fin_received) then m = m | POLLHUP
+    if t.state == SYN_SENT || t.state == SYN_RECEIVED then return m
+    // A connection that ended (`become_closed` shut both ways) reads its end, as Linux's RCV_SHUTDOWN;
+    // a socket never connected does not.
+    if t.rcv_len > 0 || t.fin_received || t.shut_rd || (t.state == CLOSED && t.shut_wr)
+        m = m | POLLIN | POLLRDNORM
+    if !t.shut_wr
+        val open = (t.state == ESTABLISHED || t.state == CLOSE_WAIT) && t.snd_len < TCP_BUF
+        if open || t.state == CLOSED then m = m | POLLOUT | POLLWRNORM
+    m
+
+// The two ends of `i`: local address and port, remote address and port, and whether it is connected.
+tcp_names(i: usize) -> (u32, u16, u32, u16, bool)
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    val t = &tcbs[i]
+    (t.local_ip, t.local_port, t.remote_ip, t.remote_port, synchronized(t.state) || t.state == SYN_RECEIVED)
+
+// The socket options a stream socket keeps (shared by every descriptor on it, as Linux's are).
+enum TcpOption
+    RcvTimeo                                    // ms, 0 for ever
+    SndTimeo
+    ReuseAddr
+    KeepAlive
+    NoDelay
+    DropEvery                                   // keel's own, test-only: drop every Nth segment sent
+    AcceptConn                                  // read-only: 1 for a listener
+    MaxSegment                                  // read-only: the MSS in use
+
+tcp_set(i: usize, o: TcpOption, v: u64)
+    val flags = lock.lock()
+    val t = &tcbs[i]
+    o match
+        RcvTimeo -> t.rcvtimeo = v
+        SndTimeo -> t.sndtimeo = v
+        ReuseAddr -> t.reuseaddr = v != 0
+        KeepAlive -> t.keepalive = v != 0
+        NoDelay -> t.nodelay = v != 0
+        DropEvery -> t.drop_every = u32(v & 0xffff_ffff)
+        else ()
+    lock.unlock(flags)
+
+tcp_get(i: usize, o: TcpOption) -> u64
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    val t = &tcbs[i]
+    o match
+        RcvTimeo -> t.rcvtimeo
+        SndTimeo -> t.sndtimeo
+        ReuseAddr -> if t.reuseaddr then 1 else 0
+        KeepAlive -> if t.keepalive then 1 else 0
+        NoDelay -> if t.nodelay then 1 else 0
+        DropEvery -> u64(t.drop_every)
+        AcceptConn -> if t.state == LISTEN then 1 else 0
+        MaxSegment -> if synchronized(t.state) then u64(t.mss) else u64(TCP_MSS)
+
+// SO_ERROR: the error waiting to be reported, now reported.
+tcp_take_error(i: usize) -> Option[NetError]
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    take_error(&tcbs[i])
+
+tcp_conn_stats(i: usize) -> TcpConnStats
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    val t = &tcbs[i]
+    TcpConnStats(t.retransmits, t.timeouts, t.fast_retransmits, t.probes, t.dropped, t.beyond_window)
+
+tcp_table() -> TcpTable
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    var live: u64 = 0
+    var waiting: u64 = 0
+    for i in 0..<TCP_SOCKETS
+        if !tcbs[i].used then continue
+        if tcbs[i].state == TIME_WAIT then waiting += 1 else live += 1
+    TcpTable(live, waiting, tcp.frames, tcp.retransmits, tcp.bad_checksums, tcp.syns_dropped)
+
+// How many stream sockets a descriptor still stands for.
+tcp_sockets_held() -> usize
+    val flags = lock.lock()
+    defer lock.unlock(flags)
+    var n: usize = 0
+    for i in 0..<TCP_SOCKETS
+        if tcbs[i].used && tcbs[i].refs > 0 then n += 1
+    n
+
+// The stack is down: every connection is dropped where it stands and its rings given back.
+private[net] tcp_down()
+    val flags = lock.lock()
+    for i in 0..<TCP_SOCKETS
+        if tcbs[i].used then free_slot(i)
+    lock.unlock(flags)

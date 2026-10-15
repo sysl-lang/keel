@@ -1,15 +1,20 @@
 module keel.net
 
 // A minimal IPv4 stack over the virtio network card: Ethernet, ARP, IPv4 (no fragments, no options sent),
-// ICMP echo in both directions, and UDP — a kernel echo service on port 7 and a small table of
-// datagram sockets for user programs.
+// ICMP echo in both directions, UDP — a kernel echo service on port 7 and a small table of datagram
+// sockets for user programs — and TCP (tcp.sysl).
 //
 //   up() / down()          bring the card and the stack's thread up; stop and join the thread
 //   ping(ip, ms)           an ICMP echo to `ip`, answered within `ms` or not
 //   echo_wait(ms)          wait for the port-7 echo service to see the word "bye"
-//   socket_* functions     what keel.proc's socket system calls are made of
+//   socket_* functions     what keel.proc's datagram socket system calls are made of
+//   tcp_* functions        what its stream socket calls are made of (tcp.sysl)
 //
 // The address is QEMU's user-mode network's (slirp): keel is 10.0.2.15/24, the gateway 10.0.2.2.
+//
+// A packet for 127.0.0.0/8 or for keel's own address never reaches the card: `send_ipv4` puts the frame
+// in the loopback ring, and the stack's thread takes it from there as if it had been received. That is
+// what lets a client and a server on keel itself talk TCP to each other.
 //
 // One IrqLock, `lock`, guards everything here and in nic.sysl: the card's rings, the ARP table, the
 // sockets and the counters. The card's interrupt takes it to acknowledge and wake `events`. The stack's
@@ -23,7 +28,7 @@ module keel.net
 // (`net_tick`), and the sleeper looks at the clock. That is a 10 ms timeout made of the two mechanisms
 // keel already has; keel has no timed sleep.
 
-import keel.sched.{IrqLock, Thread, WaitQueue, join, poll_notify, spawn}
+import keel.sched.{IrqLock, Process, Thread, WaitQueue, join, poll_notify, sleep_interruptibly, spawn}
 import keel.timer
 import sysl.sync.{Atomic, Ordering}
 
@@ -38,6 +43,20 @@ private var timed_waiters: Atomic[u64] = Atomic(0)
 our_ip() -> Ip = ip(10, 0, 2, 15)
 gateway() -> Ip = ip(10, 0, 2, 2)
 private const NETMASK: u32 = 0xffff_ff00
+
+// Whether a packet for `a` stays inside keel: the loopback network, or keel's own address.
+private[net] is_local(a: Ip) -> bool = (u32(a) >> 24) == 127 || a == our_ip()
+
+// The source address of a packet keel sends to `dst`: a loopback address answers from itself.
+private[net] source_for(dst: Ip) -> Ip = if (u32(dst) >> 24) == 127 then dst else our_ip()
+
+// The loopback ring: frames `send_ipv4` kept for the stack's thread, oldest at `loop_head`. A frame
+// finding it full is dropped, as the card drops one finding no transmit buffer.
+private const LOOP_SLOTS: usize = 32
+private var loop_frames: [LOOP_SLOTS][ETH_MAX]u8
+private var loop_lens: [LOOP_SLOTS]usize
+private var loop_head: usize = 0
+private var loop_count: usize = 0
 const ECHO_PORT: u16 = 7
 
 // Off only to show the receiving side checks: with it on, every IPv4 header keel sends carries a
@@ -97,6 +116,10 @@ private struct Stack
 
 private var stack: Stack
 private var sockets: [SOCKETS]Socket
+
+// For tcp.sysl, holding `lock`: whether the stack runs, and the card's address.
+private[net] running() -> bool = stack.running
+private[net] card_mac() -> Mac = stack.mac
 private var netd_thread: Option[&sync Thread] = None
 
 // Bring the card up and start the stack's thread. Answers the card's address, or None if there is no
@@ -121,6 +144,7 @@ down()
         Some(t) -> join(t)
         None -> ()
     netd_thread = None
+    tcp_down()
 
 stats() -> NetStats
     val flags = lock.lock()
@@ -128,9 +152,10 @@ stats() -> NetStats
     lock.unlock(flags)
     s
 
-// The timer's interrupt, on every core, every tick: wake whoever is waiting with a deadline.
+// The timer's interrupt, on every core, every tick: wake whoever is waiting with a deadline, and the
+// stack's thread when a TCP timer may be due (`tcp_tick_due`).
 net_tick()
-    if timed_waiters.load(Ordering.Relaxed) == 0 then return
+    if timed_waiters.load(Ordering.Relaxed) == 0 && !tcp_tick_due() then return
     val flags = lock.lock()
     events.wake_all()
     lock.unlock(flags)
@@ -147,8 +172,27 @@ private[net] wait_until(deadline: u64) -> bool
     timed_waiters.sub(1, Ordering.Relaxed)
     true
 
-// The stack's thread: handle every received frame, then sleep until the card's interrupt says there
-// are more.
+// How a process's wait for the network ended.
+enum Waited
+    Woken                                       // look again
+    Expired                                     // the deadline passed
+    Interrupted                                 // a signal for the process: EINTR
+
+// No deadline.
+const NEVER: u64 = 0xffff_ffff_ffff_ffff
+
+// A process's thread sleeps on `events` until woken, unless `deadline` (`now_ms` terms, NEVER for none)
+// has passed or a signal comes for `p`. Holding `lock`, which the sleep gives up.
+private[net] wait_for(p: *Process, deadline: u64) -> Waited
+    val timed = deadline != NEVER
+    if timed && now_ms() >= deadline then return Waited.Expired
+    if timed then timed_waiters.add(1, Ordering.Relaxed)
+    val woken = sleep_interruptibly(p, &events, &lock)
+    if timed then timed_waiters.sub(1, Ordering.Relaxed)
+    if woken then Waited.Woken else Waited.Interrupted
+
+// The stack's thread: handle every received frame, then every looped-back one, then the TCP timers that
+// are due, then sleep until the card's interrupt, a looped-back frame or a tick says there is more.
 private netd()
     val flags = lock.lock()
     loop
@@ -157,7 +201,16 @@ private netd()
             Some((frame, id)) ->
                 receive(frame)
                 rx_done(id)
-            None -> events.sleep(&lock)
+                continue
+            None -> ()
+        if loop_count > 0
+            // Handled where it lies: a frame sent meanwhile goes behind it, and the slot is let go after.
+            receive(loop_frames[loop_head][0..<loop_lens[loop_head]])
+            loop_head = (loop_head + 1) % LOOP_SLOTS
+            loop_count -= 1
+            continue
+        tcp_timers(now_ms())
+        events.sleep(&lock)
     stack.running = false
     lock.unlock(flags)
 
@@ -220,6 +273,7 @@ private lookup(ip: Ip) -> Option[Mac]
 // The hardware address to send a packet for `dst` to: its own on our subnet, the gateway's otherwise.
 // Asks by ARP, once a second, until `deadline`. Holding `lock`; may sleep.
 private[net] resolve(dst: Ip, deadline: u64) -> Option[Mac]
+    if is_local(dst) then return Some(stack.mac)
     val hop = if (u32(dst) & NETMASK) == (u32(our_ip()) & NETMASK) then dst else gateway()
     var asked_at: u64 = 0
     loop
@@ -247,7 +301,8 @@ private receive_ipv4(frame: []u8)
     if (h.frag.get() & (FRAG_MORE | FRAG_OFFSET)) != 0
         stack.stats.fragments_dropped += 1
         return
-    if Ip(h.dst.get()) != our_ip() then return
+    val dst = Ip(h.dst.get())
+    if !is_local(dst) then return
     val eth: *EthHeader = at(frame, 0)
     val from = Ip(h.src.get())
     val payload = frame[ETH_HEADER + header_len..<ETH_HEADER + total]
@@ -255,13 +310,16 @@ private receive_ipv4(frame: []u8)
         receive_icmp(eth.src, from, payload)
     else if h.proto == PROTO_UDP
         receive_udp(eth.src, from, payload)
+    else if h.proto == PROTO_TCP
+        tcp_receive(eth.src, from, dst, payload)
 
 // The offset of an IPv4 packet's payload in a frame keel builds (no options).
-private const PAYLOAD_AT: usize = ETH_HEADER + IPV4_HEADER
+private[net] const PAYLOAD_AT: usize = ETH_HEADER + IPV4_HEADER
 
 // Put the Ethernet and IPv4 headers in front of the `len` bytes of payload already at `PAYLOAD_AT` in
-// `out`, and send the frame. Holding `lock`.
-private send_ipv4(out: []u8, to: Mac, dst: Ip, proto: u8, len: usize) -> bool
+// `out`, and send the frame: to the card, or into the loopback ring for an address of keel's own.
+// Holding `lock`.
+private[net] send_ipv4(out: []u8, to: Mac, dst: Ip, proto: u8, len: usize) -> bool
     val eth: *EthHeader = at(out, 0)
     eth.dst = to
     eth.src = stack.mac
@@ -276,11 +334,20 @@ private send_ipv4(out: []u8, to: Mac, dst: Ip, proto: u8, len: usize) -> bool
     h.ttl = 64
     h.proto = proto
     h.checksum = be16(0)
-    h.src = be32(u32(our_ip()))
+    h.src = be32(u32(source_for(dst)))
     h.dst = be32(u32(dst))
     val sum = checksum(out[ETH_HEADER..<PAYLOAD_AT], 0)
     h.checksum = be16(if SPOIL_IP_CHECKSUM then sum + 1 else sum)
-    transmit(out[0..<PAYLOAD_AT + len])
+    if !is_local(dst) then return transmit(out[0..<PAYLOAD_AT + len])
+    if loop_count == LOOP_SLOTS then return false
+    val slot = (loop_head + loop_count) % LOOP_SLOTS
+    val n = PAYLOAD_AT + len
+    for i in 0..<n
+        loop_frames[slot][i] = out[i]
+    loop_lens[slot] = n
+    loop_count += 1
+    events.wake_all()
+    true
 
 // ICMP: answer an echo request; note an echo reply `ping` is waiting for. Holding `lock`.
 private receive_icmp(mac: Mac, from: Ip, payload: []u8)
@@ -406,8 +473,21 @@ enum NetError
     PortInUse
     NotBound
     TooLong
-    TimedOut
+    TimedOut                                    // SO_RCVTIMEO or SO_SNDTIMEO passed: EAGAIN
     NoRoute                                     // ARP found no address for the next hop
+    // The stream sockets' (tcp.sysl).
+    WouldBlock                                  // nonblocking, and it would wait: EAGAIN
+    Interrupted                                 // a signal ended the wait: EINTR
+    Refused                                     // an RST answered the SYN: ECONNREFUSED
+    Reset                                       // the peer reset the connection: ECONNRESET
+    ConnTimedOut                                // retransmission gave up: ETIMEDOUT
+    Broken                                      // nothing more can be sent: EPIPE (and SIGPIPE)
+    NotConnected                                // ENOTCONN
+    Connected                                   // EISCONN
+    InProgress                                  // a nonblocking connect is under way: EINPROGRESS
+    Already                                     // a connect is under way already: EALREADY
+    Invalid                                     // EINVAL
+    NoBuffers                                   // no frames for the rings: ENOBUFS
 
 socket_open() -> Result[usize, NetError]
     val flags = lock.lock()
@@ -507,6 +587,13 @@ private send_locked(sd: usize, to: Ip, port: u16, data: []const u8) -> Result[us
         None -> return Err(NoRoute)
     if !send_udp(mac, to, sockets[sd].port, port, data) then return Err(NoNet)
     Ok(data.len)
+
+// The port `sd` is bound to; 0 if none.
+socket_port(sd: usize) -> u16
+    val flags = lock.lock()
+    val port = if mine(sd) then sockets[sd].port else 0
+    lock.unlock(flags)
+    port
 
 // One more descriptor stands for `sd` (a dup, or a clone's copy of its parent's table).
 socket_hold(sd: usize)

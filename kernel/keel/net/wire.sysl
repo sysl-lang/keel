@@ -1,6 +1,6 @@
 module keel.net
 
-// What a packet looks like on the wire: Ethernet II, ARP, IPv4, ICMP and UDP headers, every multi-byte
+// What a packet looks like on the wire: Ethernet II, ARP, IPv4, ICMP, UDP and TCP headers, every multi-byte
 // field big-endian.
 //
 // A header is a struct viewed over the frame's bytes (`at`), which is the raw tier (FINDINGS.md 39). A
@@ -109,7 +109,32 @@ struct UdpHeader
 
 const UDP_HEADER: usize = 8
 
+// A TCP header (RFC 9293 § 3.1) without options; `offset` says how many 32-bit words the header with its
+// options takes, in its high nibble.
+struct TcpHeader
+    src_port: Be16
+    dst_port: Be16
+    seq: Be32
+    ack: Be32
+    offset: u8
+    flags: u8
+    window: Be16
+    checksum: Be16
+    urgent: Be16
+
+const TCP_HEADER: usize = 20
+const PROTO_TCP: u8 = 6
+const TCP_FIN: u8 = 0x01
+const TCP_SYN: u8 = 0x02
+const TCP_RST: u8 = 0x04
+const TCP_PSH: u8 = 0x08
+const TCP_ACK: u8 = 0x10
+const TCP_OPT_END: u8 = 0
+const TCP_OPT_NOP: u8 = 1
+const TCP_OPT_MSS: u8 = 2
+
 @assert(sizeof(EthHeader) == ETH_HEADER, "an Ethernet header is 14 bytes")
+@assert(sizeof(TcpHeader) == TCP_HEADER, "a TCP header is 20 bytes")
 @assert(sizeof(ArpPacket) == ARP_PACKET, "an ARP packet is 28 bytes")
 @assert(sizeof(Ipv4Header) == IPV4_HEADER, "an IPv4 header is 20 bytes")
 @assert(sizeof(IcmpEcho) == ICMP_ECHO_HEADER, "an ICMP echo header is 8 bytes")
@@ -142,7 +167,8 @@ private fold(s: u32) -> u32
         sum = (sum & 0xffff) + (sum >> 16)
     sum
 
-// The UDP pseudo-header's sum (RFC 768): the two addresses, the protocol and the UDP length.
+// The pseudo-header's sum that UDP (RFC 768) and TCP (RFC 9293 § 3.1) checksums start from: the two
+// addresses, the protocol and the length of the UDP datagram or TCP segment.
 pseudo_sum(src: Ip, dst: Ip, proto: u8, len: usize) -> u32
     val s = u32(src)
     val d = u32(dst)

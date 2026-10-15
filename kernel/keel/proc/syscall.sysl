@@ -11,7 +11,8 @@ import abi.keel.abi.{EAGAIN, EFAULT, EINTR, EINVAL, ENOSYS, EPERM, ETIMEDOUT, Er
     SYS_CLOCK_GETTIME, SYS_CLOCK_NANOSLEEP, SYS_GETTIMEOFDAY, SYS_PPOLL, SYS_PSELECT6, SYS_FACCESSAT2, SYS_FCNTL,
     SYS_GETRANDOM, SYS_MADVISE, SYS_MMAP, SYS_MPROTECT, SYS_MREMAP, SYS_MUNMAP, SYS_PREAD64, SYS_PRLIMIT64,
     SYS_READLINKAT, SYS_READV, SYS_RT_SIGSUSPEND, SYS_SCHED_GETAFFINITY, SYS_SCHED_YIELD, SYS_SYSINFO, SYS_TGKILL,
-    SYS_TKILL, SYS_UMASK, SYS_UNAME, SYS_UTIMENSAT, SYS_WRITEV}
+    SYS_TKILL, SYS_UMASK, SYS_UNAME, SYS_UTIMENSAT, SYS_WRITEV, SYS_LISTEN, SYS_ACCEPT, SYS_ACCEPT4, SYS_CONNECT,
+    SYS_GETSOCKNAME, SYS_GETPEERNAME, SYS_GETSOCKOPT, SYS_SHUTDOWN}
 import keel.fs
 import keel.mm
 import keel.sched
@@ -66,6 +67,14 @@ private[proc] system_call(regs: *u64) -> Option[u64]
         SYS_RECVFROM -> sys_recvfrom(p, regs)
         SYS_SENDTO -> sys_sendto(p, regs)
         SYS_SETSOCKOPT -> sys_setsockopt(p, regs)
+        SYS_GETSOCKOPT -> sys_getsockopt(p, regs)
+        SYS_LISTEN -> sys_listen(p, regs)
+        SYS_ACCEPT -> sys_accept(p, regs)
+        SYS_ACCEPT4 -> sys_accept4(p, regs)
+        SYS_CONNECT -> sys_connect(p, regs)
+        SYS_GETSOCKNAME -> sys_getsockname(p, regs)
+        SYS_GETPEERNAME -> sys_getpeername(p, regs)
+        SYS_SHUTDOWN -> sys_shutdown(p, regs)
         SYS_GETUID | SYS_GETEUID -> Ok(i64(p.uid))
         SYS_GETGID | SYS_GETEGID -> Ok(i64(p.gid))
         SYS_SETUID -> sys_setuid(p, regs)

@@ -123,12 +123,14 @@ kmain(dtb_pa: u64) -> never
     selftest.forking()
     selftest.files()
 
-    // Milestone 11: the network, from the kernel and then from a user program.
-    if selftest.network()
-        selftest.network_down()
+    // Milestone 11: the network, from the kernel and then from a user program. It stays up for the
+    // session, whose programs use TCP (milestone 19), and comes down after it.
+    val network = selftest.network()
 
     // Milestone 10: init and the shell, on the console, until the shell exits.
     selftest.session()
+    if network
+        selftest.network_down()
 
     // Shutting down: what the filesystem holds in its cache is written back before the power goes.
     selftest.fs_shutdown()

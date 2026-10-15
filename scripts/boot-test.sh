@@ -22,7 +22,12 @@ root=${0:A:h:h}
 out=$root/scratch
 mkdir -p $out
 
-limit=${KEEL_TIMEOUT:-25}
+limit=${KEEL_TIMEOUT:-60}
+# Milestone 19's host ports, forwarded by QEMU to keel's TCP ports 8100 and 8101 (linuxtcp's echo, plain
+# and with drops), 8080 and 8081 (two busybox nc listeners); the fifth is a web server on the host
+# that keel's wget reaches through slirp's gateway, 10.0.2.2.
+tcp_port=${KEEL_TCP_PORT:-15100}
+wget_port=$((tcp_port + 4))
 opt=${KEEL_OPT:-}
 accel=${KEEL_ACCEL:-hvf}
 compiler=${KEEL_SYSL:-sysl}
@@ -107,7 +112,6 @@ after_user_line=(
     "udpecho: listening on port 8007"   # a sysl program at EL0 bound a socket...
     "udpecho: bye after "   # ...and echoed the second client's datagrams through recvfrom/sendto
     "keel: udpecho exited 0"
-    "keel: network down, sockets closed"   # the stack's thread joined; the program's socket closed at its exit
 )
 
 # Milestone 10: then init starts the shell, and the script is at the console. Each boot's session is
@@ -321,6 +325,15 @@ session2=(
     'busybox sha256sum /m9/big.bin'
     "busybox seq 3 | busybox tr '\\n' ' '"
     'busybox expr 6 * 7'
+    'linuxtcp edges'
+    'linuxtcp echo 8100'
+    'linuxtcp echo 8101 7'
+    "busybox printf 'HTTP/1.0 200 OK\\r\\nContent-Length: 1116408\\r\\n\\r\\n' > /m9/h"
+    'busybox cat /m9/h /bin/busybox | busybox nc -l -p 8080 &'
+    'echo go | busybox nc -l -p 8081'
+    '@wait the same as /bin/busybox'
+    'busybox rm /m9/h'
+    "busybox wget -q -O - http://10.0.2.2:$wget_port/blob | busybox sha256sum"
     'busybox sh'
     'echo interactive $((6 * 7))'
     'cd /etc; pwd'
@@ -431,7 +444,7 @@ transcript2=(
     $'# busybox echo hello from busybox\nhello from busybox\n'
     $'# busybox uname -a\nkeel keel 0.18 milestone 18 aarch64 Linux\n'
     $'# busybox ls -l /\ntotal 68\n'
-    $'drwxr-xr-x    2 0        root          1568 Jan  1  1970 \e[1;34mbin\e[m\n'
+    $'drwxr-xr-x    2 0        root          1600 Jan  1  1970 \e[1;34mbin\e[m\n'
     $'drwxr-xr-x    2 0        root            96 Jan  1  1970 \e[1;34mdir\e[m\n'
     $'drwxr-xr-x    2 0        root           160 Jan  1  1970 \e[1;34metc\e[m\n'
     $'-rw-r--r--    1 0        root            19 Jan  1  1970 \e[0;0mhello.txt\e[m\n'
@@ -459,6 +472,34 @@ transcript2=(
     $'# busybox md5sum /hello.txt\n'"$(print -n 'hello from the disk' | md5 -q)"$'  /hello.txt\n'
     $'# busybox sha256sum /m9/big.bin\n'"$(perl -e 'srand(9); print map { chr(int(rand(256))) } 1..204800' | shasum -a 256 | cut -d' ' -f1)"$'  /m9/big.bin\n'
     $'# busybox seq 3 | busybox tr \'\\n\' \' \'\n1 2 3 # busybox expr 6 * 7\n42\n'
+    # Milestone 19: TCP. linuxtcp's edge cases run client and server on keel itself, over 127.0.0.1.
+    $'# linuxtcp edges\nlinuxtcp: connect to a closed port: ECONNREFUSED; nonblocking, EINPROGRESS then POLLERR|POLLHUP and SO_ERROR\n'
+    $'linuxtcp: half-close: ping, end of stream, pong, end of stream; a write after SHUT_WR is EPIPE\n'
+    $'linuxtcp: peer closed: its bytes, the end, then EPIPE with SIGPIPE, without it for MSG_NOSIGNAL; closed unread: ECONNRESET, then the end\n'
+    $'linuxtcp: ppoll: POLLOUT alone while quiet, POLLIN for a byte another process sent, POLLIN at the end, POLLHUP once both directions are shut\n'
+    $'linuxtcp: listen backlog 1: a second SYN dropped while one waits, the connection made once it was accepted\n'
+    $'linuxtcp: SO_RCVTIMEO: accept and read give up with EAGAIN after 0.2 s; O_NONBLOCK: EAGAIN at once\n'
+    $'linuxtcp: 40 connections in a row: the same descriptor each time, the table and its frames back where they were ('
+    $' in TIME_WAIT)\nlinuxtcp: two connections at once through one server: 256 KiB each way on each, every byte back in order\n'
+    $'linuxtcp: zero window: the writer stopped with both rings full, the persist timer probed while the reader slept, every byte read back in order and none sent past the window\n'
+    $'linuxtcp: names: getsockname, getpeername and accept4\'s address agree; SO_TYPE, TCP_NODELAY, SO_KEEPALIVE; writev and readv; ENOTCONN unconnected\n'
+    $'linuxtcp: a signal ends a blocked read with EINTR, its handler run\n'
+    # The host's client (tcp-echo-client.pl) sends 4 MiB through slirp and checks the echo byte for byte;
+    # then 256 KiB with keel dropping every 7th segment it sends, so only retransmission gets it through
+    # (at that loss the congestion window stays near three segments, so most losses wait for a timeout).
+    $'# linuxtcp echo 8100\nlinuxtcp: listening on port 8100\nlinuxtcp: echoed 4194304 bytes\n'
+    $'# linuxtcp echo 8101 7\nlinuxtcp: listening on port 8101\nlinuxtcp: echoed 262144 bytes with every 7th segment dropped: dropped '
+    # A background busybox nc serves an HTTP response, a header and /bin/busybox, to the host's curl
+    # (tcp-http-host.pl), which tells a second busybox nc the outcome; then busybox wget fetches a file
+    # from a web server on the host. (Alpine's busybox-static has no httpd: that applet is in its
+    # busybox-extras package, which is dynamically linked.)
+    $' fast)\n# busybox printf \'HTTP/1.0 200 OK\\r\\nContent-Length: 1116408\\r\\n\\r\\n\' > /m9/h\n'
+    $'# busybox cat /m9/h /bin/busybox | busybox nc -l -p 8080 &\n[1] '
+    # (The background nc prints curl's request, somewhere about here.)
+    $'\n# echo go | busybox nc -l -p 8081\n'
+    $'host: curl fetched 1116408 bytes from busybox nc on keel, the same as /bin/busybox\n'
+    $'# busybox rm /m9/h\n'
+    $'# busybox wget -q -O - http://10.0.2.2:'"$wget_port"$'/blob | busybox sha256sum\n'"$(perl -e 'srand(23); print map { chr(int(rand(256))) } 1..2097152' | shasum -a 256 | cut -d' ' -f1)"$'  -\n'
     # busybox's shell, interactive: its line editor puts the console in raw mode and echoes for itself;
     # ~ is HOME (root's is /), and `exit 3` comes back to keel's shell as the job's status.
     $'# busybox sh\n~ # echo interactive $((6 * 7))\ninteractive 42\n~ # cd /etc; pwd\n/etc\n'
@@ -469,6 +510,9 @@ transcript2=(
     "keel: every process reaped"
 )
 shutdown=(
+    # Milestone 19: the network stays up for the session (its programs use TCP) and comes down after it.
+    "keel: network down, sockets closed"   # the stack's thread joined; no descriptor stands for any socket
+    "keel: tcp table empty, every ring's frames back"   # what TIME_WAIT still held was dropped, its frames freed
     "keel: fs synced at shutdown"   # the dirty blocks went to the disk before the power did
     "keel: bounds check failed: index"   # the last step: a kernel bounds failure is reported...
     "keel: halted"                 # ...and stops the machine (checked below: nothing ran after it)
@@ -478,7 +522,7 @@ shutdown=(
 # the `files` program failed, the shell was restarted, or a process was left behind.
 not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login ended by signal"
     "keel: processes left unreaped" "keel: processes still running before init" "linuxpoll: FAILED"
-    "linuxfp: FAILED" "threads: FAILED" "cstdhello: FAILED"
+    "linuxfp: FAILED" "threads: FAILED" "cstdhello: FAILED" "linuxtcp: FAILED" "host: curl FAILED"
     "keel: kfs smp wrong" "keel: kfs replay wrong" "keel: kfs power cut wrong" "keel: kfs heap wrong" "keel.kfs:"
     "keelroot" "wonderland" "nope")
 
@@ -526,6 +570,9 @@ $linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/
 $linux_cc --target=aarch64-linux-gnu -ffreestanding -fno-builtin -nostdlib -static -fno-pic -O2 -mgeneral-regs-only \
     -mno-outline-atomics -c -o $out/linuxpoll.o $root/linux/poll.c
 $linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/linuxpoll $out/linuxpoll.o
+$linux_cc --target=aarch64-linux-gnu -ffreestanding -fno-builtin -nostdlib -static -fno-pic -O2 -mgeneral-regs-only \
+    -mno-outline-atomics -c -o $out/linuxtcp.o $root/linux/tcp.c
+$linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/linuxtcp $out/linuxtcp.o
 # The one built WITHOUT -mgeneral-regs-only: it computes in the FP/SIMD registers on purpose.
 $linux_cc --target=aarch64-linux-gnu -ffreestanding -fno-builtin -nostdlib -static -fno-pic -O2 \
     -mno-outline-atomics -c -o $out/linuxfp.o $root/linux/fp.c
@@ -578,6 +625,7 @@ done
 cp $out/linuxhello $fsroot/bin/linuxhello
 cp $out/linuxthreads $fsroot/bin/linuxthreads
 cp $out/linuxpoll $fsroot/bin/linuxpoll
+cp $out/linuxtcp $fsroot/bin/linuxtcp
 cp $out/linuxfp $fsroot/bin/linuxfp
 cp $out/cstdhello $fsroot/bin/cstdhello
 print -n "hello from the disk" > $fsroot/hello.txt
@@ -653,8 +701,17 @@ drive=(-drive file=$kfs_noflush,if=none,format=raw,id=d2,cache=writethrough -dev
 # client on the host (udp-echo-client.pl) talks to each while keel runs.
 udp_port=${KEEL_UDP_PORT:-15007}
 user_udp_port=$((udp_port + 1))
-nic=(-netdev user,id=n0,hostfwd=udp:127.0.0.1:$udp_port-:7,hostfwd=udp:127.0.0.1:$user_udp_port-:8007
+tcp_forwards=hostfwd=tcp:127.0.0.1:$tcp_port-:8100,hostfwd=tcp:127.0.0.1:$((tcp_port + 1))-:8101
+tcp_forwards=$tcp_forwards,hostfwd=tcp:127.0.0.1:$((tcp_port + 2))-:8080,hostfwd=tcp:127.0.0.1:$((tcp_port + 3))-:8081
+nic=(-netdev user,id=n0,hostfwd=udp:127.0.0.1:$udp_port-:7,hostfwd=udp:127.0.0.1:$user_udp_port-:8007,$tcp_forwards
      -device virtio-net-device,netdev=n0)
+
+# Milestone 19: the file keel's wget fetches from the host, 2 MiB of perl's srand(23) (transcript2 has
+# its sha256), served by http-file-server.pl on 127.0.0.1:$wget_port during boot 2.
+www=$out/www
+rm -rf $www
+mkdir -p $www
+perl -e 'srand(23); print map { chr(int(rand(256))) } 1..2097152' > $www/blob
 
 # Type the session named $1 at the console: QEMU's standard input is the FIFO $3, and $2 is its output
 # so far. Each element is a line, sent with its newline, except three directives:
@@ -719,6 +776,18 @@ boot() {
     local kclient=$!
     perl $root/scripts/udp-echo-client.pl $user_udp_port $limit user > $udp_log.user 2>&1 &
     local uclient=$!
+    # Boot 2's session runs milestone 19's TCP tests, with their host halves started here.
+    local tcp_log=$out/tcp$name.log tcp_pids=()
+    if [[ $name == 2 ]]; then
+        perl $root/scripts/tcp-echo-client.pl $tcp_port 4194304 $limit plain > $tcp_log.plain 2>&1 &
+        tcp_pids+=($!)
+        perl $root/scripts/tcp-echo-client.pl $((tcp_port + 1)) 262144 $limit dropping > $tcp_log.dropping 2>&1 &
+        tcp_pids+=($!)
+        perl $root/scripts/tcp-http-host.pl $((tcp_port + 2)) $((tcp_port + 3)) $busybox $out/curl.out $limit > $tcp_log.http 2>&1 &
+        tcp_pids+=($!)
+        perl $root/scripts/http-file-server.pl $wget_port blob $www/blob > $tcp_log.www 2>&1 &
+        tcp_pids+=($!)
+    fi
 
     waited=0
     while kill -0 $qpid 2> /dev/null && (( waited < limit * 10 )); do
@@ -735,7 +804,10 @@ boot() {
     wait $qpid 2> /dev/null || qemu_exit=$?
     # A client still running once keel is gone never got its echo; it is stopped by PID, and so is a
     # feeder still waiting for a line that never came.
-    kill $kclient $uclient $fpid 2> /dev/null || true
+    kill $kclient $uclient $fpid $tcp_pids 2> /dev/null || true
+    for pid in $tcp_pids; do
+        wait $pid 2> /dev/null || true
+    done
     wait $fpid 2> /dev/null || true
     rm -f $fifo
     wait $kclient 2> /dev/null || true
@@ -746,6 +818,9 @@ boot() {
     cat $log
     print -r -- "---"
     cat $udp_log.kernel $udp_log.user
+    if [[ $name == 2 ]]; then
+        cat $tcp_log.plain $tcp_log.dropping $tcp_log.http $tcp_log.www
+    fi
 
     if [[ $exited == no ]]; then
         print -r -- "FAIL: boot $name: QEMU did not exit within ${limit}s; the kernel did not power off"
@@ -789,6 +864,18 @@ boot() {
             return 1
         fi
     done
+    if [[ $name == 2 ]]; then
+        for client in plain dropping; do
+            if [[ $(<$tcp_log.$client) != *"host: tcp echo ok ($client)"* ]]; then
+                print -r -- "FAIL: boot 2: the host's TCP client ($client) did not get its bytes back: $(<$tcp_log.$client)"
+                return 1
+            fi
+        done
+        if [[ $(<$tcp_log.http) != *"host: told keel's nc"* ]]; then
+            print -r -- "FAIL: boot 2: the host's curl from keel's busybox nc did not finish: $(<$tcp_log.http)"
+            return 1
+        fi
+    fi
 }
 
 # The image is well-formed after a boot: mkfs's check reads every directory, inode and bitmap bit.

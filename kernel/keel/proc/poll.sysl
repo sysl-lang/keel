@@ -51,6 +51,7 @@ private ready(t: *sched.Files, fd: i32, events: u16) -> u16
         PipeRead -> pipe_poll(usize(f.ino), true)
         PipeWrite -> pipe_poll(usize(f.ino), false)
         Socket -> if net.socket_readable(usize(f.ino)) then POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM else POLLOUT | POLLWRNORM
+        Stream -> net.tcp_poll(usize(f.ino))
         else POLLNVAL
     mask & (events | POLLERR | POLLHUP | POLLNVAL)
 
