@@ -436,6 +436,7 @@ transcript2=(
     $'cstdhello: argv: 3 cstdhello one two; GREETING=hi among '
     $' environment strings\ncstdhello: malloc: 3000 blocks checked, 1000 grown by realloc, a '
     $'-byte block reused the freed run\ncstdhello: files: wrote, read back, sought and unlinked /m9/cstd.txt (16 bytes); then No such file or directory\n'
+    $'cstdhello: sigsetjmp saved a blocked SIGUSR1 and siglongjmp put it back\n'
     $'cstdhello: getpid and getppid answered a child of the shell\ncstdhello: atexit: 3 handlers ran last-registered first\n# echo $?\n0\n'
     # Milestone 17: a third raw-svc Linux program. ppoll and pselect6 woken by a thread's write, a close and a
     # child's write, timing out, POLLNVAL/POLLERR/EBADF, their signal masks; the clocks; termios, and raw
