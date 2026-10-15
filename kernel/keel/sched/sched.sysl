@@ -139,6 +139,13 @@ cores_up() -> u64
     cpu.irq_restore(flags)
     n
 
+// The core running the thread at address `t` now, or -1 when none is. A diagnostic: read without the
+// scheduler's lock, so the answer may already be out of date.
+core_running(t: usize) -> i64
+    for i in 0..<MAX_CPUS
+        if usize(cpus[i].current) == t then return i64(i)
+    -1
+
 // What a core runs when nothing is ready. Idle itself makes threads ready — `finish_switch` wakes an
 // exited thread's joiners in whichever thread runs next, often this one — so it hands the core over
 // whenever the run queue is not empty, and sleeps only when it is. The check and the `wfi` are made

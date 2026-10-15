@@ -77,11 +77,16 @@ private kind_of(l: LockId) -> u32 = l match
     LockId.Buffer(_) -> KIND_BUFFER
     _ -> 0
 
+// A sleeping lock's key within its kind; for a leaf, which leaf (0 journal, 1 cache, 2 icache), so a
+// report of what a thread holds can name it.
 private key_of(l: LockId) -> u64 = l match
     LockId.Dir(i) -> i
     LockId.Inode(i) -> i
     LockId.Group(g) -> u64(g)
     LockId.Buffer(b) -> b
+    LockId.Journal -> 0
+    LockId.Cache -> 1
+    LockId.Icache -> 2
     _ -> 0
 
 // The entry for (kind, key), claimed if no thread holds or waits for it. Under `sleepers_guard`.
@@ -279,12 +284,51 @@ lock_stats() -> (u64, u64, u64, u64)
     sleepers_guard.unlock(f2)
     (a, b, c, d)
 
-// Whether any thread holds a KFS lock: none should, between operations.
+// The commit thread, by address (0 while none runs). It takes buffer locks and the journal leaf in the
+// middle of every pass, whatever the operations are doing, so between operations it may legitimately
+// hold one; nothing else may.
+private var committer_thread: Atomic[u64] = Atomic(0)
+private[kfs] set_committer_thread(t: u64) = committer_thread.store(t, Ordering.Release)
+
+// The KFS locks held — or waited for, since a lock is recorded before it is taken — by every thread but
+// the commit thread: none, between operations. Once the commit thread has stopped, every thread's.
 locks_held() -> u64
+    val committer = usize(committer_thread.load(Ordering.Acquire))
     val flags = holders_guard.lock()
     var n: u64 = 0
     for i in 0..<HOLDERS
-        n += u64(holders[i].n)
+        if holders[i].thread != committer || committer == 0 then n += u64(holders[i].n)
+    holders_guard.unlock(flags)
+    n
+
+// Section 19's name for a lock, by the rank and key the order check recorded.
+private lock_name(r: u32, k: u64) -> string = r match
+    1 -> "rename_lock"
+    2 -> "inode.lock (directory)"
+    3 -> "inode.lock"
+    5 -> "orphans.lock"
+    6 -> "group.lock"
+    7 -> "buffer.lock"
+    8 -> k match
+        0 -> "journal.lock"
+        1 -> "cache.lock"
+        _ -> "icache.lock"
+    _ -> "an unranked lock"
+
+// Print every KFS lock a thread holds or waits for, naming the thread (the commit thread as such) and the
+// core it is on: what a failed `locks_held` check reports. Answers how many it printed.
+locks_report() -> u64
+    val committer = usize(committer_thread.load(Ordering.Acquire))
+    val flags = holders_guard.lock()
+    var n: u64 = 0
+    for i in 0..<HOLDERS
+        val e = &holders[i]
+        if e.thread != 0
+            n += u64(e.n)
+            print("keel.kfs: thread", e.thread, if e.thread == committer then "(kfs-commit)" else "(an operation's)",
+                  "on core", sched.core_running(e.thread), "holds or waits for", e.n)
+            for j in 0..<e.n
+                print("keel.kfs:   ", lock_name(e.ranks[j], e.keys[j]), "key", e.keys[j])
     holders_guard.unlock(flags)
     n
 

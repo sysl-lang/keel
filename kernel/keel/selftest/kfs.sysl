@@ -18,7 +18,7 @@ module keel.selftest
 
 import keel.cpu
 import keel.heap
-import keel.kfs.{CACHE_TARGET, ICACHE_TARGET, KFs, Mounted, cache_stats, keep_caches, lock_stats, locks_held, mount_disk,
+import keel.kfs.{CACHE_SLACK, CACHE_TARGET, ICACHE_TARGET, KFs, Mounted, cache_stats, keep_caches, lock_stats, locks_held, locks_report, mount_disk,
     op, pause_committer, power_cut, unmount}
 import keel.sched.{Thread, join, spawn}
 import keel.virtio
@@ -79,8 +79,17 @@ private kfs_session() -> bool
     else
         check_replayed(p)
         unmount(&m) match
-            Ok(_) -> print("keel: kfs ended: unmounted clean")
+            // The commit thread has stopped, so now no thread at all may hold a KFS lock.
+            Ok(_) -> if !locks_left_reported() then print("keel: kfs ended: unmounted clean")
             Err(e) -> print("keel: kfs unmount failed: errno", pkg.errno(e))
+    true
+
+// Whether any thread holds a KFS lock once the commit thread has stopped (`locks_held` then counts every
+// thread); if one does, which, printed.
+private locks_left_reported() -> bool
+    if locks_held() == 0 then return false
+    print("keel: kfs locks left after the commit thread stopped:", locks_held())
+    val _ = locks_report()
     true
 
 // The third disk's drive has its write cache off, so the device offers no flush; KFS has no way to order
@@ -99,7 +108,7 @@ private kfs_read_only()
     val refused = op(p, () -> pkg.create(p, ROOT_INO, "x".bytes, 0o644, root())) match
         Err(FsError.ReadOnly) -> true
         _ -> false
-    val clean = unmount(&m).is_ok()
+    val clean = unmount(&m).is_ok() && !locks_left_reported()
     if ro && refused && clean
         print("keel: kfs on a disk without flush: mounted read-only, a create refused")
     else
@@ -147,7 +156,10 @@ private kfs_smp(p: *KFs)
     val good = tally.good.load(Ordering.Acquire)
     val bad = tally.bad.load(Ordering.Acquire)
     val cores = popcount(tally.cores.load(Ordering.Acquire))
+    // The threads are joined and this thread is between operations, so no thread but the commit thread
+    // holds a KFS lock; that one may, in the middle of a pass (`locks_held` leaves it out).
     val locks_left = locks_held()
+    val pressure = cache_pressure(p)
 
     val (trims, dropped, writebacks, forgotten, peak_buffers, peak_inodes, passes) = cache_stats()
     val loads = p.loads.load()
@@ -157,12 +169,48 @@ private kfs_smp(p: *KFs)
           "inodes: target", ICACHE_TARGET, ",", forgotten, "forgotten, at most", peak_inodes, "cached")
     print("keel: kfs locks:", checked, "taken in order,", sleeps, "slept, at most", most_held, "held by one thread,",
           most_sleepers, "sleeping locks at once;", passes, "commit passes")
-    val pressure = loads > u64(CACHE_TARGET) && dropped > 0 && peak_buffers > u64(CACHE_TARGET)
     if ok && good == KFS_THREADS * (KFS_FILES + 1) && bad == 0 && cores >= 2 && locks_left == 0 && pressure
         print("keel: kfs smp ok")
     else
         print("keel: kfs smp wrong: good", good, "bad", bad, "first bad file", tally.first_bad.load(Ordering.Acquire),
               "cores", cores, "locks left", locks_left, "pressure", pressure, "setup", ok)
+        if locks_left != 0
+            val _ = locks_report()
+
+// The buffer cache under pressure by construction rather than by the threads' timing (their working set
+// peaks just past the trim threshold, so whether a trim found anything to drop depended on how their
+// operations interleaved). One operation looks up PRESSURE_BLOCKS distinct inode-table blocks from the
+// end of the table — inodes nothing uses, so blocks nothing has cached — and the next one's upkeep must
+// trim the cache: every block the first loaded past the target goes, since both are clean and no
+// operation can hold them. (Not the first operation's own upkeep: its lookups are stamped with the
+// clock's reading that `oldest_op` answers once it ends, so they are not yet older than every operation.)
+private const PRESSURE_BLOCKS: usize = 3 * CACHE_TARGET
+
+private cache_pressure(p: *KFs) -> bool
+    var blocks: Buf[u64] = buf()
+    var ino = p.sb.inode_count
+    while ino > ROOT_INO && blocks.len() < PRESSURE_BLOCKS
+        val b = p.inode_location(ino).block
+        if blocks.len() == 0 || blocks[blocks.len() - 1] != b then blocks.push(b)
+        ino -= 1
+    val (_, dropped_before, _, _, _, _, _) = cache_stats()
+    val loads_before = p.loads.load()
+    val looked = op(p, () -> look_up_all(p, blocks.view()))
+    val loaded = p.loads.load() - loads_before
+    val stat = op(p, () -> pkg.stat(p, ROOT_INO)).is_ok()
+    val (_, dropped_after, _, _, peak, _, _) = cache_stats()
+    val dropped = dropped_after - dropped_before
+    val over = loaded > u64(CACHE_TARGET + CACHE_SLACK) && peak > u64(CACHE_TARGET + CACHE_SLACK)
+    val ok = looked && stat && over && dropped + u64(CACHE_TARGET) >= loaded
+    if !ok
+        print("keel: kfs cache pressure wrong:", blocks.len(), "blocks looked up", looked, ",", loaded, "loaded,",
+              dropped, "dropped; at most", peak, "cached, the trim threshold", CACHE_TARGET + CACHE_SLACK)
+    ok
+
+private look_up_all(p: *KFs, blocks: []u64) -> bool
+    for b in blocks
+        if p.buffer(b).is_err() then return false
+    true
 
 // One thread's work in directory `dir`: KFS_FILES files created, written, read back and removed — every
 // third held open, unlinked while open, read back through the open reference and only then released,
@@ -315,6 +363,8 @@ private power_cut_after_commits(m: *Mounted)
     if why == 0 && !op(p, () -> p.checkpoint()).unwrap_or(false) then why = 8
     if why == 0 && p.logged_count() != usize(REPLAYED) then why = 90 + u64(p.logged_count())
     power_cut(m)
+    // The commit thread has stopped, so now no thread at all may hold a KFS lock.
+    if why == 0 && locks_left_reported() then why = 10
     if why == 0 then print("keel: kfs ended: power cut after", REPLAYED, "commits, before their checkpoint")
     else print("keel: kfs power cut wrong at step", why)
 

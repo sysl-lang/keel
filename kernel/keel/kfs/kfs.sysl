@@ -40,11 +40,12 @@ import sysl.sync.{Atomic, Ordering}
 
 type KFs = Fs[KfsDisk, KernelPlatform]
 
-// The cache targets; the tables' room is BUFFER_SLOTS and INODE_SLOTS (platform.sysl). The slack is
-// small enough that the boot test's four threads always push the cache past it: their working set
-// peaks at 24-27 buffers, and with a slack of 8 a build whose timing kept it at 24 never trimmed at all.
+// The cache targets; the tables' room is BUFFER_SLOTS and INODE_SLOTS (platform.sysl). The cache is
+// trimmed once it holds more than CACHE_TARGET + CACHE_SLACK buffers. (The boot test puts it under
+// pressure by construction, selftest/kfs.sysl's `cache_pressure`: the four threads' working set peaks
+// at 21-27 buffers, too close to the threshold for whether they trim to be anything but timing.)
 const CACHE_TARGET: usize = 16
-private const CACHE_SLACK: usize = 4
+const CACHE_SLACK: usize = 8
 const ICACHE_TARGET: usize = 16
 
 // How long the commit thread naps between passes when nobody asks for one.
@@ -107,6 +108,7 @@ mount_disk(d: u64) -> Result[Mounted, FsError]
 
 // The `kfs-commit` thread.
 private commit_thread(p: *KFs)
+    set_committer_thread(u64(usize(sched.current())))
     loop
         if stopping.load(Ordering.Acquire) != 0 then break
         sched.nap_kernel(timer.now_ns() + PASS_MS * 1_000_000, kicked())
@@ -144,6 +146,7 @@ private stop_committer(m: *Mounted)
         Some(t) -> sched.join(t)
         None -> ()
     m.committer = None
+    set_committer_thread(0)
     set_committer(false)
     pass_done(false)
 
