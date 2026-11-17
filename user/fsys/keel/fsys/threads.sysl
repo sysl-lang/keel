@@ -9,6 +9,7 @@ module keel.fsys
 import abi.keel.abi.{CLONE_CHILD_CLEARTID, CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_THREAD_SET, EAGAIN, EINTR,
     ETIMEDOUT, FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, SYS_FUTEX, SYS_GETTID, SYS_SCHED_YIELD, Timespec}
 import rt.keel.user.syscall
+import sysl.raw.ptr_cast
 import sysl.sync.{Atomic, Ordering}
 import sysl.sys.UNSUPPORTED
 

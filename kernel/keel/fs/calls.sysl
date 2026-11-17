@@ -23,6 +23,7 @@ import keel.sched.{Cred, Holds, OpenFile, Process, cred_of, lock_files, unlock_f
 import ondisk.keel.ondisk
 import ondisk.keel.ondisk.{BLOCK_SIZE, DIRENT_SIZE, Dirent, Inode, KIND_DIR, KIND_FILE, PERMISSION_BITS, ROOT_INO,
     S_IFMT}
+import sysl.raw.ptr_cast
 
 private const MAX_PATH: usize = usize(PATH_ROOM)
 private const CHUNK: usize = 512

@@ -49,6 +49,7 @@ import abi.keel.abi.{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM}
 import keel.mm
 import keel.sched.{Process, poll_notify}
 import keel.timer
+import sysl.raw.ptr_cast
 import sysl.sync.{Atomic, Ordering}
 
 const TCP_SOCKETS: usize = 32

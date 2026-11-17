@@ -1,6 +1,7 @@
 module keel.mm
 
 import keel.cpu
+import sysl.raw.ptr_cast
 import sysl.sync.SpinLock
 
 // Copy-on-write: what `fork` does to an address space, and what a write to a shared page does after.

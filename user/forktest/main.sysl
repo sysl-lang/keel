@@ -64,17 +64,17 @@ val me = user.getpid()
 user.fork() match
     Ok(0) ->
         // The child: the parent's memory, as it was.
-        var ok = mark == 1 && heap.at(5) == 5 && heap.at(2047) == 2047 && user.getppid() == me
+        var ok = mark == 1 && heap[5] == 5 && heap[2047] == 2047 && user.getppid() == me
         ok = ok && user.getpid() != me
         mark = 2
-        heap.set(5, 500)
-        heap.set(2047, 0)
-        ok = ok && mark == 2 && heap.at(5) == 500 && heap.at(2047) == 0
+        heap[5] = 500
+        heap[2047] = 0
+        ok = ok && mark == 2 && heap[5] == 500 && heap[2047] == 0
         user.exit(if ok then 0 else 1)
     Ok(child) ->
         check(child != me, "fork answered the parent its own pid")
         check(reaped(child) == 0, "the child did not see the parent's memory as it was")
-        check(mark == 1 && heap.at(5) == 5 && heap.at(2047) == 2047, "the child's writes reached the parent")
+        check(mark == 1 && heap[5] == 5 && heap[2047] == 2047, "the child's writes reached the parent")
     Err(e) -> fail(s"fork: errno ${i64(e)}")
 if failures == 0 then print("user: fork ok")
 
@@ -86,32 +86,32 @@ val before = failures
 val (r, w) = user.pipe() match
     Ok(ends) -> ends
     Err(e) -> stop(s"pipe: errno ${i64(e)}")
-heap.set(7, 70)
+heap[7] = 70
 mark = 10
 user.fork() match
     Ok(0) ->
         val _ = user.close(w)
         var go: [1]u8 = [0]
         val _ = user.read(r, go[..])
-        var ok = heap.at(7) == 70 && mark == 10
+        var ok = heap[7] == 70 && mark == 10
         // Both sides write every page after the fork: each gets copies of its own.
         for i in 0..<WORDS
-            heap.set(i, u64(i) * 3)
+            heap[i] = u64(i) * 3
         for i in 0..<WORDS
-            if heap.at(i) != u64(i) * 3 then ok = false
+            if heap[i] != u64(i) * 3 then ok = false
         user.exit(if ok then 0 else 1)
     Ok(child) ->
-        heap.set(7, 71)
+        heap[7] = 71
         mark = 11
         for i in 0..<WORDS
-            heap.set(i, heap.at(i) + 1)
+            heap[i] += 1
         val _ = user.write_file(w, [u8(1)])
         val _ = user.close(w)
         val _ = user.close(r)
         check(reaped(child) == 0, "the child saw the parent's writes after the fork")
-        var mine = mark == 11 && heap.at(7) == 72
+        var mine = mark == 11 && heap[7] == 72
         for i in 0..<WORDS
-            if i != 7 && heap.at(i) != u64(i) + 1 then mine = false
+            if i != 7 && heap[i] != u64(i) + 1 then mine = false
         check(mine, "the parent's pages changed under it")
     Err(e) -> fail(s"fork: errno ${i64(e)}")
 if failures == before then print("user: cow ok")
@@ -121,7 +121,7 @@ val looped = failures
 for round in 0..<64
     user.fork() match
         Ok(0) ->
-            heap.set(usize(round) * 32, 0)
+            heap[usize(round) * 32] = 0
             user.exit(int(round % 7))
         Ok(child) ->
             if reaped(child) != i64(round % 7) then fail(s"round $round: the wrong status")
@@ -172,7 +172,7 @@ user.fork() match
 mark = 42
 val missing = process.exec("/bin/missing")
 check(missing == IoError.NotFound, s"exec of a missing file answered '$missing'")
-check(mark == 42 && heap.at(9) == 10, "a failed execve changed the caller's memory")
+check(mark == 42 && heap[9] == 10, "a failed execve changed the caller's memory")
 if failures == execs then print("user: exec ok")
 
 user.exit(if failures == 0 then 0 else 1)

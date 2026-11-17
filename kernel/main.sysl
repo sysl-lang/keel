@@ -16,6 +16,7 @@ import keel.smp
 import keel.timer
 import keel.trap
 import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
 import sysl.sync.Ordering
 
 // The first instruction the machine runs. QEMU loads the ELF image at its physical addresses and

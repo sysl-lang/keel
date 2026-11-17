@@ -2798,6 +2798,75 @@ single lock: an in-memory inode's fields are split between `icache.lock`, `orpha
 `inode.lock`, and most of section 19's locks guard data that lives in buffers. kfs/SPEC.md section 19,
 "Locks are named, not wrapped around records".
 
+## Moving onto sysl 0.11
+
+## 80. A write through a `&sync` is refused unless the field is atomic or a promise is made, and no promise names the lock a kernel actually holds (gap)
+
+sysl 0.11 makes a field reached through a `&sync T` read-only (reference/memory.md, "A field reached
+through a `&sync T` is read-only"): an assignment, a compound assignment or a `*self` member is refused
+unless the field is an `Atomic`, a `@guards` names it, or the type is `@unchecked(Share)`. On moving
+keel from alpha.13 the rule refused 31 writes in six types. Shortest input (`sysl run`, 0.11.10):
+
+    import sysl.sync.SpinLock
+
+    struct Owner
+        lock: SpinLock
+
+    struct Members
+        live: u64                   // written only holding the owner's lock
+
+    bump(o: &sync Owner, m: &sync Members)
+        o.lock.lock()
+        m.live += 1
+        o.lock.unlock()
+
+```
+this '+=' writes a field reached through a '&sync Members', which is read-only: every thread holding the reference may reach it at once, and a plain write would race theirs. Make the field an 'Atomic', name it in a '@guards' so a write holds the lock, or write '@unchecked(Share)' above 'Members' where its writes are synchronised another way
+```
+
+The rule is right, and it found a real race: `keel.proc.start_with` wrote the new process's `name`
+after `start_image` had made its first thread runnable, while `procs` could be reading it. What keel
+writes through a `&sync` falls into four shapes, and only the last is expressible with a check:
+
+| shape | keel's types | what sysl offers |
+|---|---|---|
+| fields guarded by a lock in **another** object | `sched.Threads` and each thread's `Thread.user`, under `Process.sig.lock` | a promise only |
+| a lock held across a sleep, condition-variable style (`WaitQueue.sleep(&guard)`) | `sched.Signals`, `selftest.Ring` | a promise only: `Guarded.with` cannot let the lock go to sleep |
+| writes ordered by an atomic handoff, not a lock | `selftest.Turns.trace` (each turn's slot, published by `turn`'s release store) | a promise only |
+| written once, before the value is shared | `sched.Env`, `Process.name` | built before sharing: checked |
+
+`@guards` would not have checked the first three either. It does not check that a member holds any
+lock: this compiles and prints 1 —
+
+    @guards(n)
+    struct Cell
+        lock: SpinLock
+        private n: u64
+
+        bump(*self)
+            self.n += 1             // no lock taken
+
+        get(self) -> u64 = self.n
+
+    val c: &sync Cell = Cell(SpinLock(0), 0)
+    c.bump()
+    print(c.get())
+
+— so `@guards(field)` is a promise about the members, scoped to private fields, as `@unchecked(Share)`
+is a promise about the type. The diagnostic's "name it in a '@guards' so a write holds the lock" says
+more than the attribute does.
+
+Used: `@unchecked(Share)` on `Threads`, `Signals`, `Ring` and `Turns`, each with a comment saying which
+lock or handoff orders its writes. `Env` is filled before it is shared, `copied_signals` copies the
+parent's actions under its lock into a new value, and the name is a parameter of `start_image`, set
+before the first thread can run. The promises are blanket: a write added later to any of the four types
+without its lock compiles.
+
+Clean form, any of: a `@guards` that names the lock — `@guards(live, by = owner.lock)` or a lock
+parameter a member must be handed already held, as a `held: &Locked[L]` token the lock's `lock()`
+answers; a `Guarded`-style `with` whose closure may sleep on a wait queue that releases and retakes the
+guard; and, for the diagnostic, wording that does not promise a check the attribute does not make.
+
 ## What worked in milestone 17
 
 - **No sysl gap in the kernel half.** A poller waits on one module `WaitQueue` with an event count under

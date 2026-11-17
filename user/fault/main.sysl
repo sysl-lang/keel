@@ -2,6 +2,7 @@
 // for EL1, so the load is a permission fault: the kernel kills this process and carries on.
 
 import rt.keel.user
+import sysl.raw.ptr_cast
 
 print("user: reading the kernel's memory")
 val text: usize = 0xffff_0000_4020_0000

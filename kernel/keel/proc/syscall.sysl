@@ -18,6 +18,8 @@ import keel.mm
 import keel.sched
 import keel.sched.{IrqLock, Process}
 import keel.timer
+import sysl.raw.ptr_cast
+import sysl.raw.str_cast
 
 // System calls (user/abi has the numbers, Linux's aarch64 ones wherever keel has the call Linux has):
 // `svc #0` from EL0 arrives here with the saved registers, the number in x8 and the arguments in x0 to

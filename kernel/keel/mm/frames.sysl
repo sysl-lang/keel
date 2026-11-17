@@ -1,6 +1,7 @@
 module keel.mm
 
 import keel.cpu
+import sysl.raw.ptr_cast
 import sysl.sync.SpinLock
 
 // The physical frame allocator: every 4 KiB frame of RAM, one bit each, set while the frame is in use.

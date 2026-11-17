@@ -14,6 +14,7 @@ import keel.pl011.{put_byte, put_hex, put_str}
 import keel.proc
 import keel.psci.system_off
 import keel.sched.preempt
+import sysl.raw.ptr_cast
 import sysl.sync.{Atomic, Ordering}
 
 // Exception entry. The processor jumps to `VBAR_EL1` plus a fixed offset chosen by what happened and

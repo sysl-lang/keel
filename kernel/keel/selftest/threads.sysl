@@ -40,6 +40,9 @@ threads()
 private const ROUNDS: u64 = 3
 private const PATIENCE: u64 = 100           // timer ticks: one second at 10 ms
 
+// `trace[i]` is written only by the thread whose turn `i` is, and `turn`'s release store hands it to the
+// next; the reader reads it after joining both.
+@unchecked(Share)
 private struct Turns
     turn: Atomic[u64]
     trace: [6]u8
@@ -118,6 +121,10 @@ private add_many(m: &sync Mutex[u64])
 private const SLOTS: u64 = 4
 private const ITEMS: u64 = 200
 
+// The ring's fields are written holding `guard`, which a sleeper keeps across `WaitQueue.sleep` as a
+// condition variable's mutex; nothing in sysl checks that a write holds a lock (FINDINGS 80). `sum`
+// and `in_order` are the consumer's alone, read after both have been joined.
+@unchecked(Share)
 private struct Ring
     guard: IrqLock
     not_empty: WaitQueue

@@ -26,6 +26,7 @@ import keel.sched.Mutex
 import keel.virtio
 import ondisk.keel.ondisk
 import ondisk.keel.ondisk.{BLOCK_SIZE, SECTOR_SIZE, SECTORS_PER_BLOCK, Super}
+import sysl.raw.ptr_cast
 
 private const NBUF: usize = 32
 

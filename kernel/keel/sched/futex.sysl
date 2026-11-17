@@ -16,6 +16,7 @@ module keel.sched
 
 import keel.mm
 import keel.timer
+import sysl.raw.ptr_cast
 import sysl.sync.{Atomic, Ordering}
 
 private const BUCKETS: usize = 32

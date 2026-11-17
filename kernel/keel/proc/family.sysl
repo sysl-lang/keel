@@ -24,6 +24,7 @@ import keel.mm
 import keel.sched
 import keel.sched.{Holds, IrqLock, OpenFile, Process, WaitQueue}
 import sysl.buf.{Buf, buf, buf_with_capacity}
+import sysl.raw.ptr_cast
 import sysl.text.from_utf8
 
 private[proc] const MAX_PROCS: usize = 64
@@ -93,7 +94,7 @@ private[proc] sys_spawn(p: *Process, regs: *u64) -> Result[i64, Errno]
     var packed: Buf[u8] = buf_with_capacity(usize(args_len), 0)
     for _ in 0..<args_len
         packed.push(0)
-    if args_len > 0 && !mm.copy_from_user(&p.space, regs[2], packed.view()) then return Err(EFAULT)
+    if args_len > 0 && !mm.copy_from_user(&p.space, regs[2], packed.view_mut()) then return Err(EFAULT)
     val args = unpacked(packed.view())?
     val (env, fds, group) = asked_for(p, regs[4])?
 
@@ -101,7 +102,7 @@ private[proc] sys_spawn(p: *Process, regs: *u64) -> Result[i64, Errno]
     // when it is set-user-ID.
     val image = fs.read_executable(p.cwd[0..<p.cwd_len], path[0..<usize(path_len)], sched.cred_of(p))?
     val std = standard_files(p, fds)?
-    start_image(image.bytes.view(), args.view(), p, std, env.view(), image.run_as, group) match
+    start_image(image.bytes.view(), args.view(), name_from(args.view()), p, std, env.view(), image.run_as, group) match
         Ok(child) -> Ok(i64(child.pid))
         Err(e) -> Err(errno_of(e))
 
@@ -122,13 +123,13 @@ private asked_for(p: *Process, va: u64) -> Result[(Buf[u8], [3]u64, Group), Errn
             group.pgid = attr.pgid
         else
             return Err(EPERM)
-    val env: Buf[u8] = buf()
+    var env: Buf[u8] = buf()
     if attr.env_given != 0
         if attr.env_len > ENV_ROOM then return Err(E2BIG)
         for _ in 0..<attr.env_len
             env.push(0)
-        if attr.env_len > 0 && !mm.copy_from_user(&p.space, attr.env, env.view()) then return Err(EFAULT)
-        if attr.env_len > 0 && env.at(env.len() - 1) != 0 then return Err(EINVAL)
+        if attr.env_len > 0 && !mm.copy_from_user(&p.space, attr.env, env.view_mut()) then return Err(EFAULT)
+        if attr.env_len > 0 && env[env.len() - 1] != 0 then return Err(EINVAL)
     else
         for i in 0..<p.env.len
             env.push(p.env.bytes[i])

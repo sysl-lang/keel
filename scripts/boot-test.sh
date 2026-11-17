@@ -12,7 +12,7 @@
 #   KEEL_SYSL=<path>/bin/sysl scripts/boot-test.sh   build with that compiler instead of `sysl`
 #   KEEL_CSTD=<checkout> scripts/boot-test.sh   link /bin/cstdhello against that cstd (default ~/dev/sysl-lang/cstd)
 #   KEEL_KFS=<checkout> scripts/boot-test.sh    build the kernel (`--lib`) and KFS's host tools from that
-#                                               kfs checkout instead of the tag kernel/package.hocon names
+#                                               kfs checkout instead of the tag kernel/sysl.hocon names
 #   KEEL_TCP_ONLY=<n> scripts/boot-test.sh      milestone 11b's TCP tests alone, <n> times over in one boot
 #                                               (`linuxtcp edges` and both host echoes each round), instead of
 #                                               the two boots: the way to measure a rare TCP failure
@@ -46,7 +46,7 @@ cstd=${KEEL_CSTD:-$HOME/dev/sysl-lang/cstd}
 # (mkfs.kfs, kfsdump, fsck.kfs) are programs in that repository, built here from a checkout of the very
 # tag the kernel's manifest names (cloned once into scratch/), or from KEEL_KFS, which then also stands
 # in for the coordinate in every build of the workspace.
-kfs_line=${(M)${(f)"$(<$root/kernel/package.hocon)"}:#*github.com/sysl-lang/kfs*}
+kfs_line=${(M)${(f)"$(<$root/kernel/sysl.hocon)"}:#*github.com/sysl-lang/kfs*}
 kfs_version=${${kfs_line#*version = \"}%%\"*}
 kfs_lib=()
 if [[ -n ${KEEL_KFS:-} ]]; then
@@ -54,7 +54,7 @@ if [[ -n ${KEEL_KFS:-} ]]; then
     kfs_lib=(--lib $kfs_src)
 else
     kfs_src=$out/kfs-$kfs_version
-    if [[ ! -f $kfs_src/package.hocon ]]; then
+    if [[ ! -f $kfs_src/sysl.hocon ]]; then
         rm -rf $kfs_src
         if ! git clone -q --depth 1 --branch v$kfs_version https://github.com/sysl-lang/kfs $kfs_src; then
             print -r -- "FAIL: kfs v$kfs_version is not in $kfs_src and could not be cloned"
@@ -653,7 +653,16 @@ fi
 $compiler build-c $cstd/linux --target aarch64-freestanding ${opt:+$opt} -o $out/libcstd.a
 $linux_cc --target=aarch64-linux-gnu -ffreestanding -nostdinc -isystem "$($linux_cc -print-resource-dir)/include" \
     -I $cstd/include -static -fno-pic -O2 -c -o $out/cstdhello.o $root/linux/cstdhello.c
-$linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 -o $out/cstdhello $out/cstdhello.o $out/libcstd.a
+# cstd's `_start` copies the thread-local template (`.tdata`, `.tbss`: `errno` lives there) into the
+# first thread's block, and learns where the linker put it from these four symbols (cstd's README).
+tls_syms=(
+    '--defsym=__sysl_tls_data=SIZEOF(.tdata) ? ADDR(.tdata) : (SIZEOF(.tbss) ? ADDR(.tbss) : 0)'
+    '--defsym=__sysl_tls_data_end=SIZEOF(.tdata) ? ADDR(.tdata) + SIZEOF(.tdata) : __sysl_tls_data'
+    '--defsym=__sysl_tls_end=SIZEOF(.tbss) ? ADDR(.tbss) + SIZEOF(.tbss) : __sysl_tls_data_end'
+    '--defsym=__sysl_tls_align=(SIZEOF(.tdata) ? ALIGNOF(.tdata) : 1) > (SIZEOF(.tbss) ? ALIGNOF(.tbss) : 1) ? (SIZEOF(.tdata) ? ALIGNOF(.tdata) : 1) : (SIZEOF(.tbss) ? ALIGNOF(.tbss) : 1)'
+)
+$linux_ld -static -e _start --image-base=0x400000 -z max-page-size=4096 $tls_syms -o $out/cstdhello \
+    $out/cstdhello.o $out/libcstd.a
 
 rm -rf $fsroot
 mkdir -p $fsroot/dir $fsroot/bin

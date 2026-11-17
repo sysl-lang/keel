@@ -26,6 +26,7 @@ import keel.gic
 import keel.mm
 import keel.virtio
 import keel.virtio.{Avail, Desc, Regs, Used}
+import sysl.raw.ptr_cast
 
 const QSIZE: usize = 16
 const BUF_SIZE: usize = 2048

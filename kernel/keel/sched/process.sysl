@@ -136,7 +136,7 @@ struct Env
 
 // An environment holding `entries`, which must fit ENV_ROOM.
 env_of(entries: []const u8) -> &sync Env
-    val e: &sync Env = Env([0; ENV_ROOM], entries.len)
+    var bytes: [ENV_ROOM]u8 = [0; ENV_ROOM]
     for i in 0..<entries.len
-        e.bytes[i] = entries[i]
-    e
+        bytes[i] = entries[i]
+    Env(bytes, entries.len)

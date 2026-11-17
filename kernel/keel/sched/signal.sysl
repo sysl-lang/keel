@@ -39,7 +39,10 @@ const SIG_IGN: u64 = 1
 
 // The process's half: what is pending for the process as a whole, and the actions. Each thread's half —
 // its blocked set, what is pending for it alone, where it sleeps — is its `Thread.user` (group.sysl),
-// under this same `lock`.
+// under this same `lock`. `actions` is written only holding `lock`, which also guards the threads'
+// halves and the process's `Threads`, storage in other objects. Nothing in sysl checks that a write
+// holds a lock, so this is a promise (FINDINGS 80).
+@unchecked(Share)
 struct Signals
     lock: IrqLock
     pending: Atomic[u64]        // a bit per signal; written under `lock`, read without it on the way to EL0
@@ -53,12 +56,10 @@ fresh_signals() -> &sync Signals = Signals(irq_lock(), Atomic(0), [no_action(); 
 // A forked child's: its parent's actions, nothing pending. (Its thread starts with the forking thread's
 // blocked set.)
 copied_signals(from: &sync Signals) -> &sync Signals
-    val s = fresh_signals()
     val flags = from.lock.lock()
-    for i in 0..<SIGNALS
-        s.actions[i] = from.actions[i]
+    val actions = from.actions
     from.lock.unlock(flags)
-    s
+    Signals(irq_lock(), Atomic(0), actions)
 
 // What `execve` does to them: a handler's address means nothing in the new program, so a handled
 // signal goes back to the default; an ignored one stays ignored, and the blocked set stays.

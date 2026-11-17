@@ -1,5 +1,7 @@
 module keel.cpu
 
+import sysl.raw.ptr_cast
+
 // The processor's own state: the exception level, the system registers keel reads and writes, and
 // the instructions that wait for or mask interrupts. A register is read and written with the
 // `read_sysreg`/`write_sysreg` built-ins (DAIFSet and DAIFClr among them), and the barriers, address

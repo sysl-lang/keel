@@ -32,11 +32,10 @@ start_with(path: string, args: []const string) -> Result[&sync Process, LoadErro
     val image = fs.read_executable("/".bytes, path.bytes, sched.root_cred()) match
         Ok(b) -> b
         Err(e) -> return Err(Unreadable(e))
-    val p = start_image(image.bytes.view(), args, null, [sched.console_file(); 3], [], image.run_as,
-        Group(NEW_GROUP, false))?
     // A program started with no arguments is named for its file, for `procs`.
-    if args.len == 0 then p.name = sched.name_of(base_name(path.bytes))
-    Ok(p)
+    val name = if args.len == 0 then sched.name_of(base_name(path.bytes)) else name_from(args)
+    start_image(image.bytes.view(), args, name, null, [sched.console_file(); 3], [], image.run_as,
+        Group(NEW_GROUP, false))
 
 // The last part of a path: what follows its last `/`.
 private base_name(path: []const u8) -> []const u8
@@ -55,13 +54,14 @@ restart_pids() -> bool
     true
 
 // Load `image`, an executable already in kernel memory, and start it running with `args` and the
-// environment `env` (`NAME=value` entries, each followed by a NUL). A `parent` (null: the kernel)
+// environment `env` (`NAME=value` entries, each followed by a NUL), named `name` for `procs` from before
+// its thread can run. A `parent` (null: the kernel)
 // passes on its current directory. `std` are the child's descriptors 0 to 2, each already counted as
 // open (`duplicate`); they are given back if the child cannot be started. It runs as `run_as`, in the
 // process group `group` says. The process is in the table before its thread can run.
-private[proc] start_image(image: []const u8, args: []const string, parent: *Process, std: [3]OpenFile,
-        env: []const u8, run_as: Cred, group: Group) -> Result[&sync Process, LoadError]
-    val started = start_loaded(image, args, parent, std, env, run_as, group)
+private[proc] start_image(image: []const u8, args: []const string, name: [sched.NAME_ROOM]u8, parent: *Process,
+        std: [3]OpenFile, env: []const u8, run_as: Cred, group: Group) -> Result[&sync Process, LoadError]
+    val started = start_loaded(image, args, name, parent, std, env, run_as, group)
     if started.is_err()
         // The descriptors handed over for the child are not the child's after all.
         for f in std
@@ -81,8 +81,8 @@ private const FOREGROUND_AT_SPAWN: bool = true
 private[proc] const INHERIT_GROUP: u64 = 0
 private[proc] const NEW_GROUP: u64 = 0xffff_ffff_ffff_ffff
 
-private start_loaded(image: []const u8, args: []const string, parent: *Process, std: [3]OpenFile,
-        env: []const u8, run_as: Cred, group: Group) -> Result[&sync Process, LoadError]
+private start_loaded(image: []const u8, args: []const string, name: [sched.NAME_ROOM]u8, parent: *Process,
+        std: [3]OpenFile, env: []const u8, run_as: Cred, group: Group) -> Result[&sync Process, LoadError]
     if env.len > sched.ENV_ROOM then return Err(TooManyArgs)
     var l = load(image)?
     // AT_EXECFN is the name the program was started by: spawn has its argv[0] (execve, the path).
@@ -97,7 +97,7 @@ private start_loaded(image: []const u8, args: []const string, parent: *Process, 
     val pid = new_pid()
     val p: &sync Process = Process(pid, l.space, l.heap_base, l.heap_base, sched.no_threads(),
         sched.fresh_signals(), 0, 0, 0, sched.no_files(), sched.root_dir(), 1, 0, false, None, run_as.uid,
-        run_as.gid, sched.env_of(env), pid, pid, 0, name_from(args), 0, 0, 0, UMASK)
+        run_as.gid, sched.env_of(env), pid, pid, 0, name, 0, 0, 0, UMASK)
     val raw: *Process = &*p
     set_standard(raw, std)
     if parent != null

@@ -12,6 +12,7 @@ import keel.mm
 import keel.sched
 import keel.sched.{FOREVER, Process}
 import keel.timer
+import sysl.raw.ptr_cast
 
 private const NS: u64 = 1_000_000_000
 

@@ -3,6 +3,7 @@
 // starts it after the spinners, so it runs at all only because the timer takes a core from one of them.
 
 import rt.keel.user
+import sysl.raw.ptr_cast
 
 private const ROUNDS: u64 = 50_000_000
 

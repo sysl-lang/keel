@@ -30,6 +30,7 @@ import keel.net
 import keel.sched
 import keel.sched.{FOREVER, Holds, PollWait, Process}
 import keel.timer
+import sysl.raw.ptr_cast
 
 private const ENTRIES: usize = usize(POLL_MAX)
 

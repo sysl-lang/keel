@@ -27,7 +27,7 @@ allocator {
 dependencies {
   abi { workspace = true }
   ondisk { workspace = true }
-  kfs { git = "github.com/sysl-lang/kfs", version = "0.1.0" }
+  kfs { git = "github.com/sysl-lang/kfs", version = "0.1.1" }
 }
 
 targets {

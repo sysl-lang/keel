@@ -1,6 +1,7 @@
 module keel.mm
 
 import keel.cpu
+import sysl.raw.ptr_cast
 import sysl.sync.SpinLock
 
 // User address spaces: the low half, TTBR0, one per process.

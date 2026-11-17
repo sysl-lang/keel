@@ -1,6 +1,7 @@
 module keel.proc
 
 import keel.sched
+import sysl.raw.ptr_cast
 
 // Entering user mode, and coming back.
 //

@@ -49,7 +49,10 @@ struct UserSide
 no_user() -> UserSide = UserSide(0, Context([0; 12], 0, 0), 0, 0, Atomic(0), null, null, 0, null, null, 0, false,
     null, false, 0, no_fp())
 
-// A process's threads.
+// A process's threads. Every write is made under the process's signal lock (`Process.sig.lock`), a
+// lock in another object; nothing in sysl checks that a write holds a lock, so this is a promise
+// (FINDINGS 80).
+@unchecked(Share)
 struct Threads
     boxes: [MAX_THREADS]Option[&sync Thread]    // every thread it started and has not yet joined
     members: [MAX_THREADS]*Thread               // the ones still in it: not yet `thread_ended`

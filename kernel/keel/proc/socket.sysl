@@ -20,6 +20,7 @@ import keel.net
 import keel.net.{Ip, NetError}
 import keel.sched
 import keel.sched.{Holds, OpenFile, Process}
+import sysl.raw.ptr_cast
 
 // keel's address on its one interface, 10.0.2.15: the only one a socket may be bound to, besides any.
 private const OUR_IP: u32 = 0x0a00_020f

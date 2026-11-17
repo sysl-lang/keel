@@ -25,6 +25,7 @@ import keel.net
 import keel.net.{NetError, TcpOption}
 import keel.sched
 import keel.sched.{Holds, OPEN_FILES, OpenFile, Process}
+import sysl.raw.ptr_cast
 
 private const STREAM_CHUNK: usize = 2048
 

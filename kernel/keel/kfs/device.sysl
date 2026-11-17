@@ -22,6 +22,7 @@ import sh.sysl.kfs.{BLOCK_SIZE, BlockDevice, DeviceError}
 import keel.mm
 import keel.sched.{Mutex, mutex}
 import keel.virtio
+import sysl.raw.ptr_cast
 
 // Off only to show what the flush is for (the control `scripts/boot-test.sh`'s replay boot fails on):
 // `flush` answers that everything is durable without writing anything out or flushing the disk, so

@@ -17,6 +17,7 @@ import abi.keel.abi.{AF_INET, ANY_CHILD, AT_FDCWD, AT_REMOVEDIR, EACCES, EINTR, 
     SYS_SPAWN, SYS_SYNC, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE, SigAction, SockAddrIn, SpawnAttr, Stat, TIOCGPGRP,
     TIOCSPGRP, Timespec, Timeval, WNOHANG, empty_stat, sock_addr_in}
 import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
 import sysl.slices.{as_mut_ptr, as_ptr}
 import sysl.sync.SpinLock
 import sysl.threads.{tls_place, tls_room}

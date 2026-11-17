@@ -1,5 +1,7 @@
 module keel.mm
 
+import sysl.raw.ptr_cast
+
 // keel's address space, with the MMU on.
 //
 //   TTBR1 (the kernel's, VA 0xFFFF_0000_0000_0000 and up) maps physical memory at a fixed offset:

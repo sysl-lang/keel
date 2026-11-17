@@ -108,9 +108,9 @@ value_of(sh: *Shell, name: string) -> string
 // Set a variable, keeping it exported if it was; `export` exports it too.
 set_var(sh: *Shell, name: string, value: string, export: bool)
     for i in 0..<sh.vars.len()
-        val v = sh.vars.at(i)
+        val v = sh.vars[i]
         if v.name == name
-            sh.vars.set(i, ShellVar(name, value, v.exported || export))
+            sh.vars[i] = ShellVar(name, value, v.exported || export)
             return
     sh.vars.push(ShellVar(name, value, export))
 
@@ -197,7 +197,7 @@ stages(toks: Buf[Token]) -> Option[Buf[Stage]]
     var st = Stage(buf(), "", "", false)
     var i: usize = 0
     while i < toks.len()
-        val t = toks.at(i)
+        val t = toks[i]
         if !t.op
             st.args.push(t.text)
             i += 1
@@ -210,10 +210,10 @@ stages(toks: Buf[Token]) -> Option[Buf[Stage]]
             st = Stage(buf(), "", "", false)
             i += 1
             continue
-        if i + 1 == toks.len() || toks.at(i + 1).op
+        if i + 1 == toks.len() || toks[i + 1].op
             print(s"sh: ${t.text} needs a file")
             return None
-        val file = toks.at(i + 1).text
+        val file = toks[i + 1].text
         if t.text == "<"
             st.input = file
         else
@@ -259,8 +259,8 @@ start_job(sh: *Shell, all: Buf[Stage], foreground: bool) -> Started
     var last: i64 = 0
     var from_prev: Option[File] = None
     for i in 0..<all.len()
-        val st = all.at(i)
-        val name = st.args.at(0)
+        val st = all[i]
+        val name = st.args[0]
         var input = from_prev
         var output: Option[File] = None
         from_prev = None
@@ -311,7 +311,7 @@ run_foreground(sh: *Shell, all: Buf[Stage]) -> i64
     var last = job.last
     val last_at = last_stage(job)
     for i in 0..<job.stages.len()
-        val (child, name) = job.stages.at(i)
+        val (child, name) = job.stages[i]
         child.wait() match
             Ok(s) -> if i == last_at then last = status_of(name, s)
             Err(_) -> ()
@@ -330,7 +330,7 @@ closed(f: Option[File])
     f match
         Some(g) ->
             var h = g
-            h.close()
+            _ = h.close()
         None -> ()
 
 reading(f: Option[File]) -> Stdio = f match
@@ -355,7 +355,7 @@ run_background(sh: *Shell, all: Buf[Stage], text: string) -> i64
     for j in sh.jobs.view()
         if j.number >= number then number = j.number + 1
     sh.jobs.push(Job(number, job.pgid, stages, last_stage(job), text, false))
-    sh.last_background = stages.at(stages.len() - 1).pid()
+    sh.last_background = stages[stages.len() - 1].pid()
     print(s"[$number] ${sh.last_background}")
     0
 
@@ -366,13 +366,13 @@ take_console(sh: *Shell)
 // Bring job `j` (an index into the job list) to the foreground: the console is its group's, the line
 // that started it is said, and every stage still running is waited for.
 foreground(sh: *Shell, j: usize) -> i64
-    val job = sh.jobs.at(j)
+    val job = sh.jobs[j]
     sh.jobs.remove(j)
     val _ = process.set_foreground_group(job.pgid)
     print(job.text)
     var last: i64 = 0
     for i in 0..<job.stages.len()
-        job.stages.at(i).wait() match
+        job.stages[i].wait() match
             Ok(s) -> if i == job.last_at then last = status_of(job.text, s)
             Err(_) -> ()
     take_console(sh)
@@ -389,7 +389,7 @@ job_named(sh: *Shell, word: string) -> Option[usize]
         if b[i] < u8('0') || b[i] > u8('9') then return None
         n = n * 10 + u64(b[i] - u8('0'))
     for i in 0..<sh.jobs.len()
-        if sh.jobs.at(i).number == n then return Some(i)
+        if sh.jobs[i].number == n then return Some(i)
     None
 
 // Collect what has ended of every background job, and report each job whose stages have all ended.
@@ -397,14 +397,14 @@ job_named(sh: *Shell, word: string) -> Option[usize]
 reap_jobs(sh: *Shell)
     var i: usize = 0
     while i < sh.jobs.len()
-        var job = sh.jobs.at(i)
+        var job = sh.jobs[i]
         var naps = if job.signalled then 50 else 0
         while !finished(job) && naps > 0
             naps -= 1
             sleep(millis(10))
         job.signalled = false
         if !finished(job)
-            sh.jobs.set(i, job)
+            sh.jobs[i] = job
             i += 1
             continue
         sh.jobs.remove(i)
@@ -423,7 +423,7 @@ finished(job: Job) -> bool
 // How a job that has finished ended: its last stage's status, or done when that stage never started.
 job_status(job: Job) -> Status
     if job.last_at < job.stages.len()
-        job.stages.at(job.last_at).try_wait() match
+        job.stages[job.last_at].try_wait() match
             Ok(Some(s)) -> return s
             _ -> ()
     Status.Exited(0)
@@ -440,24 +440,24 @@ kill_job(sh: *Shell, w: Buf[string]) -> i64
     var sig = SIGTERM
     var at: usize = 1
     if w.len() > 2
-        sig = signal_named(w.at(1))
+        sig = signal_named(w[1])
         at = 2
     if sig == 0
-        print(s"sh: kill: ${w.at(1)}: no such signal")
+        print(s"sh: kill: ${w[1]}: no such signal")
         return 1
-    val j = job_named(sh, w.at(at)) match
+    val j = job_named(sh, w[at]) match
         Some(j) -> j
         None ->
-            print(s"sh: kill: ${w.at(at)}: no such job")
+            print(s"sh: kill: ${w[at]}: no such job")
             return 1
-    var job = sh.jobs.at(j)
+    var job = sh.jobs[j]
     signal.send(-i64(job.pgid), int(sig)) match
         Ok(_) -> ()
         Err(e) ->
-            print(s"sh: kill: ${w.at(at)}: $e")
+            print(s"sh: kill: ${w[at]}: $e")
             return 1
     job.signalled = true
-    sh.jobs.set(j, job)
+    sh.jobs[j] = job
     0
 
 // `-9`, `-KILL`, `-SIGKILL` and the like as a signal's number; 0 for one it does not know.
@@ -500,7 +500,7 @@ status_of(name: string, s: Status) -> i64 = s match
 run_line(sh: *Shell, toks: Buf[Token], text: string) -> i64
     var words = toks
     var background = false
-    if words.len() > 0 && words.at(words.len() - 1).op && words.at(words.len() - 1).text == "&"
+    if words.len() > 0 && words[words.len() - 1].op && words[words.len() - 1].text == "&"
         background = true
         words.pop()
     for t in words.view()
@@ -520,8 +520,8 @@ run_line(sh: *Shell, toks: Buf[Token], text: string) -> i64
         Some(s) -> s
         None -> return 2
     if all.len() == 0 then return sh.status
-    if all.len() == 1 && all.at(0).input == "" && all.at(0).output == "" && !background
-        builtin(sh, all.at(0).args) match
+    if all.len() == 1 && all[0].input == "" && all[0].output == "" && !background
+        builtin(sh, all[0].args) match
             Some(status) -> return status
             None -> ()
     if background then run_background(sh, all, job_text(text)) else run_foreground(sh, all)
@@ -539,13 +539,13 @@ job_text(line: string) -> string
 
 // The built-ins, which act on the shell itself; None if `w` is not one of them, else their status.
 builtin(sh: *Shell, w: Buf[string]) -> Option[i64]
-    val name = w.at(0)
+    val name = w[0]
     if name == "jobs"
         for j in sh.jobs.view()
             print(s"[${j.number}] running ${j.text}")
         return Some(0)
     if name == "fg"
-        val word = if w.len() > 1 then w.at(1) else ""
+        val word = if w.len() > 1 then w[1] else ""
         return job_named(sh, word) match
             Some(j) -> Some(foreground(sh, j))
             None ->
@@ -559,12 +559,12 @@ builtin(sh: *Shell, w: Buf[string]) -> Option[i64]
 
 // The built-ins that answer nothing: exit, cd, pwd, export.
 plain_builtin(sh: *Shell, w: Buf[string]) -> bool
-    val name = w.at(0)
+    val name = w[0]
     if name == "exit"
-        val code = if w.len() > 1 then parse_code(w.at(1)) else 0
+        val code = if w.len() > 1 then parse_code(w[1]) else 0
         exit(int(code))
     if name == "cd"
-        val dir = if w.len() > 1 then w.at(1) else "/"
+        val dir = if w.len() > 1 then w[1] else "/"
         fs.set_current_dir(dir) match
             Ok(_) -> ()
             Err(e) -> print(s"sh: cd: $dir: $e")

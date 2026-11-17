@@ -207,7 +207,7 @@ private cache_pressure(p: *KFs) -> bool
               dropped, "dropped; at most", peak, "cached, the trim threshold", CACHE_TARGET + CACHE_SLACK)
     ok
 
-private look_up_all(p: *KFs, blocks: []u64) -> bool
+private look_up_all(p: *KFs, blocks: []const u64) -> bool
     for b in blocks
         if p.buffer(b).is_err() then return false
     true
@@ -263,7 +263,7 @@ private reads_back(p: *KFs, ino: u64, t: u64, k: u64, n: usize) -> bool
     var out: Buf[u8] = buf()
     for _ in 0..<n + 100
         out.push(0)
-    val got = op(p, () -> pkg.read(p, ino, 0, out.view())) match
+    val got = op(p, () -> pkg.read(p, ino, 0, out.view_mut())) match
         Ok(g) -> g
         Err(_) -> return false
     if got != n then return false
@@ -389,7 +389,7 @@ private check_replayed(p: *KFs)
             var out: Buf[u8] = buf()
             for _ in 0..<n + 10
                 out.push(0)
-            val got = op(p, () -> pkg.read(p, ino, 0, out.view())).unwrap_or(0)
+            val got = op(p, () -> pkg.read(p, ino, 0, out.view_mut())).unwrap_or(0)
             if got != n then ok = false
             for off in 0..<got
                 if out[off] != replay_fill(k, off) then ok = false

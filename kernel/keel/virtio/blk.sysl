@@ -38,6 +38,7 @@ import keel.cpu
 import keel.gic
 import keel.mm
 import keel.sched.{IrqLock, WaitQueue}
+import sysl.raw.ptr_cast
 
 const SECTOR_SIZE: usize = 512
 // The most one request moves: a KFS block, eight sectors.

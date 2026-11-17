@@ -18,8 +18,9 @@ main(args: []string)
     val first: usize = if long then 2 else 1
     val dir = if args.len > first then args[first] else "."
     fs.entries(dir) match
-        Ok(names) ->
-            val all = names.view()
+        Ok(found) ->
+            var names = found
+            val all = names.view_mut()
             sort(all)
             val users: Buf[User] = if long then passwd.read_users() else buf()
             for name in all

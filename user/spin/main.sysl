@@ -7,6 +7,7 @@
 // when the spinner is running.
 
 import rt.keel.user
+import sysl.raw.ptr_cast
 
 main(args: []string)
     if args.len > 1 then print("spin: spinning")

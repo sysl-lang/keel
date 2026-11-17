@@ -1,7 +1,7 @@
 module keel.heap
 
 // The kernel heap: the allocator every `&T` box, `Buf`, `string` and closure in the kernel comes from.
-// `kernel/package.hocon` names `keel_alloc` and `keel_free` as the program's allocating pair, so the
+// `kernel/sysl.hocon` names `keel_alloc` and `keel_free` as the program's allocating pair, so the
 // compiler calls these wherever it would call `malloc` and `free`.
 //
 // Two kinds of block, both carved from frames and both starting with a `Page` header in their first
@@ -19,6 +19,7 @@ module keel.heap
 import keel.cpu
 import keel.mm
 import keel.mm.{Frame, PhysAddr}
+import sysl.raw.ptr_cast
 import sysl.sync.SpinLock
 
 private const PAGE: u64 = 4096

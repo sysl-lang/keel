@@ -32,7 +32,7 @@ private serve(args: []string) -> int
     var s = udp_socket(here) match
         Ok(sock) -> sock
         Err(e) -> return failed("socket", e)
-    defer s.close()
+    defer _ = s.close()
     s.bind(here) match
         Ok(_) -> ()
         Err(e) -> return failed("bind", e)

@@ -9,6 +9,7 @@ import keel.mm
 import keel.sched
 import keel.sched.Process
 import keel.timer
+import sysl.raw.ptr_cast
 import sysl.sync.{Atomic, Ordering}
 
 // --- Random bytes ---------------------------------------------------------------------------------------

@@ -5,6 +5,7 @@
 
 import abi.keel.abi.EFAULT
 import rt.keel.user
+import sysl.raw.ptr_cast
 
 private attempt(addr: u64, len: u64) -> i64 = user.write(1, ptr_cast(usize(addr)), len)
 

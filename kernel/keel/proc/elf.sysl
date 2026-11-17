@@ -3,6 +3,7 @@ module keel.proc
 import abi.keel.abi.Errno
 import keel.cpu
 import keel.mm
+import sysl.raw.ptr_cast
 
 // A static aarch64 ELF executable (ELF-64 Object File Format; the AArch64 ELF ABI): the file header,
 // and one program header per segment. keel loads an ET_EXEC file at the addresses it was linked at, and

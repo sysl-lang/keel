@@ -28,6 +28,7 @@ module keel.sched
 import keel.cpu
 import keel.gic
 import keel.mm
+import sysl.raw.ptr_cast
 import sysl.sync.{Atomic, Ordering, SpinLock}
 
 const MAX_CPUS: usize = 4

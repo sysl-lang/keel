@@ -10,6 +10,7 @@ module keel.net
 // and written with `be16`/`be32`. Every field is bytes, so every header has alignment 1 and may sit at
 // any offset in a frame — the IPv4 header starts 14 bytes in.
 
+import sysl.raw.ptr_cast
 import sysl.slices.as_mut_ptr
 
 struct Be16

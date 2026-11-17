@@ -8,6 +8,7 @@ module keel.ondisk
 // struct can say so (FINDINGS.md 39), so the structs are read and written in place, through a pointer
 // into a block's bytes, and the layout of each is pinned by `@assert`s below.
 
+import sysl.raw.ptr_cast
 import sysl.slices.as_mut_ptr
 
 const SECTOR_SIZE: usize = 512

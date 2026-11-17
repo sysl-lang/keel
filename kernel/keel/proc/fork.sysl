@@ -29,6 +29,7 @@ import keel.mm
 import keel.sched
 import keel.sched.{Context, Env, Process}
 import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
 
 private const MAX_EXEC_PATH: usize = usize(PATH_ROOM)
 
@@ -159,7 +160,7 @@ private[proc] sys_execve(p: *Process, regs: *u64) -> Result[i64, Errno]
 private vector_in(p: *Process, va: u64, room: u64) -> Result[Buf[u8], Errno]
     val out: Buf[u8] = buf()
     if va == 0 then return Ok(out)
-    val space: Buf[u8] = buf()
+    var space: Buf[u8] = buf()
     for _ in 0..<room
         space.push(0)
     var used: usize = 0
@@ -170,7 +171,7 @@ private vector_in(p: *Process, va: u64, room: u64) -> Result[Buf[u8], Errno]
         if !mm.copy_from_user(&p.space, at, raw[0..<8]) then return Err(EFAULT)
         if ptr == 0 then break
         if used == usize(room) then return Err(E2BIG)
-        val n = mm.copy_cstr_from_user(&p.space, ptr, space.view()[used..]) match
+        val n = mm.copy_cstr_from_user(&p.space, ptr, space.view_mut()[used..]) match
             Some(n) -> n
             None -> return Err(EFAULT)
         if n == usize(room) - used then return Err(E2BIG)

@@ -32,6 +32,7 @@ import keel.net
 import keel.pl011.put_byte
 import keel.sched
 import keel.sched.{Holds, IrqLock, OPEN_FILES, OpenFile, Process, WaitQueue}
+import sysl.raw.ptr_cast
 
 private const PIPES: usize = 16
 private const ROOM: usize = usize(PIPE_ROOM)
