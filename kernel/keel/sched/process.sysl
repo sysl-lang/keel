@@ -128,7 +128,7 @@ unlock_files(p: *Process)
 const ENV_ROOM: usize = 1024
 
 // A process's environment, in a box of its own rather than inline: a Process is built by value before
-// it is boxed, and a kernel stack is 16 KiB. A `Buf` cannot be a field, every count inside a `&sync`
+// it is boxed, and a kernel stack is 24 KiB. A `Buf` cannot be a field, every count inside a `&sync`
 // box having to be atomic.
 struct Env
     bytes: [ENV_ROOM]u8

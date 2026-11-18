@@ -109,7 +109,7 @@ private[proc] sys_spawn(p: *Process, regs: *u64) -> Result[i64, Errno]
 // What a spawn's caller asked for besides the program and its arguments — the SpawnAttr at `va`, or
 // every default for 0: the child's environment, the caller's descriptors for its 0 to 2, and its
 // process group. A function of its own so that its frame is gone before the child is built (kernel
-// stacks are 16 KiB).
+// stacks are 24 KiB).
 private asked_for(p: *Process, va: u64) -> Result[(Buf[u8], [3]u64, Group), Errno]
     var attr = SpawnAttr([NO_FD, NO_FD, NO_FD], 0, 0, 0, 0, 0)
     if va != 0

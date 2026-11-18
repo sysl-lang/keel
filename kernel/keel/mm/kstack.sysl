@@ -4,18 +4,23 @@ import keel.cpu
 import sysl.sync.SpinLock
 
 // Kernel thread stacks. Each lives in a window of the kernel half of its own, 32 KiB a slot: the top
-// 16 KiB are mapped, page by page, to frames from the frame allocator, and the 16 KiB below stay
+// 24 KiB are mapped, page by page, to frames from the frame allocator, and the 8 KiB below stay
 // unmapped, so a thread that runs off the bottom of its stack takes a translation fault instead of
 // writing over its neighbour. RAM's own mapping is in 2 MiB blocks, which a single guard page cannot
 // be cut out of; a window of its own needs only two more tables (one level-2, one level-3 for the
 // window's 2 MiB) and no splitting.
+//
+// 24 KiB is set by an unoptimised (-O0) build. Optimised, the deepest thread measured, a KFS worker in
+// the boot test's multi-core run, used about 4.5 KiB; at -O0 the same worker used all of 16 KiB, so an
+// interrupt taken at its deepest point put its 272-byte frame in the guard. The guard still exceeds
+// every frame a thread's stack holds (the larger ones are `kmain`'s, on the boot stack).
 //
 // The window is at 256 GiB into the kernel half: level-1 slot 256 of the kernel's root, far from the
 // devices (slot 0) and RAM (slot 1).
 
 private const WINDOW: u64 = KERNEL_BASE + 0x40_0000_0000
 private const SLOT: u64 = 32 << 10
-const STACK_SIZE: u64 = 16 << 10
+const STACK_SIZE: u64 = 24 << 10
 private const SLOTS: u64 = 64                       // one level-3 table: 2 MiB of window
 
 private const PAGE: u64 = 4096
@@ -31,7 +36,7 @@ struct Stack
     slot: u64
     top: VirtAddr
 
-// A mapped 16 KiB stack with an unmapped guard below it, or None when every slot is taken or RAM is
+// A mapped 24 KiB stack with an unmapped guard below it, or None when every slot is taken or RAM is
 // exhausted.
 alloc_stack() -> Option[Stack]
     val flags = cpu.irq_save()

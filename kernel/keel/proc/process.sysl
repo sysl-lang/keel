@@ -92,7 +92,7 @@ private start_loaded(image: []const u8, args: []const string, name: [sched.NAME_
         None ->
             mm.free_space(&l.space)
             return Err(TooManyArgs)
-    // The descriptors are filled in once the process is in its box: a kernel stack is 16 KiB, and every
+    // The descriptors are filled in once the process is in its box: a kernel stack is 24 KiB, and every
     // copy of a Process made on the way to the box is more than a KiB of it.
     val pid = new_pid()
     val p: &sync Process = Process(pid, l.space, l.heap_base, l.heap_base, sched.no_threads(),
