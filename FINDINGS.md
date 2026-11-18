@@ -2919,6 +2919,51 @@ Clean form, in two parts:
   `@stack(8192)` on `keel_trap`. Indirect calls would have to be annotated: KFS calls every operation through
   a closure (`keel.kfs.op`).
 
+## 82. An allocation cannot fail: a null from the allocator traps, so a kernel cannot answer ENOMEM from any path that allocates (gap)
+
+keel's heap (`keel_alloc`, behind sysl's `allocator` block) has one answer when RAM runs out:
+`panic("keel: out of memory: the kernel heap asked for more frames than are free")`, which powers the
+machine off (`heap.sysl:16-17`, `:168-170`). The heap could return null instead, but nothing above it
+could act on that. reference/memory.md: "A box is made from what the allocator answers, and a null
+answer **traps** before anything is stored, exactly as a failed array allocation does." The library has
+no fallible form: there is no `try_push`, `try_reserve` or fallible box constructor anywhere under
+`library/`. Shortest input (0.11.12, `sysl run`):
+
+    import sysl.buf.{Buf, buf}
+
+    main()
+        var b: Buf[u64] = buf()
+        b.reserve(usize(1) << 61)
+        print("reserved", b.len())
+
+It exits with status 133 (SIGTRAP), printing nothing; nothing the program writes can catch it.
+
+Every system call that builds a `Buf` or a box is therefore one exhausted heap away from powering off
+the machine. That covers:
+- `spawn` and `execve` packing arguments and the environment (`proc/family.sysl`);
+- `fork` copying (`proc/fork.sysl`);
+- path and directory handling in the filesystem calls;
+- every TCP connection's state.
+
+A user process can drive all of these. Linux answers -ENOMEM from almost every allocation site
+(`kmalloc` returns NULL, and callers unwind), and starts its OOM killer only when reclaim fails. Rust for
+Linux built `try_push`, `try_with_capacity` and `Box::try_new` (since moved into the `alloc` crate as
+`try_reserve` and friends) because `alloc`'s infallible default was unacceptable in a kernel. For keel
+this is the step after demand paging and reclaim: reclaim needs somewhere to fall back to that is not a
+panic.
+
+Used: nothing yet. Every allocation in the kernel is a panic on failure, and the boot test never runs
+the heap dry.
+
+Clean form, any of:
+- fallible twins on the containers and boxes, answering `Result[_, AllocError]`: `Buf.try_push`,
+  `try_reserve`, `try_buf_with_capacity`, and a fallible box constructor;
+- a module- or package-level setting under which an allocation that may fail must be written in its
+  fallible form, so a kernel's call paths can be checked not to reach the trapping one, as `@no_alloc`
+  is checked through every call today;
+- an allocator hook that is allowed to answer null, with the trap kept only where the program chose the
+  infallible form.
+
 ## What worked in milestone 17
 
 - **No sysl gap in the kernel half.** A poller waits on one module `WaitQueue` with an event count under
