@@ -2867,6 +2867,58 @@ parameter a member must be handed already held, as a `held: &Locked[L]` token th
 answers; a `Guarded`-style `with` whose closure may sleep on a wait queue that releases and retakes the
 guard; and, for the diagnostic, wording that does not promise a check the attribute does not make.
 
+## 81. Nothing in sysl reports or bounds a function's stack frame, so a kernel learns its stack depth from a crash (gap)
+
+On sysl 0.11.10 keel's `-O0` gate failed about one boot in five, during KFS's multi-core self-test:
+`keel: trap translation fault level 3 esr=0x96000047 elr=... (keel_vectors) far=0xffff004000028000`, the
+lowest byte of a kernel stack's guard. Painting every stack at allocation and scanning for the lowest
+write at `free_stack` measured the deepest KFS worker:
+
+| build | deepest worker, of a 16 KiB stack |
+|---|---|
+| alpha.13, kfs 0.1.0, `-O0` | 14,928 bytes |
+| 0.11.10, kfs 0.1.1, `-O0` | 16,384 bytes: all of it, every run |
+| 0.11.10, kfs 0.1.1, default | about 4,500 bytes |
+
+A timer interrupt taken at the worker's deepest point pushed its 272-byte trap frame into the guard. The
+path is KFS's write path (`write_root`, `declare_access`, the lock-order `take`/`give`), and the largest
+frames in the `-O0` kernel are KFS's: `mount` 25,184 bytes, the generated `Corruption.debug` 5,312 and
+`FsError.debug` 4,560 (new in 0.11), `settle` 4,272, `finish` 4,192, `chunk_in` 3,696. Nothing said so
+before the crash. Shortest input (0.11.12, `sysl build -O0`):
+
+    deep(n: usize) -> u8
+        var block: [65536]u8 = [0; 65536]
+        block[n % 65536] = u8(n)
+        block[(n * 7) % 65536]
+
+    main()
+        print(deep(3))
+
+It builds without a word, and `deep`'s prologue reserves 65,600 bytes. `sysl build --help` has no option
+for a frame limit or a stack report, and no reference page names one (`grep -ri` for frame size, stack
+usage and stack budget over `docs/content/reference` finds nothing). keel already sizes thread stacks and
+cannot ask the compiler what they hold.
+
+What the mainstream does:
+- **Linux:** treats a frame over 2 KiB on 64-bit as a build error (`-Wframe-larger-than`, `CONFIG_FRAME_WARN`)
+  and ranks frames with `make checkstack`. It reports each task's peak use and has a stack tracer, both at run
+  time, and runs interrupts on per-CPU stacks. It does not build at `-O0`.
+- **Windows:** `/analyze` warns at large frames (C6262), and a driver can ask how much stack is left.
+- **Safety-critical systems** (GNATstack for Ada/SPARK) compute a whole-program worst-case bound, with indirect
+  calls and recursion annotated.
+
+Used: kernel stacks raised to 24 KiB with an 8 KiB guard; the measurement code was thrown away.
+
+Clean form, in two parts:
+- **(a) The mainstream minimum,** cheap because LLVM has both:
+  - a per-function frame limit that fails the build, as LLVM's `warn-stack-size` attribute does for clang's
+    `-Wframe-larger-than`, settable per package and per function, so a kernel can hold every function to
+    2 KiB and exempt `kmain`;
+  - a per-function stack report, as `-fstack-usage` produces.
+- **(b) Optionally,** a whole-program bound checked through the call graph as `@no_alloc` already is, such as
+  `@stack(8192)` on `keel_trap`. Indirect calls would have to be annotated: KFS calls every operation through
+  a closure (`keel.kfs.op`).
+
 ## What worked in milestone 17
 
 - **No sysl gap in the kernel half.** A poller waits on one module `WaitQueue` with an event count under
