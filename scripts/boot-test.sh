@@ -120,6 +120,15 @@ before_user_line=(
     "user: exec ok"         # /bin/env through a pipe saw the environment; /bin/false's 1; a failed execve's ENOENT
     "keel: forktest exited 0"
     "keel: fork frames reclaimed"  # every frame the forked children shared or copied came back, and every ASID
+    # Milestone 20: mappings and demand paging (mm's maps.sysl), each line with exact frame counts.
+    "vmtest: a 64 MiB anonymous mapping took at most 2 frames; 100 pages touched took 100; munmap gave back every page brought in"
+    "vmtest: read() into a mapping never touched, across a page boundary, brought in the file's bytes"
+    "vmtest: fork: a page only one side touched read zero in the other and kept each side's own writes; the child's frames came back"
+    "vmtest: 4 threads wrote the same 256 fresh pages at once: no write lost, one frame each"
+    "vmtest: an untouched PROT_NONE page faults; mprotect reached touched and untouched pages; munmap split a mapping"
+    "vmtest: a child touching pages until memory ran out was killed by SIGSEGV; every frame came back"
+    "keel: vmtest exited 0"
+    "keel: paging frames reclaimed"   # every frame vmtest's pages, tables, lists and children took came back
     "keel: fs smp ok"       # one process per core wrote, read back, removed a file of its own, synced
     "user: hello.txt says hello from the disk"   # a sysl program read a file mkfs put on the disk
     "user: write ok"        # ...wrote /out.txt (12 blocks, the indirect one too), reopened it, read it back
@@ -497,7 +506,7 @@ transcript2=(
     $'# busybox echo hello from busybox\nhello from busybox\n'
     $'# busybox uname -a\nkeel keel 0.18 milestone 18 aarch64 Linux\n'
     $'# busybox ls -l /\ntotal 68\n'
-    $'drwxr-xr-x    2 0        root          1600 Jan  1  1970 \e[1;34mbin\e[m\n'
+    $'drwxr-xr-x    2 0        root          1632 Jan  1  1970 \e[1;34mbin\e[m\n'
     $'drwxr-xr-x    2 0        root            96 Jan  1  1970 \e[1;34mdir\e[m\n'
     $'drwxr-xr-x    2 0        root           160 Jan  1  1970 \e[1;34metc\e[m\n'
     $'-rw-r--r--    1 0        root            19 Jan  1  1970 \e[0;0mhello.txt\e[m\n'
@@ -559,13 +568,13 @@ shutdown=(
 # the `files` program failed, the shell was restarted, or a process was left behind.
 not_expected=("keel: bounds failure was not fatal" "user: FAILED" "init: login ended by signal"
     "keel: processes left unreaped" "keel: processes still running before init" "linuxpoll: FAILED"
-    "linuxfp: FAILED" "threads: FAILED" "cstdhello: FAILED" "linuxtcp: FAILED" "host: curl FAILED"
+    "linuxfp: FAILED" "threads: FAILED" "vmtest: FAILED" "cstdhello: FAILED" "linuxtcp: FAILED" "host: curl FAILED"
     "keel: kfs smp wrong" "keel: kfs replay wrong" "keel: kfs power cut wrong" "keel: kfs heap wrong" "keel.kfs:" "sh.sysl.kfs:"
     "keelroot" "wonderland" "nope")
 
 user_programs=(hello fault spin worker badptr files fsload echo cp cmp cat ls fscheck
     init sh mkdir rm rmdir mv false ppid orphan udpecho login su id whoami chmod chown env wc grep head true forktest
-    sigtest stdsig ps kill sleep threads)
+    sigtest stdsig ps kill sleep threads vmtest)
 
 # 256 MiB is 65,536 frames; the device tree (1 MiB), the image and the bitmap take a few hundred — up to
 # about 650 at -O0 since KFS is in the image.

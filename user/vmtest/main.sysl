@@ -1,0 +1,280 @@
+// vmtest: anonymous memory is paged in on demand. Every line printed is a property checked with exact
+// frame counts (sysinfo's freeram, in pages) or exact values:
+//
+// - a 64 MiB anonymous mapping takes almost no frames; touching 100 pages of it takes exactly 100, and
+//   munmap gives back exactly the pages that were brought in;
+// - read() from a file into a mapping no one has touched, across a page boundary, lands the file's bytes;
+// - after fork, a page neither side had touched reads zero in each and holds each side's own writes, and
+//   every frame the child had comes back when it is reaped;
+// - four threads writing the same 256 fresh pages at once lose no write, and exactly 256 frames came in;
+// - a PROT_NONE page inside an untouched mapping faults, mprotect reaches the untouched pages as well as
+//   the touched ones, and a munmap in the middle of a mapping leaves both sides of it;
+// - a child that touches pages until memory runs out is killed by SIGSEGV, and its frames come back.
+//
+// Nothing is printed between two counts it compares: print uses the heap, whose pages come in too.
+
+import abi.keel.abi.{SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_READ, SYS_SYSINFO}
+import rt.keel.user
+import sysl.raw.ptr_cast
+import sysl.sync.Atomic
+import sysl.threads.{Thread, spawn}
+
+const PAGE: u64 = 4096
+const TABLE_SPAN: u64 = 0x20_0000               // what one level-3 table maps
+const PROT_NONE: u64 = 0
+const PROT_READ: u64 = 1
+const PROT_WRITE: u64 = 2
+const MAP_PRIVATE: u64 = 0x02
+const MAP_ANONYMOUS: u64 = 0x20
+const SIGSEGV: u64 = 11
+const EFAULT: i64 = 14
+
+var failures: u64 = 0
+
+fail(what: string)
+    print(s"vmtest: FAILED $what")
+    failures += 1
+
+check(ok: bool, what: string)
+    if !ok then fail(what)
+
+stop(what: string) -> never
+    print(s"vmtest: FAILED $what")
+    user.exit(1)
+
+// Free frames now: sysinfo's freeram, whose unit is the page.
+free_frames() -> u64
+    var info: [14]u64 = [0; 14]
+    if user.syscall(SYS_SYSINFO, u64(usize(&info[0])), 0, 0, 0) != 0 then stop("sysinfo")
+    info[5]                                     // after uptime, three loads and totalram
+
+// Free frames once nothing else is changing them: the kernel that started this program may still be
+// giving back the buffer it read the image into, on another core, while this program runs.
+settled_frames() -> u64
+    var last = free_frames()
+    loop
+        val _ = user.nanosleep(20_000_000)
+        val now = free_frames()
+        if now == last then return now
+        last = now
+
+// A fresh private anonymous mapping of `len` bytes.
+anon(len: u64, prot: u64 = PROT_READ | PROT_WRITE) -> u64
+    val r = user.syscall6(SYS_MMAP, 0, len, prot, MAP_PRIVATE | MAP_ANONYMOUS, ~u64(0), 0)
+    if r < 0 then stop(s"mmap of $len bytes: errno ${-r}")
+    u64(r)
+
+unmap(at: u64, len: u64)
+    if user.syscall(SYS_MUNMAP, at, len, 0, 0) != 0 then stop("munmap")
+
+protect(at: u64, len: u64, prot: u64) -> i64 = user.syscall(SYS_MPROTECT, at, len, prot, 0)
+
+word(at: u64) -> *volatile u64 = ptr_cast(usize(at))
+
+byte(at: u64) -> *volatile u8 = ptr_cast(usize(at))
+
+// The first address in [at, ...) on a boundary of what one level-3 table maps.
+table_aligned(at: u64) -> u64 = (at + TABLE_SPAN - 1) & ~(TABLE_SPAN - 1)
+
+// Whether a child that stores `value` at `at` is killed by SIGSEGV for it.
+store_faults(at: u64, value: u64) -> bool
+    user.fork() match
+        Ok(0) ->
+            *word(at) = value
+            user.exit(0)
+        Ok(child) -> user.wait(i64(child)) match
+            Ok((_, status)) -> status.signalled() && status.signal() == SIGSEGV
+            Err(_) -> false
+        Err(e) -> stop(s"fork: errno ${i64(e)}")
+
+// Wait for `pid`; whether it exited 0.
+exited_ok(pid: u64) -> bool = user.wait(i64(pid)) match
+    Ok((_, status)) -> status.exited() && status.code() == 0
+    Err(_) -> false
+
+// --- A lazy mapping, counted ---------------------------------------------------------------------
+// The 100 pages are in one level-3 table's span, whose table the first touch made: so each of them costs
+// exactly its own frame. The untouched page read at the end is brought in too, as a zero page.
+val big: u64 = 64 * 1024 * 1024
+val f0 = settled_frames()
+val region = anon(big)
+val f1 = free_frames()
+val window = table_aligned(region)
+*word(window) = 1
+val f2 = free_frames()
+for i in 1..<101
+    *word(window + u64(i) * PAGE) = u64(i)
+val f3 = free_frames()
+var kept = *word(window) == 1
+for i in 1..<101
+    kept = kept && *word(window + u64(i) * PAGE) == u64(i)
+val untouched_zero = *word(window + 300 * PAGE) == 0
+val f3_read = free_frames()
+unmap(region, big)
+val f4 = free_frames()
+check(f0 - f1 <= 2, s"a 64 MiB mapping took ${f0 - f1} frames")
+check(f1 - f2 >= 1 && f1 - f2 <= 4, s"the first touch took ${f1 - f2} frames")
+check(f2 - f3 == 100, s"100 pages touched took ${f2 - f3} frames")
+check(kept && untouched_zero, "a touched page lost its value, or an untouched one was not zero")
+check(f3 - f3_read == 1, s"reading an untouched page took ${f3 - f3_read} frames")
+check(f4 - f3_read == 102, s"munmap gave back ${f4 - f3_read} frames, not the 102 pages present")
+if failures == 0 then print("vmtest: a 64 MiB anonymous mapping took at most 2 frames; 100 pages touched took 100; munmap gave back every page brought in")
+
+// --- A system call on untouched pages ------------------------------------------------------------
+var before = failures
+var expected: [64]u8 = [0; 64]
+val fd1 = user.open("/hello.txt", 0) match
+    Ok(fd) -> fd
+    Err(e) -> stop(s"open /hello.txt: errno ${i64(e)}")
+val n1 = user.read(fd1, expected[..]) match
+    Ok(n) -> n
+    Err(e) -> stop(s"read /hello.txt: errno ${i64(e)}")
+val _ = user.close(fd1)
+val buffer = anon(2 * PAGE)
+val into = buffer + PAGE - 5                    // five bytes in the first page, the rest in the second
+val fd2 = user.open("/hello.txt", 0) match
+    Ok(fd) -> fd
+    Err(e) -> stop(s"open /hello.txt: errno ${i64(e)}")
+val n2 = user.syscall(SYS_READ, fd2, into, 64, 0)
+val _ = user.close(fd2)
+check(n1 > 5 && n2 == i64(n1), s"read into an untouched mapping answered $n2, not $n1")
+if n2 == i64(n1)
+    for i in 0..<n1
+        check(*byte(into + i) == expected[i], s"byte $i read into an untouched mapping differs")
+unmap(buffer, 2 * PAGE)
+if failures == before then print("vmtest: read() into a mapping never touched, across a page boundary, brought in the file's bytes")
+
+// --- fork ----------------------------------------------------------------------------------------
+// Page 0 the parent wrote before the fork; page 1 only the child touches, page 2 only the parent, both
+// while the other is alive (the pipe orders them).
+before = failures
+val shared_area = anon(2 * TABLE_SPAN)
+val shared = table_aligned(shared_area)         // the four pages under one level-3 table
+*word(shared) = 7
+val (r, w) = user.pipe() match
+    Ok(ends) -> ends
+    Err(e) -> stop(s"pipe: errno ${i64(e)}")
+val ff0 = free_frames()
+user.fork() match
+    Ok(0) ->
+        val _ = user.close(w)
+        var go: [1]u8 = [0]
+        val _ = user.read(r, go[..])
+        var ok = *word(shared + 2 * PAGE) == 0 && *word(shared + PAGE) == 0 && *word(shared) == 7
+        *word(shared + PAGE) = 11
+        *word(shared) = 8
+        ok = ok && *word(shared + PAGE) == 11 && *word(shared) == 8
+        user.exit(if ok then 0 else 1)
+    Ok(child) ->
+        *word(shared + 2 * PAGE) = 13
+        val _ = user.write_file(w, [u8(1)])
+        val reaped = exited_ok(child)
+        val ff1 = free_frames()
+        check(reaped, "the child saw a page the parent touched after the fork, or not its own writes")
+        check(*word(shared) == 7 && *word(shared + 2 * PAGE) == 13, "the child's writes reached the parent")
+        check(ff0 - ff1 == 1, s"after the child was reaped ${ff0 - ff1} frames were gone, not the parent's one page")
+        check(*word(shared + PAGE) == 0, "a page only the child touched was not zero in the parent")
+    Err(e) -> stop(s"fork: errno ${i64(e)}")
+val _ = user.close(r)
+val _ = user.close(w)
+unmap(shared_area, 2 * TABLE_SPAN)
+if failures == before then print("vmtest: fork: a page only one side touched read zero in the other and kept each side's own writes; the child's frames came back")
+
+// --- Threads faulting on the same pages ----------------------------------------------------------
+const THREADS: u64 = 4
+const PAGES: u64 = 256
+
+struct Toucher
+    base: u64
+    index: u64
+    ready: *Atomic[u64]
+    go: *Atomic[u64]
+
+// Wait until every thread is ready, then write this thread's word of each page, in the same order as
+// the others: they meet on pages none of them has brought in yet.
+touch(t: *Toucher)
+    val _ = t.ready.add(1)
+    while t.go.load() == 0
+        ()
+    for k in 1..<PAGES + 1
+        *word(t.base + k * PAGE + t.index * 8) = k * 10 + t.index
+
+before = failures
+val area = anon(2 * TABLE_SPAN)
+val pages_at = table_aligned(area)
+*word(pages_at) = 1                             // its level-3 table is there now
+var ready: Atomic[u64] = Atomic(0)
+var go: Atomic[u64] = Atomic(0)
+var touchers: [4]Toucher = [Toucher(pages_at, 0, &ready, &go); 4]
+var threads: [4]Option[Thread] = [None; 4]
+for i in 0..<THREADS
+    touchers[i].index = i
+    threads[i] = spawn(&touch, &touchers[i])
+    if threads[i].is_none() then stop("spawn answered None")
+while ready.load() < THREADS
+    ()
+go.store(1)
+for i in 0..<THREADS
+    threads[i] match
+        Some(t) -> if !t.join() then stop("a thread was not joined")
+        None -> ()
+var lost: u64 = 0
+for k in 1..<PAGES + 1
+    for i in 0..<THREADS
+        if *word(pages_at + k * PAGE + i * 8) != k * 10 + i then lost += 1
+val ft0 = free_frames()
+unmap(area, 2 * TABLE_SPAN)
+val ft1 = free_frames()
+check(lost == 0, s"$lost writes of 4 threads x 256 fresh pages were lost")
+check(ft1 - ft0 == PAGES + 1, s"munmap gave back ${ft1 - ft0} frames, not one for each of 257 pages")
+if failures == before then print("vmtest: 4 threads wrote the same 256 fresh pages at once: no write lost, one frame each")
+
+// --- Guards, mprotect and munmap inside a lazy mapping -------------------------------------------
+before = failures
+val g = anon(16 * PAGE)
+check(protect(g + 8 * PAGE, PAGE, PROT_NONE) == 0, "mprotect PROT_NONE of an untouched page")
+check(store_faults(g + 8 * PAGE, 1), "a store to an untouched PROT_NONE page did not fault")
+val fd3 = user.open("/hello.txt", 0) match
+    Ok(fd) -> fd
+    Err(e) -> stop(s"open /hello.txt: errno ${i64(e)}")
+check(user.syscall(SYS_READ, fd3, g + 8 * PAGE, 1, 0) == -EFAULT, "read() into an untouched PROT_NONE page was not EFAULT")
+val _ = user.close(fd3)
+for k in 0..<4
+    *word(g + u64(k) * PAGE) = u64(k) + 100
+check(protect(g, 8 * PAGE, PROT_READ) == 0, "mprotect PROT_READ of a partly touched range")
+check(store_faults(g + PAGE, 5), "a store to a touched page made PROT_READ did not fault")
+check(store_faults(g + 6 * PAGE, 5), "a store to an untouched page made PROT_READ did not fault")
+check(*word(g + 6 * PAGE) == 0 && *word(g + PAGE) == 101, "a PROT_READ page read wrong")
+check(protect(g, 8 * PAGE, PROT_READ | PROT_WRITE) == 0, "mprotect back to read-write")
+*word(g + 6 * PAGE) = 9
+*word(g + 7 * PAGE) = 10
+check(*word(g + 6 * PAGE) == 9 && *word(g + 7 * PAGE) == 10, "a page made writable again lost a store")
+unmap(g + 12 * PAGE, PAGE)
+check(store_faults(g + 12 * PAGE, 1), "a store into a page munmap took out of the middle did not fault")
+*word(g + 11 * PAGE) = 3
+*word(g + 13 * PAGE) = 4
+check(*word(g + 11 * PAGE) == 3 && *word(g + 13 * PAGE) == 4, "the pages on each side of a munmap'd one")
+unmap(g, 16 * PAGE)
+if failures == before then print("vmtest: an untouched PROT_NONE page faults; mprotect reached touched and untouched pages; munmap split a mapping")
+
+// --- Running out --------------------------------------------------------------------------------
+// 512 MiB is twice the machine's RAM: the child cannot touch it all.
+before = failures
+val fo0 = free_frames()
+user.fork() match
+    Ok(0) ->
+        val huge = anon(512 * 1024 * 1024)
+        for k in 0..<u64(512 * 256)
+            *word(huge + k * PAGE) = k
+        user.exit(0)
+    Ok(child) ->
+        val killed = user.wait(i64(child)) match
+            Ok((_, status)) -> status.signalled() && status.signal() == SIGSEGV
+            Err(_) -> false
+        val fo1 = free_frames()
+        check(killed, "a child touching 512 MiB was not killed by SIGSEGV")
+        check(fo1 == fo0, s"after it, $fo1 frames were free, not $fo0")
+    Err(e) -> stop(s"fork: errno ${i64(e)}")
+if failures == before then print("vmtest: a child touching pages until memory ran out was killed by SIGSEGV; every frame came back")
+
+user.exit(if failures == 0 then 0 else 1)

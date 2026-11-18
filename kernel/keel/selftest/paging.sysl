@@ -1,0 +1,30 @@
+module keel.selftest
+
+// Demand paging (mm's maps.sysl): /bin/vmtest maps memory it touches only in part, reads files into
+// pages it never touched, forks over untouched pages, faults one page from four threads at once, and
+// has a child run out of memory. The kernel starts it, waits, and then counts: every frame its pages,
+// tables, lists of mappings and children took must have come back, and every ASID.
+
+import keel.heap
+import keel.mm
+import keel.proc
+
+paging()
+    val frames_before = mm.frames_free()
+    val blocks_before = heap.live()
+    proc.start_with("/bin/vmtest", ["vmtest"]) match
+        Ok(p) ->
+            proc.wait(p)
+            if proc.exited(p)
+                print("keel: vmtest exited", proc.exit_code(p))
+            else
+                print(s"keel: vmtest killed: ${proc.why(p)}")
+        Err(_) ->
+            print("keel: vmtest did not load")
+            return
+    val frames_after = mm.frames_free()
+    if frames_after == frames_before && mm.asids_in_use() == 0 && heap.live() == blocks_before
+        print("keel: paging frames reclaimed")
+    else
+        print("keel: paging frames leaked: frames free", frames_after, "of", frames_before, "asids",
+            mm.asids_in_use(), "blocks live", heap.live(), "of", blocks_before)

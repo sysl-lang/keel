@@ -329,22 +329,24 @@ user_sync(regs: *u64, ec: u64, iss: u64)
         val again = system_call(regs)
         val p = current_process()
         if p != null then deliver(p, regs, again)
-    else if ec == 0x24 && is_write_permission_fault(iss) && mm.break_cow(&current_process().space, cpu.far())
-        // A write to a copy-on-write page (mm's cow.sysl): the page is writable now, and the store runs
-        // again.
-        returning_to_user(regs)
-    else if ec == 0x24 && is_translation_fault(iss) && mm.grow_stack(&current_process().space, cpu.far())
-        // The stack's next page, touched for the first time (mm's uspace.sysl): it is there now.
+    else if (ec == 0x20 || ec == 0x24) && is_page_fault(iss) && faulted_in(ec, iss)
+        // A page of a mapping touched for the first time, a write to a copy-on-write page, or the stack
+        // grown down (mm's maps.sysl): the access may go ahead now, and the instruction runs again.
         returning_to_user(regs)
     else
         val fault = (ec << 8) | (iss & 0x3f)
         end(current_process(), fault_signal(ec), fault)
 
-// A data abort's ISS: a permission fault at any level (DFSC 0b0011xx) on a write (WnR, bit 6).
-private is_write_permission_fault(iss: u64) -> bool = ((iss & 0x3f) >> 2) == 3 && ((iss >> 6) & 1) == 1
+// An abort's ISS: a translation fault (status 0b0001xx: nothing present there) or a permission fault
+// (0b0011xx), at any level — the two the mappings may answer.
+private is_page_fault(iss: u64) -> bool = ((iss & 0x3f) >> 2) == 1 || ((iss & 0x3f) >> 2) == 3
 
-// A data abort's ISS: a translation fault at any level (DFSC 0b0001xx), nothing mapped there.
-private is_translation_fault(iss: u64) -> bool = ((iss & 0x3f) >> 2) == 1
+// Whether the mappings let the abort's access go ahead now (mm's `fault_in`, which may grow the stack).
+private faulted_in(ec: u64, iss: u64) -> bool = mm.fault_in(&current_process().space, cpu.far(), wanted(ec, iss), true)
+
+// The access an abort was: an instruction fetch, or a data access that wrote (WnR, bit 6) or read.
+private wanted(ec: u64, iss: u64) -> u64 =
+    if ec == 0x20 then mm.PROT_EXEC else if ((iss >> 6) & 1) == 1 then mm.PROT_WRITE else mm.PROT_READ
 
 // The signal a POSIX kernel raises for an exception class: an instruction or data abort is SIGSEGV, a
 // PC or SP alignment fault SIGBUS, a trapped floating-point exception SIGFPE, `brk` SIGTRAP, and

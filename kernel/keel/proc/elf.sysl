@@ -151,14 +151,11 @@ load(image: []const u8) -> Result[Loaded, LoadError]
         mm.free_space(&space)
         return Err(BadEntry)
 
-    var va = mm.stack_bottom()
-    while va < mm.USER_STACK_TOP
-        mm.map_user_page(&space, va, mm.UserProt(true, false)) match
-            Some(_) -> ()
-            None ->
-                mm.free_space(&space)
-                return Err(NoMemory)
-        va += mm.PAGE_SIZE
+    // The stack: a mapping with no pages yet. lay_out_args's copies bring in the ones it writes.
+    if !mm.add_mapping(&space, mm.stack_bottom(), mm.USER_STACK_TOP, mm.PROT_READ | mm.PROT_WRITE,
+            mm.VM_ANON | mm.VM_STACK | mm.VM_PRIVATE)
+        mm.free_space(&space)
+        return Err(NoMemory)
 
     cpu.sync_icache()
     Ok(Loaded(space, entry, page_up(end), phdr, u64(h.phnum)))
@@ -174,6 +171,8 @@ private load_segment(space: *mm.Space, image: []const u8, ph: ProgramHeader) -> 
     val prot = mm.UserProt(ph.flags & PF_W != 0, ph.flags & PF_X != 0)
     var page = ph.vaddr & ~(mm.PAGE_SIZE - 1)
     val last = ph.vaddr + ph.memsz
+    val linux_prot = mm.PROT_READ | (if prot.write then mm.PROT_WRITE else 0) | (if prot.exec then mm.PROT_EXEC else 0)
+    if !mm.record_image(space, page, page_up(last), linux_prot) then return Err(NoMemory)
     while page < last
         val pa = mm.map_user_page(space, page, prot) match
             Some(p) -> p

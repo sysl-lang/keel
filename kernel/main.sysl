@@ -122,6 +122,7 @@ kmain(dtb_pa: u64) -> never
         system_off()
     selftest.user()
     selftest.forking()
+    selftest.paging()
     selftest.files()
 
     // Milestone 11: the network, from the kernel and then from a user program. It stays up for the

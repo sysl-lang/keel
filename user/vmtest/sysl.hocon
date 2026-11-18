@@ -1,0 +1,28 @@
+// `vmtest`: demand paging of anonymous memory, checked from EL0 — lazy mappings counted in frames, system
+// calls on untouched pages, fork, threads faulting on one page, guards and mprotect, running out.
+
+package {
+  name    = "vmtest"
+  version = "0.0.1"
+}
+
+dependencies {
+  rt { workspace = true }
+  fsys { workspace = true }
+}
+
+// sysl.threads keeps its own per-thread state at TPIDR_EL0, which the kernel switches with the thread.
+codegen {
+  thread_pointer = "tpidr_el0"
+}
+
+targets {
+  aarch64-freestanding {
+    linker_script = "../user.ld"
+    entry         = "_start"
+
+    capabilities {
+      posix = false
+    }
+  }
+}

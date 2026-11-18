@@ -104,6 +104,22 @@ alloc_frames(n: u64) -> Option[Frame]
     cpu.irq_restore(flags)
     found
 
+// The frames a user space may not take: the kernel's own allocations (its heap, thread stacks, disk
+// buffers) cannot fail (FINDINGS 82), so a program that touches page after page runs out — and gets
+// SIGSEGV from its fault — while this much is still free for them. 4 MiB, as Linux keeps min_free_kbytes
+// back from user allocations.
+private const USER_RESERVE: u64 = 1024
+
+// `n` free frames in a row for a user space (its pages, tables, list of mappings), only while more than
+// USER_RESERVE would still be free after; None otherwise.
+alloc_user_frames(n: u64) -> Option[Frame]
+    val flags = cpu.irq_save()
+    lock.lock()
+    val found = if free_count < n + USER_RESERVE then None else take(n)
+    lock.unlock()
+    cpu.irq_restore(flags)
+    found
+
 // Give one frame back.
 free_frame(f: Frame) = free_frames(f, 1)
 

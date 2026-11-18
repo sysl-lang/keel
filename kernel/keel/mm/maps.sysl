@@ -1,0 +1,453 @@
+module keel.mm
+
+import keel.cpu
+import sysl.raw.ptr_cast
+import sysl.sync.SpinLock
+
+// A user space's mappings: the record of what each range of its addresses is, kept apart from the
+// translation tables. The tables are a cache of this list for the pages that are present; a page inside
+// a mapping that has no descriptor yet is given one by `fault_in` the first time the program (or a
+// system call on its behalf) touches it.
+//
+// The list is an array of `Mapping`s sorted by address, none overlapping and none empty, held in a run of
+// contiguous frames of the space's own (`Space.maps`, `maps_len`, `maps_frames`). A sorted array, and not
+// a tree, because:
+//
+// - a process has tens of mappings, a few hundred at most (busybox and musl's malloc stay under fifty),
+//   so a binary search is a handful of compares and an insertion moves a few KiB;
+// - the operation that must be fast is the lookup on every fault, and the array is the densest form
+//   for it, with no pointers to chase through frames;
+// - its storage is frames, not the kernel heap, so a list that cannot grow is an ordinary ENOMEM rather
+//   than the heap's panic (FINDINGS 82), and `fork` copies it with one loop.
+//
+// Neighbours that could be one mapping (anonymous, same protection, same kind) are merged after every
+// change, so musl's run of small anonymous maps stays a single entry.
+//
+// One lock, `vm_lock`, guards every space's list and the level-3 descriptors of its present pages. It is
+// a leaf: taken with this core's IRQs masked, after keel.proc's `brk_guard` and any `IrqLock` a system
+// call holds while it copies (the futex lock), and before the frame allocator's lock, which is all it
+// takes inside. Two threads faulting on one page both come here; the first installs the frame, the
+// second finds the page present and simply retries its access — the discipline `break_cow` already had
+// for a copy-on-write page, which now runs under this same lock.
+
+// What a mapping is. Every mapping is private: keel has no shared writable memory.
+const VM_ANON: u32 = 1          // zero-filled, a page at a time, when first touched
+const VM_STACK: u32 = 2         // the stack: grows down on a fault below it (`grow_locked`)
+const VM_HEAP: u32 = 4          // the heap `brk` moves
+const VM_IMAGE: u32 = 8         // an ELF segment, filled from the program's file at exec
+const VM_FILE: u32 = 16         // a copy of a file's bytes, made at `mmap`; `ino` and `offset` say whose
+const VM_PRIVATE: u32 = 32
+
+struct Mapping
+    start: u64                  // page aligned
+    end: u64                    // page aligned, above start
+    prot: u32                   // Linux's PROT_* bits
+    flags: u32                  // VM_*
+    ino: u32                    // VM_FILE: the file the bytes came from
+    pad: u32
+    offset: u64                 // VM_FILE: the offset in it that `start` was filled from
+
+@assert(sizeof(Mapping) == 40, "a mapping entry is five words")
+
+// Linux's vm.max_map_count is 65530; keel's list is frames that never page out, so it is smaller.
+private const MAX_MAPPINGS: usize = 4096
+private const PER_FRAME: usize = 4096 / 40
+
+// The gap a stack keeps from the mapping below it when it grows, as Linux's stack_guard_gap: 1 MiB, the
+// same as the gap between mmap's window and the stack's limit.
+private const STACK_GUARD_GAP: u64 = 0x10_0000
+
+// The bytes one level-3 table covers.
+private const TABLE_SPAN: u64 = 0x20_0000
+
+// Off only to show what laziness is for: every anonymous mapping is then given all its frames when it is
+// made, and /bin/vmtest's 64 MiB mapping takes 16384 at once.
+private const EAGER: bool = false
+
+// Off only to show what the lock is for: two threads faulting on one fresh page then each install a
+// frame of their own, one write is lost and a frame leaks.
+private const FAULT_LOCKED: bool = true
+
+// Off only to show where a fresh page's protection comes from: it is then mapped read-write whatever the
+// mapping allows, so a PROT_NONE guard inside an untouched region no longer faults.
+private const PROT_FROM_MAPPING: bool = true
+
+// Off only to show that `mprotect` changes the record as well as the present pages: an untouched page
+// then keeps the old protection and comes in writable after a PROT_READ.
+private const PROTECT_ENTRIES: bool = true
+
+private var vm_lock: SpinLock = SpinLock(0)
+
+private[mm] lock_vm() -> u64
+    val flags = cpu.irq_save()
+    vm_lock.lock()
+    flags
+
+private[mm] unlock_vm(flags: u64)
+    vm_lock.unlock()
+    cpu.irq_restore(flags)
+
+private entries(s: *Space) -> *Mapping = ptr_cast(usize(u64(to_virt(s.maps))))
+
+// The index of the first mapping that ends above `va`: the one holding `va` if any does, else the next
+// one up (maps_len when there is none).
+private index_above(s: *Space, va: u64) -> usize
+    val e = entries(s)
+    var lo: usize = 0
+    var hi = s.maps_len
+    while lo < hi
+        val mid = (lo + hi) / 2
+        if e[mid].end <= va then lo = mid + 1 else hi = mid
+    lo
+
+// The index of the mapping holding `va`.
+private mapping_at(s: *Space, va: u64) -> Option[usize]
+    val i = index_above(s, va)
+    if i < s.maps_len && entries(s)[i].start <= va then Some(i) else None
+
+// Whether no mapping overlaps [start, end).
+private unused_locked(s: *Space, start: u64, end: u64) -> bool
+    val i = index_above(s, start)
+    i == s.maps_len || entries(s)[i].start >= end
+
+// Whether mappings cover every page of [start, end), with no hole.
+private covered_locked(s: *Space, start: u64, end: u64) -> bool
+    var at = start
+    var i = index_above(s, start)
+    val e = entries(s)
+    while at < end
+        if i == s.maps_len || e[i].start > at then return false
+        at = e[i].end
+        i += 1
+    true
+
+// Room in the list for `extra` more entries, moving it to a longer run of frames if it needs one.
+private ensure_room(s: *Space, extra: usize) -> bool
+    val want = s.maps_len + extra
+    if want > MAX_MAPPINGS then return false
+    if want <= usize(s.maps_frames) * PER_FRAME then return true
+    var frames = if s.maps_frames == 0 then u64(1) else s.maps_frames * 2
+    while usize(frames) * PER_FRAME < want
+        frames *= 2
+    val f = alloc_user_frames(frames) match
+        Some(f) -> f
+        None -> return false
+    val moved: *Mapping = ptr_cast(usize(u64(to_virt(frame_addr(f)))))
+    val e = entries(s)
+    for i in 0..<s.maps_len
+        moved[i] = e[i]
+    if s.maps_frames > 0 then free_frames(frame_of(s.maps), s.maps_frames)
+    s.maps = frame_addr(f)
+    s.maps_frames = frames
+    true
+
+// Put `m` at index `i`, moving the ones from there up. The room is there.
+private insert_at(s: *Space, i: usize, m: Mapping)
+    val e = entries(s)
+    var k = s.maps_len
+    while k > i
+        e[k] = e[k - 1]
+        k -= 1
+    e[i] = m
+    s.maps_len += 1
+
+// Take away `n` entries from index `i`.
+private remove_at(s: *Space, i: usize, n: usize)
+    val e = entries(s)
+    for k in i..<s.maps_len - n
+        e[k] = e[k + n]
+    s.maps_len -= n
+
+// Make `va` a boundary between entries: a mapping that holds it with pages on both sides is cut in two.
+// The room for one more entry is there.
+private split_at(s: *Space, va: u64)
+    val i = mapping_at(s, va) match
+        Some(i) -> i
+        None -> return
+    val e = entries(s)
+    if e[i].start == va then return
+    var upper = e[i]
+    upper.start = va
+    if (upper.flags & VM_FILE) != 0 then upper.offset += va - e[i].start
+    e[i].end = va
+    insert_at(s, i + 1, upper)
+
+private joinable(a: Mapping, b: Mapping) -> bool =
+    a.end == b.start && a.prot == b.prot && a.flags == b.flags && (a.flags & VM_FILE) == 0
+
+// Merge every pair of neighbours that could be one mapping.
+private coalesce(s: *Space)
+    val e = entries(s)
+    var i: usize = 0
+    while i + 1 < s.maps_len
+        if joinable(e[i], e[i + 1])
+            e[i].end = e[i + 1].end
+            remove_at(s, i + 1, 1)
+        else
+            i += 1
+
+// Record a mapping of [start, end) — page aligned, where nothing is mapped — with `prot` (PROT_*) and
+// `flags` (VM_*); `ino` and `offset` describe a VM_FILE copy's source. An anonymous mapping gets no frames
+// here; anything else gets all its frames, zeroed, for its maker to fill. False, with nothing recorded,
+// when something is already mapped there or the list or the frames ran out.
+add_mapping(s: *Space, start: u64, end: u64, prot: u64, flags: u32, ino: u32 = 0, offset: u64 = 0) -> bool
+    val held = lock_vm()
+    var ok = start < end && unused_locked(s, start, end) && ensure_room(s, 1)
+    if ok
+        insert_at(s, index_above(s, start), Mapping(start, end, u32(prot), flags, ino, 0, offset))
+        if EAGER || (flags & VM_ANON) == 0
+            ok = populate_locked(s, start, end, prot)
+            if !ok then remove_locked(s, start, end)
+        coalesce(s)
+    unlock_vm(held)
+    ok
+
+// Give every page of [start, end) a zeroed frame with `prot`.
+private populate_locked(s: *Space, start: u64, end: u64, prot: u64) -> bool
+    var va = start
+    while va < end
+        if !install_locked(s, va, prot) then return false
+        va += PAGE_SIZE
+    true
+
+// A zeroed frame for the absent page at `va`, mapped with `prot`; true if the page is already present.
+private install_locked(s: *Space, va: u64, prot: u64) -> bool
+    val slot = leaf_slot(s, va, true) match
+        Some(p) -> p
+        None -> return false
+    if *slot != 0 then return true
+    val pa = zeroed_frame() match
+        Some(p) -> p
+        None -> return false
+    *slot = cpu.to_word(leaf_with(LeafDesc(1, 1, Normal, 0, UserRo, Inner, 1, 1, frame_of(pa), 0, 0, 0, 0, 1, 1,
+        0, 0), prot, false))
+    s.pages += 1
+    cpu.publish_tables()
+    true
+
+// Unmap [start, end): the mappings in it are cut back or removed, and every present page there goes,
+// its frame released. False, changing nothing, only when cutting a mapping in two found no room for the
+// second half.
+remove_range(s: *Space, start: u64, end: u64) -> bool
+    val held = lock_vm()
+    val ok = ensure_room(s, 2)
+    if ok then remove_locked(s, start, end)
+    unlock_vm(held)
+    ok
+
+private remove_locked(s: *Space, start: u64, end: u64)
+    split_at(s, start)
+    split_at(s, end)
+    val i = index_above(s, start)
+    var j = i
+    while j < s.maps_len && entries(s)[j].start < end
+        j += 1
+    remove_at(s, i, j - i)
+    var va = next_present(s, start, end)
+    while va < end
+        unmap_present(s, va)
+        va = next_present(s, va + PAGE_SIZE, end)
+
+// The first page at or above `va`, below `end`, that has a descriptor; `end` when none does. A missing
+// table skips the whole span it would have covered.
+private next_present(s: *Space, va: u64, end: u64) -> u64
+    var a = va
+    while a < end
+        leaf_slot(s, a, false) match
+            Some(slot) ->
+                if *slot != 0 then return a
+                a += PAGE_SIZE
+            None -> a = (a | (TABLE_SPAN - 1)) + 1
+    end
+
+private unmap_present(s: *Space, va: u64)
+    val slot = leaf_slot(s, va, false) match
+        Some(p) -> p
+        None -> return
+    if *slot == 0 then return
+    val leaf: LeafDesc = cpu.from_word(*slot)
+    *slot = 0
+    flush_user_page(s, va)
+    release_frame(leaf.oa)
+    s.pages -= 1
+
+// Give every page of [start, end) the protection `prot`: the mappings' record, cut at the ends, and the
+// present pages' descriptors. False, changing nothing, when a page of the range is not mapped (mprotect's
+// ENOMEM) or the cuts found no room.
+protect_range(s: *Space, start: u64, end: u64, prot: u64) -> bool
+    val held = lock_vm()
+    val ok = covered_locked(s, start, end) && ensure_room(s, 2)
+    if ok
+        split_at(s, start)
+        split_at(s, end)
+        if PROTECT_ENTRIES
+            var i = index_above(s, start)
+            while i < s.maps_len && entries(s)[i].start < end
+                entries(s)[i].prot = u32(prot)
+                i += 1
+        var va = next_present(s, start, end)
+        while va < end
+            protect_page(s, va, prot)
+            va = next_present(s, va + PAGE_SIZE, end)
+        coalesce(s)
+    unlock_vm(held)
+    ok
+
+// MADV_DONTNEED over [start, end): an anonymous page goes back to being untouched (its frame released;
+// it reads as zeros when next touched), any other page is zeroed where it is (mmap.sysl's
+// `discard_page`).
+discard_range(s: *Space, start: u64, end: u64)
+    val held = lock_vm()
+    var va = next_present(s, start, end)
+    while va < end
+        val anonymous = mapping_at(s, va) match
+            Some(i) -> (entries(s)[i].flags & VM_ANON) != 0
+            None -> false
+        if anonymous then unmap_present(s, va) else discard_page(s, va)
+        va = next_present(s, va + PAGE_SIZE, end)
+    unlock_vm(held)
+
+// Whether nothing is mapped anywhere in [va, va + len).
+range_unused(s: *Space, va: u64, len: u64) -> bool
+    val held = lock_vm()
+    val free = unused_locked(s, va, va + len)
+    unlock_vm(held)
+    free
+
+// Record an ELF segment's pages, [start, end) with `prot`. A page an earlier segment already recorded (two
+// segments may share one) keeps its entry, widened to allow what this one allows too. The frames are
+// the loader's to map (uspace.sysl's `map_user_page`).
+record_image(s: *Space, start: u64, end: u64, prot: u64) -> bool
+    val held = lock_vm()
+    var ok = true
+    var va = start
+    while ok && va < end
+        val i = index_above(s, va)
+        val e = entries(s)
+        if i < s.maps_len && e[i].start <= va
+            val stop = if e[i].end < end then e[i].end else end
+            val wider = u64(e[i].prot) | prot
+            if wider != u64(e[i].prot)
+                ok = ensure_room(s, 2)
+                if ok
+                    split_at(s, va)
+                    split_at(s, stop)
+                    val k = index_above(s, va)
+                    entries(s)[k].prot = u32(wider)
+            va = stop
+        else
+            val next = if i < s.maps_len then e[i].start else end
+            val stop = if next < end then next else end
+            ok = ensure_room(s, 1)
+            if ok then insert_at(s, i, Mapping(va, stop, u32(prot), VM_IMAGE | VM_PRIVATE, 0, 0, 0))
+            va = stop
+    coalesce(s)
+    unlock_vm(held)
+    ok
+
+// Off only to show what the search is for: every mapping with no address asked for is then put at the
+// top of the window, over the last one — the second of musl's malloc's mmaps fails, ENOMEM.
+private const LOOK_FOR_ROOM: bool = true
+
+// The lowest address of `len` bytes no mapping touches in mmap's window, the highest such run below
+// mmap_top(); None when there is no gap that long.
+find_room(s: *Space, len: u64) -> Option[u64]
+    if len == 0 || len > mmap_top() - MMAP_BASE then return None
+    if !LOOK_FOR_ROOM then return Some(mmap_top() - len)
+    val held = lock_vm()
+    val e = entries(s)
+    var top = mmap_top()
+    // `k` counts the mappings that start below `top`; the gap under `top` reaches down to the end of the
+    // last of them.
+    var k = index_above(s, top)
+    if k < s.maps_len && e[k].start < top then k += 1
+    var found: Option[u64] = None
+    loop
+        val below = if k > 0 && e[k - 1].end > MMAP_BASE then e[k - 1].end else MMAP_BASE
+        if top >= below && top - below >= len
+            found = Some(top - len)
+            break
+        if k == 0 then break
+        if e[k - 1].start < top then top = e[k - 1].start
+        k -= 1
+        if top <= MMAP_BASE then break
+    unlock_vm(held)
+    found
+
+// Make the access `want` (PROT_READ, PROT_WRITE or PROT_EXEC) at `va` possible, as the mappings say it may
+// be: an untouched page of a mapping gets a zeroed frame with the mapping's protection, a write to a
+// copy-on-write page breaks it (cow.sysl), and a page another thread brought in meanwhile is simply
+// there. `from_user`: an EL0 fault, which may also grow the stack down to `va`; a system call's access
+// never does. False — SIGSEGV or EFAULT — outside every mapping, against its protection, or when there is
+// no frame for the page.
+fault_in(s: *Space, va: u64, want: u64, from_user: bool) -> bool
+    if va >= USER_STACK_TOP then return false
+    val page = va & ~(PAGE_SIZE - 1)
+    val held = if FAULT_LOCKED then lock_vm() else u64(0)
+    val ok = fault_locked(s, page, want, from_user)
+    if FAULT_LOCKED then unlock_vm(held)
+    ok
+
+private fault_locked(s: *Space, page: u64, want: u64, from_user: bool) -> bool
+    val i = mapping_at(s, page) match
+        Some(i) -> i
+        None ->
+            if !from_user || !grow_locked(s, page) then return false
+            index_above(s, page)
+    val prot = u64(entries(s)[i].prot)
+    // PROT_WRITE or PROT_EXEC alone still reads, as on arm64 Linux.
+    val needs = if want == PROT_READ then PROT_READ | PROT_WRITE | PROT_EXEC else want
+    if (prot & needs) == 0 then return false
+    val slot = leaf_slot(s, page, true) match
+        Some(p) -> p
+        None -> return false
+    if *slot == 0
+        val pa = zeroed_frame() match
+            Some(p) -> p
+            None -> return false
+        val given = if PROT_FROM_MAPPING then prot else PROT_READ | PROT_WRITE
+        *slot = cpu.to_word(leaf_with(LeafDesc(1, 1, Normal, 0, UserRo, Inner, 1, 1, frame_of(pa), 0, 0, 0, 0, 1, 1,
+            0, 0), given, false))
+        s.pages += 1
+        cpu.publish_tables()
+        return true
+    val leaf: LeafDesc = cpu.from_word(*slot)
+    val user = leaf.ap == UserRw || leaf.ap == UserRo
+    if want == PROT_WRITE
+        if (leaf.software & 1) != 0 then break_cow_locked(s, page) else leaf.ap == UserRw
+    else if want == PROT_EXEC
+        user && leaf.uxn == 0
+    else
+        user
+
+// Off only to show what growing is for: without it the stack is its first 64 KiB and no more, and
+// busybox's interactive shell, whose line editor keeps its buffers on the stack, dies of SIGSEGV.
+private const GROW_STACK: bool = true
+
+// Grow the stack mapping down to `page`, which no mapping holds: only within stack_limit() (8 MiB, as
+// Linux's default RLIMIT_STACK), only when the next mapping up is the stack, and only while
+// STACK_GUARD_GAP stays clear below it.
+private grow_locked(s: *Space, page: u64) -> bool
+    if !GROW_STACK || page < stack_limit() || page >= USER_STACK_TOP then return false
+    val i = index_above(s, page)
+    val e = entries(s)
+    if i == s.maps_len || (e[i].flags & VM_STACK) == 0 then return false
+    if i > 0 && e[i - 1].end + STACK_GUARD_GAP > page then return false
+    e[i].start = page
+    true
+
+// Copy `parent`'s list into `child`'s empty one. Called under the lock.
+private[mm] copy_maps(parent: *Space, child: *Space) -> bool
+    if !ensure_room(child, parent.maps_len) then return false
+    val from = entries(parent)
+    val to = entries(child)
+    for i in 0..<parent.maps_len
+        to[i] = from[i]
+    child.maps_len = parent.maps_len
+    true
+
+// Give the list's frames back.
+private[mm] free_maps(s: *Space)
+    if s.maps_frames > 0 then free_frames(frame_of(s.maps), s.maps_frames)
+    s.maps_frames = 0
+    s.maps_len = 0

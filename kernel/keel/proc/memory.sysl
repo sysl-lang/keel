@@ -1,9 +1,10 @@
 module keel.proc
 
 // mmap, munmap, mprotect, mremap and madvise, over keel.mm's mmap.sysl: Linux's calls (mm/mmap.c,
-// mm/mprotect.c), private memory only. An anonymous mapping is fresh zeroed pages; a file mapping is a
-// private COPY of the file's bytes made at the call (MAP_PRIVATE's semantics hold for a file nobody
-// writes meanwhile), zero past its end. A mapping with no address asked for goes in mmap's window,
+// mm/mprotect.c), private memory only. Each call changes the space's list of mappings (mm's maps.sysl)
+// and the pages present under it. An anonymous mapping gets no frames: each page is zero-filled when
+// first touched. A file mapping is a private COPY of the file's bytes made at the call (MAP_PRIVATE's
+// semantics hold for a file nobody writes meanwhile), zero past its end, with every frame at once. A mapping with no address asked for goes in mmap's window,
 // top-down; a hint is taken when its pages are free; MAP_FIXED replaces whatever was there, and
 // MAP_FIXED_NOREPLACE refuses to (EEXIST). Shared mappings are refused unless they could never be
 // written (a MAP_SHARED, PROT_READ file mapping is a copy like a private one). mremap shrinks in place;
@@ -60,7 +61,12 @@ private[proc] sys_mmap(p: *Process, regs: *u64) -> Result[i64, Errno]
     val flags_held = brk_guard.lock()
     val placed = placed_at(p, hint, len, flags)
     val r = placed match
-        Ok(at) -> map_fresh(p, at, len, first_prot)
+        Ok(at) ->
+            val made = if anonymous
+                mm.add_mapping(&p.space, at, at + len, prot, mm.VM_ANON | mm.VM_PRIVATE)
+            else
+                mm.add_mapping(&p.space, at, at + len, first_prot, mm.VM_FILE | mm.VM_PRIVATE, file.ino, offset)
+            if made then Ok(at) else Err(ENOMEM)
         Err(e) -> Err(e)
     brk_guard.unlock(flags_held)
     val at = r?
@@ -74,12 +80,9 @@ private[proc] sys_mmap(p: *Process, regs: *u64) -> Result[i64, Errno]
     val filled = fs.sys_read(p, &from, &args[0])
     val f2 = brk_guard.lock()
     if filled.is_err()
-        unmap_range(p, at, len)
+        val _ = mm.remove_range(&p.space, at, at + len)
     else
-        var va = at
-        while va < at + len
-            mm.protect_page(&p.space, va, prot)
-            va += mm.PAGE_SIZE
+        val _ = mm.protect_range(&p.space, at, at + len, prot)
     brk_guard.unlock(f2)
     filled?
     Ok(i64(at))
@@ -91,7 +94,7 @@ private placed_at(p: *Process, hint: u64, len: u64, flags: u64) -> Result[u64, E
         if !mm.range_unused(&p.space, hint, len) then return Err(EEXIST)
         return Ok(hint)
     if (flags & MAP_FIXED) != 0
-        unmap_range(p, hint, len)
+        if !mm.remove_range(&p.space, hint, hint + len) then return Err(ENOMEM)
         return Ok(hint)
     val asked = hint & ~(mm.PAGE_SIZE - 1)
     if asked != 0 && fits(asked, len) && mm.range_unused(&p.space, asked, len) then return Ok(asked)
@@ -99,40 +102,26 @@ private placed_at(p: *Process, hint: u64, len: u64, flags: u64) -> Result[u64, E
         Some(at) -> Ok(at)
         None -> Err(ENOMEM)
 
-// Map `len` bytes of fresh pages at `at` with `prot`, or none of them (ENOMEM).
-private map_fresh(p: *Process, at: u64, len: u64, prot: u64) -> Result[u64, Errno]
-    var va = at
-    while va < at + len
-        mm.map_page_prot(&p.space, va, prot) match
-            Some(_) -> va += mm.PAGE_SIZE
-            None ->
-                unmap_range(p, at, va - at)
-                return Err(ENOMEM)
-    Ok(at)
-
 // Whether [at, at + len) is somewhere a program's memory may be: above the never-mapped bottom, below
 // the stack's guard page.
 private fits(at: u64, len: u64) -> bool =
     at >= mm.USER_BASE && at < mm.mmap_top() && len <= mm.mmap_top() - at
 
-private unmap_range(p: *Process, at: u64, len: u64)
-    var va = at
-    while va < at + len
-        mm.unmap_user_page(&p.space, va)
-        va += mm.PAGE_SIZE
-
-// munmap(addr, len) -> 0. Pages that are not mapped are no error.
+// munmap(addr, len) -> 0. Pages that are not mapped are no error; a mapping the range cuts in two is
+// split.
 private[proc] sys_munmap(p: *Process, regs: *u64) -> Result[i64, Errno]
     val at = regs[0]
     val len = page_up(regs[1])
     if (at & (mm.PAGE_SIZE - 1)) != 0 || regs[1] == 0 || len < regs[1] then return Err(EINVAL)
     if at >= mm.USER_STACK_TOP || len > mm.USER_STACK_TOP - at then return Err(EINVAL)
     val flags = brk_guard.lock()
-    unmap_range(p, at, len)
+    val done = mm.remove_range(&p.space, at, at + len)
     brk_guard.unlock(flags)
-    Ok(0)
+    if done then Ok(0) else Err(ENOMEM)
 
-// mprotect(addr, len, prot) -> 0; ENOMEM, changing nothing, if any page of the range is not mapped.
+// mprotect(addr, len, prot) -> 0; ENOMEM, changing nothing, if any page of the range is not mapped. The
+// protection is the mappings' (split where the range ends inside one), so pages not yet touched get it
+// when they come in, as the present ones get it now.
 private[proc] sys_mprotect(p: *Process, regs: *u64) -> Result[i64, Errno]
     val at = regs[0]
     val len = page_up(regs[1])
@@ -141,18 +130,7 @@ private[proc] sys_mprotect(p: *Process, regs: *u64) -> Result[i64, Errno]
     if (prot & ~(mm.PROT_READ | mm.PROT_WRITE | mm.PROT_EXEC)) != 0 then return Err(EINVAL)
     if at >= mm.USER_STACK_TOP || len > mm.USER_STACK_TOP - at then return Err(ENOMEM)
     val flags = brk_guard.lock()
-    var va = at
-    var whole = true
-    while va < at + len
-        if !mm.page_in_use(&p.space, va)
-            whole = false
-            break
-        va += mm.PAGE_SIZE
-    if whole
-        va = at
-        while va < at + len
-            mm.protect_page(&p.space, va, prot)
-            va += mm.PAGE_SIZE
+    val whole = mm.protect_range(&p.space, at, at + len, prot)
     brk_guard.unlock(flags)
     if whole then Ok(0) else Err(ENOMEM)
 
@@ -165,21 +143,20 @@ private[proc] sys_mremap(p: *Process, regs: *u64) -> Result[i64, Errno]
     if (at & (mm.PAGE_SIZE - 1)) != 0 || regs[2] == 0 || (regs[3] & ~MREMAP_MAYMOVE) != 0 then return Err(EINVAL)
     if new_len > old_len then return Err(ENOMEM)
     val flags = brk_guard.lock()
-    unmap_range(p, at + new_len, old_len - new_len)
+    val done = mm.remove_range(&p.space, at + new_len, at + old_len)
     brk_guard.unlock(flags)
-    Ok(i64(at))
+    if done then Ok(i64(at)) else Err(ENOMEM)
 
-// madvise(addr, len, advice) -> 0. MADV_DONTNEED zeroes the range's pages, as Linux's does for private
-// anonymous memory; every other advice is taken and ignored.
+// madvise(addr, len, advice) -> 0. MADV_DONTNEED gives an anonymous page's frame back (it reads as zeros
+// when next touched) and zeroes any other page, as Linux's does for private memory; every other advice
+// is taken and ignored.
 private[proc] sys_madvise(p: *Process, regs: *u64) -> Result[i64, Errno]
     val at = regs[0]
     val len = page_up(regs[1])
     if (at & (mm.PAGE_SIZE - 1)) != 0 || len < regs[1] then return Err(EINVAL)
     if regs[2] != MADV_DONTNEED then return Ok(0)
+    if at >= mm.USER_STACK_TOP || len > mm.USER_STACK_TOP - at then return Err(EINVAL)
     val flags = brk_guard.lock()
-    var va = at
-    while va < at + len
-        mm.discard_page(&p.space, va)
-        va += mm.PAGE_SIZE
+    mm.discard_range(&p.space, at, at + len)
     brk_guard.unlock(flags)
     Ok(0)
