@@ -180,6 +180,43 @@ private aligned_boxes() -> (usize, usize)
     val b: &PageSized = PageSized([0; 512])
     (usize(&*a) % 64, usize(&*b) % 4096)
 
+// keel.heap's pair called as the compiler calls it. For each size and boundary, eight blocks held at
+// once, each checked on its boundary and filled to its size with its own byte; the fills are read back
+// once all eight are live, so a block shorter than asked or overlapping another shows. Each is then
+// freed with the size and boundary it was taken with, which `heap reclaimed` checks came back. The
+// shapes: every slab class on the word's boundary or its own; boundaries above a class's own (32 and 64
+// on 16 bytes, 128 on 128 bytes, whose slab objects begin only on 64); above every slab's (2048); a
+// page and two pages; and the large path on 16 and 1024. Answers how many checks failed.
+private aligned_blocks() -> u64
+    val shapes: [19](usize, usize) = [
+        (8, 8), (16, 16), (32, 16), (64, 16), (128, 16), (256, 16), (512, 16), (1024, 16), (2048, 16),
+        (16, 32), (16, 64), (24, 64), (128, 128), (16, 2048),
+        (5000, 16), (3000, 1024), (5000, 4096), (16, 8192), (100, 4096)]
+    var wrong: u64 = 0
+    for (size, align) in shapes
+        var held: [8]usize = [0; 8]
+        for k in 0..<8
+            val p = heap.keel_alloc(size, align)
+            if usize(p) % align != 0 then wrong += 1
+            fill(p, size, u8(k + 1))
+            held[k] = usize(p)
+        for k in 0..<8
+            if !filled(ptr_cast(held[k]), size, u8(k + 1)) then wrong += 1
+        for k in 0..<8
+            heap.keel_free(ptr_cast(held[k]), size, align)
+    wrong
+
+private fill(p: *u8, n: usize, b: u8)
+    for i in 0..<n
+        val q: *u8 = ptr_cast(usize(p) + i)
+        *q = b
+
+private filled(p: *u8, n: usize, b: u8) -> bool
+    for i in 0..<n
+        val q: *u8 = ptr_cast(usize(p) + i)
+        if *q != b then return false
+    true
+
 // What milestone 3 is for: `Buf`, `string`, `&T` and closures in the kernel, all on keel.heap, and
 // every frame they took given back once they are gone.
 private heap_tests()
@@ -201,6 +238,9 @@ private heap_tests()
         print("keel: aligned boxes ok")
     else
         print("keel: aligned boxes wrong:", line, page)
+
+    val wrong = aligned_blocks()
+    if wrong == 0 then print("keel: aligned blocks ok") else print("keel: aligned blocks wrong:", wrong)
 
     val after = mm.frames_free()
     if after == before && heap.live() == 0

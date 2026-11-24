@@ -2,19 +2,24 @@ module keel.heap
 
 // The kernel heap: the allocator every `&T` box, `Buf`, `string` and closure in the kernel comes from.
 // `kernel/sysl.hocon` names `keel_alloc` and `keel_free` as the program's allocating pair, so the
-// compiler calls these wherever it would call `malloc` and `free`.
+// compiler calls these for every block, telling both the block's size and the boundary it must begin
+// on (`alloc(size, align)`, `free(p, size, align)`, the same two on both calls).
 //
-// Two kinds of block, both carved from frames and both starting with a `Page` header in their first
-// frame, so `free` finds what a pointer belongs to by rounding it down to its page:
+// Two kinds of block, both carved from frames, each with a `Page` header in the page holding the byte
+// before the object, so `free` finds what a pointer belongs to by rounding `p - 1` down to its page:
 //
 //   small   eight size classes, 16 to 2048 bytes. A slab is one frame holding objects of one class
 //           after its header, with its own free list. The slabs of a class that have a free object are
-//           on a doubly-linked list; a slab whose last object comes back returns its frame.
-//   large   anything bigger: a run of whole frames, the object after the header, the run's length in
-//           the header. Freed straight back to the frame allocator.
+//           on a doubly-linked list; a slab whose last object comes back returns its frame. An object
+//           of class `s` begins on min(s, 64): the frame is page-aligned and the header 64 bytes. So a
+//           block asking for a boundary up to 64 takes the class of max(size, align).
+//   large   anything bigger, or asking for more than 64: a run of whole frames, the object on its
+//           boundary inside it, the run's first frame and length in the header. Freed straight back to
+//           the frame allocator.
 //
-// Every pointer handed out is 16-byte aligned, as malloc's are on AArch64. Running out is a panic that
-// says so: the language has no way for an allocation to fail.
+// `free` checks the size and boundary it is told against the kind of block it finds, so a free that
+// names another block's shape stops the kernel. Running out is a panic that says so: the language has
+// no way for an allocation to fail.
 
 import keel.cpu
 import keel.mm
@@ -37,6 +42,7 @@ private struct Page
     free: *u8                   // the first free object; each free object holds the next
     next: *Page                 // the class's list of slabs with a free object
     prev: *Page
+    first: *Page                // large: the run's first frame, where the header may be further in
 
 @assert(sizeof(Page) <= 64, "a page header fits in HEADER bytes")
 
@@ -48,51 +54,47 @@ private var partial: [CLASSES]*Page
 private var allocated: u64 = 0
 
 @export("keel_alloc")
-keel_alloc(n: usize) -> *u8
+keel_alloc(size: usize, align: usize) -> *u8
     val flags = cpu.irq_save()
     lock.lock()
-    val p = if u64(n) <= class_size(CLASSES - 1) then small(class_of(u64(n))) else large(u64(n))
+    val p = if is_small(u64(size), u64(align))
+        small(class_for(u64(size), u64(align)))
+    else
+        large(u64(size), u64(align))
     allocated += 1
     lock.unlock()
     cpu.irq_restore(flags)
     p
 
 @export("keel_free")
-keel_free(p: *u8)
+keel_free(p: *u8, size: usize, align: usize)
     if p == null then return
     val flags = cpu.irq_save()
     lock.lock()
-    val page: *Page = ptr_cast(usize(u64(usize(p)) & ~(PAGE - 1)))
+    val page: *Page = ptr_cast(usize((u64(usize(p)) - 1) & ~(PAGE - 1)))
     if page.magic != MAGIC then panic("keel: free of a pointer the heap did not hand out")
-    if page.class == LARGE
-        mm.free_frames(frame_of_page(page), page.used)
-    else
+    val small_block = is_small(u64(size), u64(align))
+    if page.class == LARGE && !small_block
+        page.magic = 0
+        mm.free_frames(frame_of_page(page.first), page.used)
+    else if page.class != LARGE && small_block && usize(page.class) == class_for(u64(size), u64(align))
         give_back(page, p)
+    else
+        panic("keel: free told a size or boundary the block was not taken with")
     allocated -= 1
     lock.unlock()
     cpu.irq_restore(flags)
 
-// The pair the compiler calls for a box whose type asks for more than 16 bytes' alignment. The block is
-// `n + align` bytes from `keel_alloc`; the pointer handed out is the first `align` boundary at least 8
-// bytes into it, and the word before it holds the block's own address for `sysl_free_aligned`. A
-// 16-aligned block starts 8 short of an 8-aligned boundary, so rounding up adds at most `align - 8`
-// and the object always fits.
-@export("sysl_alloc_aligned")
-alloc_aligned(n: usize, align: usize) -> *u8
-    val block = keel_alloc(n + align)
-    val at = (usize(block) + 8 + align - 1) & ~(align - 1)
-    val slot: *usize = ptr_cast(at - 8)
-    *slot = usize(block)
-    ptr_cast(at)
-
-@export("sysl_free_aligned")
-free_aligned(p: *u8)
-    if p == null then return
-    val slot: *usize = ptr_cast(usize(p) - 8)
-    keel_free(ptr_cast(*slot))
-
 // How many blocks are handed out and not yet freed.
 live() -> u64 = allocated
+
+// Whether a block of `size` bytes on `align` comes from a slab: its class must hold it and begin on its
+// boundary, and no class begins on more than HEADER.
+private is_small(size: u64, align: u64) -> bool = align <= HEADER && max(size, align) <= class_size(CLASSES - 1)
+
+private class_for(size: u64, align: u64) -> usize = class_of(max(size, align))
+
+private max(a: u64, b: u64) -> u64 = if a > b then a else b
 
 private class_size(c: usize) -> u64 = u64(1) << (MIN_SHIFT + u64(c))
 
@@ -128,6 +130,7 @@ private new_slab(c: usize) -> *Page
     page.free = ptr_cast(usize(base))
     page.next = null
     page.prev = null
+    page.first = page
     page
 
 private give_back(page: *Page, p: *u8)
@@ -153,17 +156,26 @@ private unlink(page: *Page, c: usize)
     page.next = null
     page.prev = null
 
-// A run of whole frames with the object after the header.
-private large(n: u64) -> *u8
-    val frames = (n + HEADER + PAGE - 1) / PAGE
-    val page = page_of_frame(frame_or_panic(frames))
+// A run of whole frames holding one object of `n` bytes on `align`. Below a page's boundary the object
+// is `max(align, HEADER)` bytes into the run and the header is the run's first frame. From a page up the
+// run is `align` longer, the object is on the first boundary at least a frame in, and the header is the
+// frame just below it: the boundary is at most `align` in, so the object fits. Either way the header is
+// the page holding the byte before the object.
+private large(n: u64, align: u64) -> *u8
+    val ahead = if align < PAGE then max(align, HEADER) else align
+    val frames = (ahead + n + PAGE - 1) / PAGE
+    val first = page_of_frame(frame_or_panic(frames))
+    val start = u64(usize(first))
+    val at = if align < PAGE then start + ahead else (start + PAGE + align - 1) & ~(align - 1)
+    val page: *Page = if align < PAGE then first else ptr_cast(usize(at - PAGE))
     page.magic = MAGIC
     page.class = LARGE
     page.used = frames
     page.free = null
     page.next = null
     page.prev = null
-    ptr_cast(usize(u64(usize(page)) + HEADER))
+    page.first = first
+    ptr_cast(usize(at))
 
 private frame_or_panic(n: u64) -> Frame = mm.alloc_frames(n) match
     Some(f) -> f

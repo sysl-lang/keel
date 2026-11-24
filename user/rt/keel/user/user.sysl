@@ -60,7 +60,7 @@ private place_first_tls()
 
     if room == 0 || !PLACE_FIRST_TLS then return
 
-    val block = alloc(room)
+    val block = alloc(room, HEADER)
 
     if block == null then exit(127)
 
@@ -525,12 +525,25 @@ private var free_list: *Header = null
 private var heap_end: u64 = 0
 private var heap_lock: SpinLock = SpinLock(0)
 
+// The compiler calls the pair with every block's size and boundary, the same two on both calls. A
+// block's bytes after its header begin on 16. One asking for more is carved `align` longer and handed
+// out from the first `align` boundary at least 8 bytes into it, the word before that boundary holding
+// the carved block's address for `free`: the carved bytes begin 8 short of an 8-aligned address, so the
+// boundary is at most `align - 8` past it and the object fits.
 @export("keel_user_alloc")
-alloc(n: usize) -> *u8
+alloc(size: usize, align: usize) -> *u8
     heap_lock.lock()
-    val p = carve(n)
+    val p = if align <= HEADER then carve(size) else over_aligned(size, align)
     heap_lock.unlock()
     p
+
+private over_aligned(size: usize, align: usize) -> *u8
+    val block = carve(size + align)
+    if block == null then return null
+    val at = (usize(block) + 8 + align - 1) & ~(align - 1)
+    val slot: *usize = ptr_cast(at - 8)
+    *slot = usize(block)
+    ptr_cast(at)
 
 private carve(n: usize) -> *u8
     val need = (n + HEADER + 15) & ~usize(15)
@@ -553,9 +566,12 @@ private carve(n: usize) -> *u8
     ptr_cast(usize(start) + HEADER)
 
 @export("keel_user_free")
-free(p: *u8)
+free(p: *u8, size: usize, align: usize)
     if p == null then return
-    val h: *Header = ptr_cast(usize(p) - HEADER)
+    val slot: *usize = ptr_cast(usize(p) - 8)
+    val block = if align <= HEADER then usize(p) else *slot
+    val h: *Header = ptr_cast(block - HEADER)
+    if h.size < size + HEADER then panic("keel.user: free told a size larger than the block it was taken as")
     heap_lock.lock()
     h.next = free_list
     free_list = h

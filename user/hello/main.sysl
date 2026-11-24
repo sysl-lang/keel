@@ -3,6 +3,7 @@
 // call (keel.user).
 
 import rt.keel.user
+import sysl.raw.ptr_cast
 
 print("user: hello from EL0")
 
@@ -10,3 +11,30 @@ print("user: hello from EL0")
 val pid = user.getpid()
 val greeting = s"user: process $pid has a heap"
 print(greeting)
+
+// The heap's pair called as the compiler calls it, on the word's boundary, the heap's own 16, and
+// boundaries above it (32, 64, 256, 4096): four blocks of each held at once, each checked on its
+// boundary and filled to its size with its own byte, read back once all four are live, then freed with
+// the size and boundary they were taken with. Then an over-aligned block freed and asked for again
+// comes back at the same address, so `free` found the block it was carved as.
+val shapes: [8](usize, usize) = [(8, 8), (24, 16), (100, 16), (16, 32), (40, 64), (16, 256), (300, 4096), (5000, 64)]
+var wrong = 0
+for (size, align) in shapes
+    var held: [4]usize = [0; 4]
+    for k in 0..<4
+        val p = user.alloc(size, align)
+        if usize(p) % align != 0 then wrong += 1
+        for i in 0..<size
+            val q: *u8 = ptr_cast(usize(p) + i)
+            *q = u8(k + 1)
+        held[k] = usize(p)
+    for k in 0..<4
+        for i in 0..<size
+            val q: *u8 = ptr_cast(held[k] + i)
+            if *q != u8(k + 1) then wrong += 1
+    for k in 0..<4
+        user.free(ptr_cast(held[k]), size, align)
+val first = user.alloc(64, 256)
+user.free(first, 64, 256)
+if user.alloc(64, 256) != first then wrong += 1
+if wrong == 0 then print("user: aligned heap ok") else print("user: aligned heap wrong:", wrong)

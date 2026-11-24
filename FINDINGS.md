@@ -2964,6 +2964,47 @@ Clean form, any of:
 - an allocator hook that is allowed to answer null, with the trap kept only where the program chose the
   infallible form.
 
+## 83. A `volatile` device read can be compiled to a writeback load, which HVF cannot emulate: keel stops under HVF at the default level on 0.13.4 (gap)
+
+On sysl 0.13.4 (`/opt/homebrew/bin/sysl`), keel builds, and boots and passes under TCG and under HVF at
+`-O0`, but under HVF at the default level QEMU dies before the first timer tick:
+
+    keel: trap brk esr=0x00000000f200004b elr=0xffff00004020d87c far=0x0000000000000000
+    Assertion failed: (isv), function hvf_handle_exception, file hvf.c, line 2447.
+
+`keel.gic.redist_base` (`gic/gic.sysl:85-93`), inlined into `kmain` through `gic.init`, reads
+`GICR_TYPER`, a `typer: volatile u64` field, and the read comes out as a **post-indexed** load:
+
+    ffff00004020d898:  ldr  x10, [x8], #-0x8      // x8 = 0xffff0000_080a0008, GICR_TYPER
+
+The `#-0x8` writeback is LLVM's load/store optimiser folding the later `sub x8, x8, #8` (back to the
+frame's base, for `GICR_WAKER` at 0x14) into the load. A writeback load or store, like a load or store
+pair, reports a data abort with ESR's ISV bit clear. A hypervisor emulates an MMIO access from the
+syndrome, so with no syndrome it cannot. HVF asserts, and KVM refuses such an access. Linux avoids
+this by writing every `readl`/`writel` as inline asm (`arch/arm64/include/asm/io.h`) with a plain
+`ldr`/`str` and no writeback.
+
+reference/memory.md says `volatile` "promises the one load or the one store the source wrote and nothing
+else", and reference/attributes.md says it makes every access "exactly the declared type's width". A
+writeback load is still one load of that width, so the compiler keeps both promises. Neither page
+promises which addressing form the access takes, and nothing in the language can ask for a form a
+hypervisor can decode.
+
+Shortest input: not reduced. A probe with the same struct, loop and wake-up sequence, built with
+`sysl build-c --target aarch64-freestanding`, compiles to plain `ldr x10, [x8, #0x8]`. The fold only
+appears where register allocation in the large inlined `kmain` makes the base register's decrement
+foldable. The same keel source built by 0.11.10 booted under HVF, and the instruction is reproducible
+from `scripts/boot-test.sh` on branch `alloc-013` (`scratch/keel.elf`).
+
+Clean form, any of:
+- `volatile` accesses never use writeback or pair addressing on AArch64 (what a C compiler targeting
+  Linux gets from the `asm` accessors). It could be a rule of `volatile`, or of a target or package
+  setting such as `codegen.mmio_single_access`;
+- a library `sysl.mmio.read[T]`/`write[T]` guaranteed to be one plain `ldr`/`str` of the width.
+
+Workaround available: an `asm` read for each register type, as Linux does. Not taken here (a workaround
+is a stop-and-report).
+
 ## What worked in milestone 17
 
 - **No sysl gap in the kernel half.** A poller waits on one module `WaitQueue` with an event count under

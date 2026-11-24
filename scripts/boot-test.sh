@@ -78,6 +78,7 @@ before_user_line=(
     "keel: hello from the heap"              # a string built by interpolation
     "keel: closure ok"      # a closure capturing a boxed value
     "keel: aligned boxes ok"  # @align(64) and @align(4096) boxes on their boundaries
+    "keel: aligned blocks ok" # keel_alloc(size, align) on every class and the large path, boundaries above each, filled and freed
     "keel: heap reclaimed"  # every frame came back once those were dropped, and no block is live
     "keel: interleaved ok"  # two spinning threads took turns: only the timer can have switched them
     "keel: mutex ok"        # 4 threads x 10,000 additions under a blocking Mutex[u64] total 40,000
@@ -106,6 +107,7 @@ before_user_line=(
     "keel: kfs heap reclaimed"   # every heap block the mounts took came back
     "keel: fs mounted, 4096 blocks"   # the superblock mkfs wrote, checked against the disk's size
     "user: hello from EL0"  # a sysl program read from /bin, at EL0 in its own address space, printing through `write`
+    "user: aligned heap ok" # keel_user_alloc(size, align) on 8 to 4096, filled, freed with size and align, an over-aligned block reused
     "keel: process 1 exited 0"   # ...and ending with `exit(0)`
     "keel: process 2 killed: permission fault"   # a program reading kernel memory is killed, alone
     "keel: preempt user ok" # one spinner per core never yields; a worker still ran, and each was preempted
