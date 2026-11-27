@@ -129,11 +129,13 @@ fstat(fd: int, out: *fsys.Stat) -> int
 @export("sysl_fs_ftruncate")
 ftruncate(fd: int, length: long) -> int = status(syscall(SYS_FTRUNCATE, u64(fd), u64(length), 0, 0))
 
-// Linux's `struct stat` as `sysl.fs`'s thirteen numbers: the mode is POSIX's, type bits and all, and so
+// Linux's `struct stat` as `sysl.fs`'s sixteen numbers: the mode is POSIX's, type bits and all, and so
 // are the owner and group (`Meta.owner`, `Meta.group`); keel keeps no devices or times, so those stay
-// zero.
+// zero. The last word is `has`, a bit per optional reading filled in: keel keeps no birth time, so
+// `stat_created` stays clear and `Meta.created` reads as absent rather than as the epoch.
 private converted(s: Stat) -> fsys.Stat
-    fsys.Stat(long(s.size), long(s.mode), long(s.nlink), long(s.uid), long(s.gid), long(s.ino), 0, 0, 0, 0, 0, 0, 0)
+    fsys.Stat(long(s.size), long(s.mode), long(s.nlink), long(s.uid), long(s.gid), long(s.ino), 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0)
 
 // --- Paths -----------------------------------------------------------------------------------------
 

@@ -50,6 +50,18 @@ check(fs.exists("/hello.txt") && fs.exists("hello.txt") && !fs.exists("/nowhere"
 check(fs.is_dir("/dir") && !fs.is_dir("/hello.txt") && fs.is_file("/hello.txt"), "is_dir and is_file")
 check(fs.size_of("/hello.txt") == Ok(19), "size_of(/hello.txt)")
 
+// keel keeps no birth time, and says so: `created` is absent for a file and for a directory, followed
+// or not, rather than the epoch.
+fs.metadata("/hello.txt") match
+    Ok(m) -> check(m.created.is_none() && m.size == 19, "metadata(/hello.txt) has a birth time")
+    Err(e) -> fail(s"metadata(/hello.txt): $e")
+fs.metadata("/dir") match
+    Ok(m) -> check(m.created.is_none(), "metadata(/dir) has a birth time")
+    Err(e) -> fail(s"metadata(/dir): $e")
+fs.link_metadata("/hello.txt") match
+    Ok(m) -> check(m.created.is_none(), "link_metadata(/hello.txt) has a birth time")
+    Err(e) -> fail(s"link_metadata(/hello.txt): $e")
+
 // Truncation by path (keel's truncate) and through an open file (ftruncate): shorter, then longer with
 // zeros, across a block boundary.
 check(fs.write_text("/t.txt", "0123456789").is_ok(), "write_text(/t.txt)")
